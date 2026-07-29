@@ -100,6 +100,10 @@ void XingtaiEpd::refresh(const uint8_t *buffer) {
 void XingtaiEpd::clear(uint8_t value) {
     static uint8_t frame[FRAME_BYTES];
     memset(frame, value, sizeof(frame));
+    display(frame);
+}
+
+void XingtaiEpd::display(const uint8_t *frame) {
     reset();
     waitBusy();
     controllerSetup();

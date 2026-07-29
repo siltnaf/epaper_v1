@@ -14,6 +14,7 @@ public:
     void begin();
     void reset();
     void clear(uint8_t value = 0x00);
+    void display(const uint8_t *frame);
     void drawTestPattern();
     void sleep();
 
