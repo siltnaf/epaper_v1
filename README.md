@@ -33,6 +33,45 @@ after the basic GPIO/SPI test is working.
 The remaining assignments are centralized in `include/board_pins.h`, including
 I2C (12/13), SD, battery ADC, touch, audio and ML307R modem signals.
 
+## FT6336 touch screen
+
+The FocalTech driver from `FT6X36-master` is integrated under
+`include/devices/ft6336` and `src/devices/ft6336`. The board powers the touch
+controller through GPIO37, uses the shared I2C bus on SDA GPIO13/SCL GPIO12,
+and receives active-low touch interrupts on GPIO36. The driver validates the
+FT6206/FT6236/FT6336 chip ID, configures trigger interrupt mode, and processes
+the queued interrupt events from the Arduino `loop()` context (I2C is never
+performed inside the ISR).
+
+Raw touch coordinates are rotated into the e-paper's 240x416 portrait coordinate
+space in `src/main.cpp`. A tap on a home-page icon opens its page; a tap on the
+upper-left Home touch target of a content page returns to the main page. Page refreshes
+are deferred until after the touch callback returns so the callback remains
+short and the e-paper refresh does not run in the driver's event dispatch.
+
+## ES8311 audio codec
+
+The ES8311 codec driver is implemented locally in
+`include/devices/es8311/es8311.h` and `src/devices/es8311/es8311.cpp`. It uses
+the same SDA GPIO13/SCL GPIO12 I2C bus as the FT6336. The driver auto-detects
+the two ES8311 7-bit addresses, `0x18` and `0x19`; this PCB responds at `0x19`.
+The ESP32-S3 is the I2S master at 16 kHz/16-bit with MCLK GPIO42, BCLK GPIO40,
+LRCLK GPIO39, codec input GPIO38, codec output GPIO41, and amplifier enable
+GPIO35. Startup scans the shared bus before initializing either device and
+prints all responding addresses to the serial monitor.
+
+The application also releases and reinitializes the shared I2C bus after the
+long e-paper startup refresh. If a peripheral holds SDA low after an interrupted
+transaction, up to nine SCL recovery pulses are generated before `Wire` is
+restarted.
+
+The schematic also shows that ES8311 power comes from regulator U8, whose
+enable net is `CODEC_PWR`. That net has a 100 kΩ pull-down but is not connected
+to an ESP32 GPIO in the supplied schematic or pin spreadsheet. The driver
+supports an optional `Pins::powerEnable` GPIO, but on the current PCB
+`CODEC_PWR` must first be electrically tied high (or routed to a GPIO) before
+the codec can acknowledge address `0x18`.
+
 ## Project structure
 
 The project is intentionally split into device drivers and page modules:

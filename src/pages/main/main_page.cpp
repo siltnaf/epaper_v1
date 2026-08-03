@@ -25,6 +25,29 @@ void hline(uint8_t *frame, int x, int y, int width) {
     for (int i = 0; i < width; ++i) pixel(frame, x + i, y);
 }
 
+void vline(uint8_t *frame, int x, int y, int height) {
+    for (int i = 0; i < height; ++i) pixel(frame, x, y + i);
+}
+
+void roundedFrame(uint8_t *frame, int x, int y, int width, int height) {
+    // A compact 4-pixel corner radius keeps the frame crisp on the monochrome
+    // panel while matching the rounded app-tile treatment in the reference.
+    constexpr int radius = 4;
+    hline(frame, x + radius, y, width - radius * 2);
+    hline(frame, x + radius, y + height - 1, width - radius * 2);
+    vline(frame, x, y + radius, height - radius * 2);
+    vline(frame, x + width - 1, y + radius, height - radius * 2);
+
+    pixel(frame, x + 2, y + 1);
+    pixel(frame, x + 1, y + 2);
+    pixel(frame, x + width - 3, y + 1);
+    pixel(frame, x + width - 2, y + 2);
+    pixel(frame, x + 1, y + height - 3);
+    pixel(frame, x + 2, y + height - 2);
+    pixel(frame, x + width - 2, y + height - 3);
+    pixel(frame, x + width - 3, y + height - 2);
+}
+
 void statusBar(uint8_t *frame) {
     // Keep the status area clean: no separator/bounding rule is drawn.
     Topbar::drawHome(frame, 4, 2);
@@ -34,6 +57,10 @@ void statusBar(uint8_t *frame) {
 }
 
 void icon(uint8_t *frame, int x, int y, const uint8_t *bitmap) {
+    constexpr int framePadding = 4;
+    constexpr int frameSize = 48 + framePadding * 2;
+    roundedFrame(frame, x - framePadding, y - framePadding, frameSize, frameSize);
+
     // DATA is the exact 48x48 MSB-first raster generated from the page SVG.
     for (int row = 0; row < 48; ++row) {
         for (int bit = 0; bit < 8; ++bit) {

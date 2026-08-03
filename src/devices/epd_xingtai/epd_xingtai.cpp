@@ -83,23 +83,18 @@ void XingtaiEpd::refresh(const uint8_t *buffer) {
     command(0x13); // write new image data
     waitBusy();
 
-    // The 3.7-inch panel's native transfer direction mirrors the image
-    // horizontally relative to the portrait framebuffer used by page code.
-    // Mirror each row here at the device boundary so all pages remain in a
-    // normal left-to-right coordinate system.
-    static uint8_t mirrored[FRAME_BYTES];
+    // The panel natively mirrors transferred rows horizontally. To present the
+    // page framebuffer upside down (180 degrees), send its rows bottom-to-top
+    // without the usual horizontal pre-mirror: the panel's native mirror then
+    // supplies the remaining horizontal part of the rotation.
+    static uint8_t rotated[FRAME_BYTES];
     constexpr size_t ROW_BYTES = WIDTH / 8;
     for (uint16_t y = 0; y < HEIGHT; ++y) {
-        const size_t row = static_cast<size_t>(y) * ROW_BYTES;
-        for (size_t xByte = 0; xByte < ROW_BYTES; ++xByte) {
-            uint8_t value = buffer[row + (ROW_BYTES - 1 - xByte)];
-            value = static_cast<uint8_t>((value >> 4) | (value << 4));
-            value = static_cast<uint8_t>(((value & 0xCCU) >> 2) | ((value & 0x33U) << 2));
-            value = static_cast<uint8_t>(((value & 0xAAU) >> 1) | ((value & 0x55U) << 1));
-            mirrored[row + xByte] = value;
-        }
+        const size_t destinationRow = static_cast<size_t>(y) * ROW_BYTES;
+        const size_t sourceRow = static_cast<size_t>(HEIGHT - 1 - y) * ROW_BYTES;
+        memcpy(rotated + destinationRow, buffer + sourceRow, ROW_BYTES);
     }
-    data(mirrored, FRAME_BYTES);
+    data(rotated, FRAME_BYTES);
 
     command(0x04); // power on
     waitBusy();
