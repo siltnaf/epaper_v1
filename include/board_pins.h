@@ -34,7 +34,7 @@ constexpr int SD_DATA2 = 21;
 constexpr int USB_D_MINUS = 19;
 constexpr int USB_D_PLUS = 20;
 
-// Shared I2C bus (e-paper touch controller / audio codec)
+// Shared I2C bus (FT6336 e-paper touch controller / audio codec)
 constexpr int I2C_SCL = 12;
 constexpr int I2C_SDA = 13;
 
