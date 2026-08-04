@@ -3,9 +3,61 @@
 #include <Arduino.h>
 #include <SD_MMC.h>
 
+#include <cstring>
+
 #include "board_pins.h"
 
 namespace SdCard {
+
+bool isMounted() {
+    return SD_MMC.cardType() != CARD_NONE;
+}
+
+uint8_t listRoot(char names[][33], bool directories[], uint8_t capacity) {
+    if (!isMounted() || names == nullptr || directories == nullptr) return 0;
+    File root = SD_MMC.open("/");
+    if (!root || !root.isDirectory()) return 0;
+    uint8_t count = 0;
+    File entry = root.openNextFile();
+    while (entry && count < capacity) {
+        std::strncpy(names[count], entry.name(), 32);
+        names[count][32] = '\0';
+        directories[count] = entry.isDirectory();
+        ++count;
+        entry.close();
+        entry = root.openNextFile();
+    }
+    root.close();
+    return count;
+}
+
+bool clearDirectory(File directory) {
+    File entry = directory.openNextFile();
+    while (entry) {
+        const String path = entry.name();
+        const bool isDirectory = entry.isDirectory();
+        entry.close();
+        if (isDirectory) {
+            File child = SD_MMC.open(path);
+            const bool cleared = child && clearDirectory(child);
+            if (child) child.close();
+            if (!cleared || !SD_MMC.rmdir(path)) return false;
+        } else if (!SD_MMC.remove(path)) {
+            return false;
+        }
+        entry = directory.openNextFile();
+    }
+    return true;
+}
+
+bool format() {
+    if (!isMounted()) return false;
+    File root = SD_MMC.open("/");
+    if (!root || !root.isDirectory()) return false;
+    const bool cleared = clearDirectory(root);
+    root.close();
+    return cleared;
+}
 
 void printInfo() {
     if (SD_MMC.cardType() == CARD_NONE) {

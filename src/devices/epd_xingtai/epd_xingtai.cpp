@@ -60,14 +60,14 @@ void XingtaiEpd::data(const uint8_t *buffer, size_t length) {
 }
 
 void XingtaiEpd::waitBusy(uint32_t timeoutMs) {
-    // This 3.7-inch Xingtai/UC8253 panel's vendor reference firmware does
-    // not trust the BUSY pin; it uses a conservative fixed delay instead.
-    // Keep the parameter for API compatibility and future panel revisions.
-    (void)timeoutMs;
-    // The panel has no reliable BUSY indication on this board. Keep a short
-    // guard delay for command sequencing without adding the old half-second
-    // pause to every refresh phase.
-    delay(100);
+    // The UC8253 vendor driver treats BUSY HIGH as ready. In particular, do not
+    // reset the controller for the next frame while the previous waveform is
+    // still active; doing so can leave the panel settled with inverted polarity.
+    const uint32_t started = millis();
+    while (digitalRead(BoardPins::EP_BUSY) != HIGH && millis() - started < timeoutMs) {
+        delay(1);
+    }
+    delay(20);
 }
 
 void XingtaiEpd::controllerSetup() {
@@ -117,6 +117,91 @@ void XingtaiEpd::display(const uint8_t *frame) {
     waitBusy();
     controllerSetup();
     refresh(frame);
+}
+
+void XingtaiEpd::displayPartial(const uint8_t *oldFrame, const uint8_t *newFrame,
+                               uint16_t x, uint16_t y, uint16_t width, uint16_t height) {
+    if (oldFrame == nullptr || newFrame == nullptr || width == 0 || height == 0 ||
+        x >= WIDTH || y >= HEIGHT) {
+        return;
+    }
+
+    const uint16_t logicalXStart = x & ~0x07U;
+    const uint16_t logicalXEnd = min<uint16_t>(WIDTH - 1, (x + width - 1) | 0x07U);
+    const uint16_t logicalYEnd = min<uint16_t>(HEIGHT - 1, y + height - 1);
+    // Partial-window coordinates address the physical X axis directly. Pixel
+    // data still follows the panel's native scan order; mirroring this window
+    // itself incorrectly moves right-side updates beside the Home icon.
+    const uint16_t controllerXStart = logicalXStart;
+    const uint16_t controllerXEnd = logicalXEnd;
+    const uint16_t controllerYStart = HEIGHT - 1 - logicalYEnd;
+    const uint16_t controllerYEnd = HEIGHT - 1 - y;
+    const size_t rowBytes = WIDTH / 8;
+    const size_t windowBytes = (logicalXEnd - logicalXStart + 1) / 8;
+
+    reset();
+    waitBusy();
+    controllerSetup();
+
+    // The UC8253 partial waveform needs both the pixels currently on-screen
+    // and their replacements. A reset discards the controller's previous RAM,
+    // so seed both planes with the current full image before replacing only the
+    // selected window. The visible refresh below is still restricted to the tile.
+    command(0x50);
+    data(0xC7);
+
+    command(0x10);
+    waitBusy();
+    for (int logicalY = HEIGHT - 1; logicalY >= 0; --logicalY) {
+        data(oldFrame + static_cast<size_t>(logicalY) * rowBytes, rowBytes);
+    }
+
+    command(0x13);
+    waitBusy();
+    for (int logicalY = HEIGHT - 1; logicalY >= 0; --logicalY) {
+        data(oldFrame + static_cast<size_t>(logicalY) * rowBytes, rowBytes);
+    }
+
+    command(0x91); // partial in
+    waitBusy();
+    command(0x90); // partial window
+    waitBusy();
+    data(static_cast<uint8_t>(controllerXStart));
+    data(static_cast<uint8_t>(controllerXEnd));
+    data(static_cast<uint8_t>(controllerYStart >> 8));
+    data(static_cast<uint8_t>(controllerYStart));
+    data(static_cast<uint8_t>(controllerYEnd >> 8));
+    data(static_cast<uint8_t>(controllerYEnd));
+    data(0x01);
+
+    command(0x10); // old image data
+    waitBusy();
+    for (int logicalY = logicalYEnd; logicalY >= static_cast<int>(y); --logicalY) {
+        const uint8_t *row = oldFrame + static_cast<size_t>(logicalY) * rowBytes + logicalXStart / 8;
+        data(row, windowBytes);
+    }
+
+    command(0x13); // new image data
+    waitBusy();
+    for (int logicalY = logicalYEnd; logicalY >= static_cast<int>(y); --logicalY) {
+        const uint8_t *row = newFrame + static_cast<size_t>(logicalY) * rowBytes + logicalXStart / 8;
+        data(row, windowBytes);
+    }
+
+    command(0xE0);
+    data(0x02);
+    command(0xE5);
+    data(0x65); // vendor partial-refresh waveform selection
+    command(0x92); // partial out
+    waitBusy();
+    command(0x04); // power on
+    waitBusy();
+    delay(20);
+    command(0x12); // refresh only the configured window
+    delay(20);
+    waitBusy();
+    command(0x02); // power off
+    waitBusy();
 }
 
 void XingtaiEpd::drawTestPattern() {

@@ -1,0 +1,328 @@
+[1mdiff --git a/include/pages/main/main_page.h b/include/pages/main/main_page.h[m
+[1mindex 0b0ef56..2badeb2 100644[m
+[1m--- a/include/pages/main/main_page.h[m
+[1m+++ b/include/pages/main/main_page.h[m
+[36m@@ -4,6 +4,22 @@[m
+ [m
+ namespace MainPage {[m
+ [m
+[32m+[m[32menum class FunctionIcon : uint8_t {[m
+[32m+[m[32m    None,[m
+[32m+[m[32m    Settings,[m
+[32m+[m[32m    Calendar,[m
+[32m+[m[32m    Calculator,[m
+[32m+[m[32m    Clock,[m
+[32m+[m[32m    Book,[m
+[32m+[m[32m    Voice,[m
+[32m+[m[32m    Music,[m
+[32m+[m[32m    Poem,[m
+[32m+[m[32m    Learn,[m
+[32m+[m[32m    Recording,[m
+[32m+[m[32m};[m
+[32m+[m
+ void render(uint8_t *frame);[m
+[32m+[m[32mvoid render(uint8_t *frame, FunctionIcon selectedIcon);[m
+[32m+[m[32mvoid setWifiConnected(bool connected);[m
+ [m
+ }[m
+\ No newline at end of file[m
+[1mdiff --git a/src/main.cpp b/src/main.cpp[m
+[1mindex e387c97..c03bad2 100644[m
+[1m--- a/src/main.cpp[m
+[1m+++ b/src/main.cpp[m
+[36m@@ -1,5 +1,9 @@[m
+ #include <Arduino.h>[m
+[32m+[m[32m#include <Preferences.h>[m
+ #include <Wire.h>[m
+[32m+[m[32m#include <WiFi.h>[m
+[32m+[m
+[32m+[m[32m#include <cstring>[m
+ [m
+ #include "board_pins.h"[m
+ #include "devices/epd_xingtai/epd_xingtai.h"[m
+[36m@@ -8,13 +12,16 @@[m
+ #include "devices/sd_card/sd_card.h"[m
+ #include "pages/asundar/asundar_page.h"[m
+ #include "pages/book/book_page.h"[m
+[32m+[m[32m#include "pages/calendar/calendar_page.h"[m
+ #include "pages/calculator/calculator_page.h"[m
+ #include "pages/clock/clock_page.h"[m
+ #include "pages/learn/learn_page.h"[m
+ #include "pages/main/main_page.h"[m
+ #include "pages/music/music_page.h"[m
+ #include "pages/poem/poem_page.h"[m
+[32m+[m[32m#include "pages/recording/recording_page.h"[m
+ #include "pages/settings/settings_page.h"[m
+[32m+[m[32m#include "pages/topbar/topbar_assets.h"[m
+ #include "pages/voice/voice_page.h"[m
+ [m
+ XingtaiEpd epaper;[m
+[36m@@ -31,6 +38,7 @@[m [musing PageRenderer = void (*)(uint8_t *frame);[m
+ enum class PageId : uint8_t {[m
+     Main,[m
+     Settings,[m
+[32m+[m[32m    Calendar,[m
+     Calculator,[m
+     Clock,[m
+     Book,[m
+[36m@@ -38,6 +46,7 @@[m [menum class PageId : uint8_t {[m
+     Music,[m
+     Poem,[m
+     Learn,[m
+[32m+[m[32m    Recording,[m
+ };[m
+ [m
+ struct TouchAction {[m
+[36m@@ -46,15 +55,159 @@[m [mstruct TouchAction {[m
+ };[m
+ [m
+ static uint8_t frame[XingtaiEpd::FRAME_BYTES];[m
+[32m+[m[32mstatic uint8_t transitionFrame[XingtaiEpd::FRAME_BYTES];[m
+[32m+[m[32mPreferences touchPreferences;[m
+[32m+[m[32mPreferences settingsPreferences;[m
+[32m+[m[32mPreferences wifiPreferences;[m
+[32m+[m[32mbool calibrationActive = false;[m
+[32m+[m[32muint8_t calibrationCount = 0;[m
+[32m+[m[32mTPoint calibrationRaw[3] = {};[m
+[32m+[m[32mconstexpr int16_t calibrationTargetX[3] = {20, 220, 120};[m
+[32m+[m[32mconstexpr int16_t calibrationTargetY[3] = {40, 40, 380};[m
+[32m+[m[32mconstexpr float defaultTouchTransform[6] = {[m
+[32m+[m[32m    static_cast<float>(XingtaiEpd::WIDTH - 1) / 299.0f, 0.0f, 0.0f,[m
+[32m+[m[32m    0.0f, static_cast<float>(XingtaiEpd::HEIGHT - 1) / 479.0f, 0.0f,[m
+[32m+[m[32m};[m
+[32m+[m[32mfloat touchTransform[6] = {[m
+[32m+[m[32m    defaultTouchTransform[0], defaultTouchTransform[1], defaultTouchTransform[2],[m
+[32m+[m[32m    defaultTouchTransform[3], defaultTouchTransform[4], defaultTouchTransform[5],[m
+[32m+[m[32m};[m
+ PageId currentPage = PageId::Main;[m
+ TouchAction touchAction;[m
+ bool initialEs8311Present = false;[m
+ uint8_t initialEs8311Address = 0;[m
+ bool initialFt6x36Present = false;[m
+[32m+[m[32mSettingsPage::State settingsState = {true, true, 60, 0};[m
+[32m+[m[32mbool lastWifiConnected = false;[m
+[32m+[m[32mchar savedWifiSsid[33] = {};[m
+[32m+[m[32mchar savedWifiPassword[64] = {};[m
+[32m+[m[32mchar scannedWifiNetworks[6][33] = {};[m
+[32m+[m[32muint8_t scannedWifiCount = 0;[m
+[32m+[m[32mchar wifiPasswordInput[64] = {};[m
+[32m+[m[32mchar selectedWifiSsid[33] = {};[m
+[32m+[m[32mchar sdEntryNames[8][33] = {};[m
+[32m+[m[32mbool sdEntryDirectories[8] = {};[m
+[32m+[m[32mchar contentUrl[128] = {};[m
+[32m+[m
+[32m+[m[32mvoid recoverSharedI2c();[m
+[32m+[m[32mvoid refreshCurrentPage();[m
+[32m+[m
+[32m+[m[32mvoid loadWifiCredentials() {[m
+[32m+[m[32m    if (!wifiPreferences.begin("wifi", true)) return;[m
+[32m+[m[32m    const String ssid = wifiPreferences.getString("ssid", "");[m
+[32m+[m[32m    const String password = wifiPreferences.getString("password", "");[m
+[32m+[m[32m    wifiPreferences.end();[m
+[32m+[m[32m    std::strncpy(savedWifiSsid, ssid.c_str(), sizeof(savedWifiSsid) - 1);[m
+[32m+[m[32m    std::strncpy(savedWifiPassword, password.c_str(), sizeof(savedWifiPassword) - 1);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mvoid saveWifiCredentials() {[m
+[32m+[m[32m    if (!wifiPreferences.begin("wifi", false)) return;[m
+[32m+[m[32m    wifiPreferences.putString("ssid", selectedWifiSsid);[m
+[32m+[m[32m    wifiPreferences.putString("password", wifiPasswordInput);[m
+[32m+[m[32m    wifiPreferences.end();[m
+[32m+[m[32m    std::strncpy(savedWifiSsid, selectedWifiSsid, sizeof(savedWifiSsid) - 1);[m
+[32m+[m[32m    std::strncpy(savedWifiPassword, wifiPasswordInput, sizeof(savedWifiPassword) - 1);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mvoid saveSettings() {[m
+[32m+[m[32m    if (!settingsPreferences.begin("settings", false)) {[m
+[32m+[m[32m        Serial.println("[SETTINGS] Failed to open preferences for writing");[m
+[32m+[m[32m        return;[m
+[32m+[m[32m    }[m
+[32m+[m[32m    settingsPreferences.putBool("wifi", settingsState.wifiEnabled);[m
+[32m+[m[32m    settingsPreferences.putBool("cellular", settingsState.cellularEnabled);[m
+[32m+[m[32m    settingsPreferences.putUChar("volume", settingsState.volumePercent);[m
+[32m+[m[32m    settingsPreferences.putUChar("language", settingsState.language);[m
+[32m+[m[32m    settingsPreferences.putString("contentUrl", contentUrl);[m
+[32m+[m[32m    settingsPreferences.end();[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mvoid applyWifiSetting() {[m
+[32m+[m[32m    if (settingsState.wifiEnabled) {[m
+[32m+[m[32m        WiFi.mode(WIFI_STA);[m
+[32m+[m[32m        WiFi.setAutoReconnect(true);[m
+[32m+[m[32m        configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");[m
+[32m+[m[32m        if (savedWifiSsid[0] != '\0') WiFi.begin(savedWifiSsid, savedWifiPassword);[m
+[32m+[m[32m    } else {[m
+[32m+[m[32m        WiFi.setAutoReconnect(false);[m
+[32m+[m[32m        WiFi.disconnect(true, false);[m
+[32m+[m[32m        WiFi.mode(WIFI_OFF);[m
+[32m+[m[32m    }[m
+[32m+[m[32m    Serial.printf("[SETTINGS] WiFi %s\n", settingsState.wifiEnabled ? "enabled" : "disabled");[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mvoid applyCellularSetting() {[m
+[32m+[m[32m    pinMode(BoardPins::MODEM_PWR, OUTPUT);[m
+[32m+[m[32m    digitalWrite(BoardPins::MODEM_PWR, settingsState.cellularEnabled ? HIGH : LOW);[m
+[32m+[m[32m    Serial.printf("[SETTINGS] 4G modem power %s\n", settingsState.cellularEnabled ? "enabled" : "disabled");[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mvoid applyAudioSetting() {[m
+[32m+[m[32m    if (audio.isInitialized()) audio.setOutputVolume(settingsState.volumePercent);[m
+[32m+[m[32m    audio.setSpeakerEnabled(settingsState.volumePercent > 0);[m
+[32m+[m[32m    Serial.printf("[SETTINGS] Audio volume %u%%\n", settingsState.volumePercent);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mvoid loadSettings() {[m
+[32m+[m[32m    if (settingsPreferences.begin("settings", true)) {[m
+[32m+[m[32m        settingsState.wifiEnabled = settingsPreferences.getBool("wifi", true);[m
+[32m+[m[32m        settingsState.cellularEnabled = settingsPreferences.getBool("cellular", true);[m
+[32m+[m[32m        settingsState.volumePercent = settingsPreferences.getUChar("volume", 60);[m
+[32m+[m[32m        settingsState.language = settingsPreferences.getUChar("language", 0);[m
+[32m+[m[32m        const String savedContentUrl = settingsPreferences.getString("contentUrl", "");[m
+[32m+[m[32m        std::strncpy(contentUrl, savedContentUrl.c_str(), sizeof(contentUrl) - 1);[m
+[32m+[m[32m        settingsPreferences.end();[m
+[32m+[m[32m    }[m
+[32m+[m[32m    if (settingsState.volumePercent > 100) settingsState.volumePercent = 100;[m
+[32m+[m[32m    SettingsPage::setState(settingsState);[m
+[32m+[m[32m    loadWifiCredentials();[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mvoid scanWifiNetworks() {[m
+[32m+[m[32m    SettingsPage::showWifiScanning();[m
+[32m+[m[32m    refreshCurrentPage();[m
+[32m+[m[32m    WiFi.mode(WIFI_STA);[m
+[32m+[m[32m    WiFi.disconnect();[m
+[32m+[m[32m    delay(100);[m
+[32m+[m[32m    const int found = WiFi.scanNetworks();[m
+[32m+[m[32m    scannedWifiCount = found > 0 ? static_cast<uint8_t>(found > 6 ? 6 : found) : 0;[m
+[32m+[m[32m    for (uint8_t index = 0; index < scannedWifiCount; ++index) {[m
+[32m+[m[32m        std::strncpy(scannedWifiNetworks[index], WiFi.SSID(index).c_str(), 32);[m
+[32m+[m[32m        scannedWifiNetworks[index][32] = '\0';[m
+[32m+[m[32m    }[m
+[32m+[m[32m    WiFi.scanDelete();[m
+[32m+[m[32m    SettingsPage::showWifiNetworks(scannedWifiNetworks, scannedWifiCount);[m
+[32m+[m[32m    refreshCurrentPage();[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mvoid connectSelectedWifi() {[m
+[32m+[m[32m    settingsState.wifiEnabled = true;[m
+[32m+[m[32m    SettingsPage::setState(settingsState);[m
+[32m+[m[32m    WiFi.disconnect(true, false);[m
+[32m+[m[32m    delay(100);[m
+[32m+[m[32m    WiFi.mode(WIFI_STA);[m
+[32m+[m[32m    WiFi.setAutoReconnect(true);[m
+[32m+[m[32m    WiFi.begin(selectedWifiSsid, wifiPasswordInput);[m
+[32m+[m[32m    const uint32_t started = millis();[m
+[32m+[m[32m    while (WiFi.status() != WL_CONNECTED && millis() - started < 10000) delay(100);[m
+[32m+[m[32m    if (WiFi.status() == WL_CONNECTED) {[m
+[32m+[m[32m        saveWifiCredentials();[m
+[32m+[m[32m        saveSettings();[m
+[32m+[m[32m        Serial.printf("[WIFI] Connected to %s, IP=%s\n", selectedWifiSsid,[m
+[32m+[m[32m                      WiFi.localIP().toString().c_str());[m
+[32m+[m[32m        SettingsPage::showSettings();[m
+[32m+[m[32m    } else {[m
+[32m+[m[32m        Serial.printf("[WIFI] Connection to %s failed\n", selectedWifiSsid);[m
+[32m+[m[32m        SettingsPage::showWifiPassword(selectedWifiSsid, wifiPasswordInput);[m
+[32m+[m[32m    }[m
+[32m+[m[32m    refreshCurrentPage();[m
+[32m+[m[32m}[m
+ [m
+ const char *pageName(PageId page) {[m
+     switch (page) {[m
+     case PageId::Settings: return "Settings";[m
+[32m+[m[32m    case PageId::Calendar: return "Calendar";[m
+     case PageId::Calculator: return "Calculator";[m
+     case PageId::Clock: return "Clock";[m
+     case PageId::Book: return "Book";[m
+[36m@@ -62,6 +215,7 @@[m [mconst char *pageName(PageId page) {[m
+     case PageId::Music: return "Music";[m
+     case PageId::Poem: return "Poem";[m
+     case PageId::Learn: return "Learn";[m
+[32m+[m[32m    case PageId::Recording: return "Recording";[m
+     default: return "Main";[m
+     }[m
+ }[m
+[36m@@ -69,6 +223,7 @@[m [mconst char *pageName(PageId page) {[m
+ PageRenderer rendererFor(PageId page) {[m
+     switch (page) {[m
+     case PageId::Settings: return SettingsPage::render;[m
+[32m+[m[32m    case PageId::Calendar: return CalendarPage::render;[m
+     case PageId::Calculator: return CalculatorPage::render;[m
+     case PageId::Clock: return ClockPage::render;[m
+     case PageId::Book: return BookPage::render;[m
+[36m@@ -76,23 +231,200 @@[m [mPageRenderer rendererFor(PageId page) {[m
+     case PageId::Music: return MusicPage::render;[m
+     case PageId::Poem: return PoemPage::render;[m
+     case PageId::Learn: return LearnPage::render;[m
+[32m+[m[32m    case PageId::Recording: return RecordingPage::render;[m
+     default: return MainPage::render;[m
+     }[m
+ }[m
+ [m
+[32m+[m[32mvoid refreshCurrentPage() {[m
+[32m+[m[32m    rendererFor(currentPage)(transitionFrame);[m
+[32m+[m[32m    constexpr size_t topBarBytes = static_cast<size_t>(32) * (XingtaiEpd::WIDTH / 8);[m
+[32m+[m[32m    std::memcpy(transitionFrame, frame, topBarBytes);[m
+[32m+[m[32m    epaper.displayPartial(frame, transitionFrame, 0, 32,[m
+[32m+[m[32m                          XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT - 32);[m
+[32m+[m[32m    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);[m
+[32m+[m[32m    epaper.sleep();[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mvoid refreshCurrentRegion(uint16_t x, uint16_t y, uint16_t width, uint16_t height) {[m
+[32m+[m[32m    rendererFor(currentPage)(transitionFrame);[m
+[32m+[m[32m    constexpr size_t topBarBytes = static_cast<size_t>(32) * (XingtaiEpd::WIDTH / 8);[m
+[32m+[m[32m    std::memcpy(transitionFrame, frame, topBarBytes);[m
+[32m+[m[32m    epaper.displayPartial(frame, transitionFrame, x, y, width, height);[m
+[32m+[m[32m    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);[m
+[32m+[m[32m    epaper.sleep();[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mvoid clearFrameRegion(uint8_t *buffer, int left, int top, int width, int height) {[m
+[32m+[m[32m    for (int y = top; y < top + height; ++y) {[m
+[32m+[m[32m        for (int x = left; x < left + width; ++x) {[m
+[32m+[m[32m            buffer[static_cast<size_t>(y) * (XingtaiEpd::WIDTH / 8) + x / 8] &=[m
+[32m+[m[32m                static_cast<uint8_t>(~(0x80U >> (x % 8)));[m
+[32m+[m[32m        }[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mvoid refreshWifiTopbar(bool connected) {[m
+[32m+[m[32m    MainPage::setWifiConnected(connected);[m
+[32m+[m[32m    std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);[m
+[32m+[m[32m    clearFrameRegion(transitionFrame, 178, 0, 28, 32);[m
+[32m+[m[32m    if (connected) Topbar::drawWifi(transitionFrame, 181, 2);[m
+[32m+[m[32m    epaper.displayPartial(frame, transitionFrame, 178, 0, 28, 32);[m
+[32m+[m[32m    if (!connected) {[m
+[32m+[m[32m        // Reapply the black-to-white waveform once to scrub residual pigment[m
+[32m+[m[32m        // without touching the adjacent battery icon.[m
+[32m+[m[32m        epaper.displayPartial(frame, transitionFrame, 178, 0, 28, 32);[m
+[32m+[m[32m    }[m
+[32m+[m[32m    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);[m
+[32m+[m[32m    epaper.sleep();[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mvoid updateWifiTopbar() {[m
+[32m+[m[32m    const bool connected = WiFi.status() == WL_CONNECTED;[m
+[32m+[m[32m    if (connected == lastWifiConnected) return;[m
+[32m+[m[32m    lastWifiConnected = connected;[m
+[32m+[m[32m    Serial.printf("[TOPBAR] WiFi %s\n", connected ? "connected" : "disconnected");[m
+[32m+[m[32m    refreshWifiTopbar(connected);[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mMainPage::FunctionIcon mainIconFor(PageId page) {[m
+[32m+[m[32m    switch (page) {[m
+[32m+[m[32m    case PageId::Settings: return MainPage::FunctionIcon::Settings;[m
+[32m+[m[32m    case PageId::Calendar: return MainPage::FunctionIcon::Calendar;[m
+[32m+[m[32m    case PageId::Calculator: return MainPage::FunctionIcon::Calculator;[m
+[32m+[m[32m    case PageId::Clock: return MainPage::FunctionIcon::Clock;[m
+[32m+[m[32m    case PageId::Book: return MainPage::FunctionIcon::Book;[m
+[32m+[m[32m    case PageId::Voice: return MainPage::FunctionIcon::Voice;[m
+[32m+[m[32m    case PageId::Music: return MainPage::FunctionIcon::Music;[m
+[32m+[m[32m    case PageId::Poem: return MainPage::FunctionIcon::Poem;[m
+[32m+[m[32m    case PageId::Learn: return MainPage::FunctionIcon::Learn;[m
+[32m+[m[32m    case PageId::Recording: return MainPage::FunctionIcon::Recording;[m
+[32m+[m[32m    default: return MainPage::FunctionIcon::None;[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32mbool mainIconBounds(PageId page, uint16_t &x, uint16_t &y, uint16_t &width, uint16_t &h

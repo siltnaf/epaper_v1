@@ -15,6 +15,8 @@ public:
     void reset();
     void clear(uint8_t value = 0x00);
     void display(const uint8_t *frame);
+    void displayPartial(const uint8_t *oldFrame, const uint8_t *newFrame,
+                        uint16_t x, uint16_t y, uint16_t width, uint16_t height);
     void drawTestPattern();
     void sleep();
 

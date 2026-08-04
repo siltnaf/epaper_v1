@@ -43,6 +43,7 @@ bool FT6X36::begin(uint8_t threshold)
 	_isrCounter = 0;
 	_touchActive = false;
 	_dragMode = false;
+	_tapFiredOnPress = false;
 	pinMode(_intPin, INPUT_PULLUP);
 	attachInterrupt(digitalPinToInterrupt(_intPin), FT6X36::isr, FALLING);
 	_interruptAttached = true;
@@ -61,6 +62,7 @@ void FT6X36::end()
 	_isrCounter = 0;
 	_touchActive = false;
 	_dragMode = false;
+	_tapFiredOnPress = false;
 }
 
 bool FT6X36::isOnline() const
@@ -146,6 +148,11 @@ void FT6X36::processTouch()
 		_touchActive = true;
 		_touchStartTime = millis();
 		fireEvent(point, TEvent::TouchStart);
+		// This firmware uses discrete tap targets rather than gestures. Dispatch
+		// on the interrupt-driven press sample so UI actions do not wait for the
+		// controller's later LiftUp report.
+		fireEvent(point, TEvent::Tap);
+		_tapFiredOnPress = true;
 	}
 	else if (event == TRawEvent::Contact)
 	{
@@ -157,6 +164,8 @@ void FT6X36::processTouch()
 			_touchActive = true;
 			_touchStartTime = millis();
 			fireEvent(point, TEvent::TouchStart);
+			fireEvent(point, TEvent::Tap);
+			_tapFiredOnPress = true;
 		}
 		if (_pointIdx < 10)
 		{
@@ -185,7 +194,7 @@ void FT6X36::processTouch()
 			fireEvent(point, TEvent::DragEnd);
 			_dragMode = false;
 		}
-		if (_points[0].aboutEqual(point) && _touchEndTime - _touchStartTime <= 300)
+		if (!_tapFiredOnPress && _points[0].aboutEqual(point) && _touchEndTime - _touchStartTime <= 300)
 		{
 			fireEvent(point, TEvent::Tap);
 			_points[0] = {0, 0};
@@ -193,6 +202,7 @@ void FT6X36::processTouch()
 		}
 		_touchActive = false;
 		_pointIdx = 0;
+		_tapFiredOnPress = false;
 	}
 	else
 	{

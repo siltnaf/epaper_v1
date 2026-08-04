@@ -144,5 +144,6 @@ private:
 	unsigned long _lastPollTime = 0;
 	bool _touchActive = false;
 	bool _dragMode = false;
+	bool _tapFiredOnPress = false;
 };
 #endif
