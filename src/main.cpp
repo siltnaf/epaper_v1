@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <HTTPClient.h>
 #include <Preferences.h>
 #include <Wire.h>
 #include <WiFi.h>
@@ -23,6 +24,7 @@
 #include "pages/settings/settings_page.h"
 #include "pages/topbar/topbar_assets.h"
 #include "pages/voice/voice_page.h"
+#include "ui/localization.h"
 
 XingtaiEpd epaper;
 FT6X36 touch(&Wire, BoardPins::TOUCH_INT);
@@ -87,7 +89,14 @@ char wifiPasswordInput[64] = {};
 char selectedWifiSsid[33] = {};
 char sdEntryNames[8][33] = {};
 bool sdEntryDirectories[8] = {};
-char contentUrl[128] = {};
+constexpr char CONTENT_URL_PREFIX[] = "http://";
+constexpr size_t CONTENT_URL_PREFIX_LENGTH = sizeof(CONTENT_URL_PREFIX) - 1;
+char contentUrl[128] = "http://";
+char savedContentUrl[128] = "http://";
+uint8_t lastRenderedClockMinute = 0xFF;
+volatile bool clockWeatherRequested = false;
+volatile bool clockWeatherTaskRunning = false;
+volatile bool clockWeatherUpdated = false;
 
 void recoverSharedI2c();
 void refreshCurrentPage();
@@ -124,6 +133,107 @@ void saveSettings() {
     settingsPreferences.end();
 }
 
+bool contentUrlReachable(const char *url) {
+    if (!url || std::strlen(url) <= CONTENT_URL_PREFIX_LENGTH || WiFi.status() != WL_CONNECTED) {
+        return false;
+    }
+
+    HTTPClient http;
+    http.setConnectTimeout(5000);
+    http.setTimeout(5000);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    if (!http.begin(url)) return false;
+    const int responseCode = http.GET();
+    http.end();
+    Serial.printf("[CONTENT URL] Validation %s returned HTTP code %d\n", url, responseCode);
+    return responseCode > 0;
+}
+
+void copyAsciiUpper(char *destination, size_t destinationSize, const String &source) {
+    if (!destination || destinationSize == 0) return;
+    size_t output = 0;
+    bool previousSpace = true;
+    for (size_t index = 0; index < source.length() && output + 1 < destinationSize; ++index) {
+        unsigned char character = static_cast<unsigned char>(source[index]);
+        if (character >= 'a' && character <= 'z') character -= 'a' - 'A';
+        if (character >= 32 && character <= 126) {
+            if (character == ' ' && previousSpace) continue;
+            destination[output++] = static_cast<char>(character);
+            previousSpace = character == ' ';
+        }
+    }
+    while (output > 0 && destination[output - 1] == ' ') --output;
+    destination[output] = '\0';
+}
+
+bool fetchClockWeather() {
+    if (WiFi.status() != WL_CONNECTED) {
+        return false;
+    }
+
+    HTTPClient http;
+    http.setConnectTimeout(7000);
+    http.setTimeout(7000);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    http.setUserAgent("ESP32-ePaper-Clock/1.0");
+    // wttr.in resolves the public IP to a location and returns a deliberately
+    // compact, pipe-separated response: location|condition|temperature.
+    if (!http.begin("http://wttr.in/?format=%25l%7C%25C%7C%25t")) return false;
+    const int responseCode = http.GET();
+    const String response = responseCode > 0 ? http.getString() : String();
+    http.end();
+    if (responseCode < 200 || responseCode >= 400) {
+        Serial.printf("[CLOCK] Weather request failed with HTTP code %d\n", responseCode);
+        return false;
+    }
+
+    const int firstSeparator = response.indexOf('|');
+    const int secondSeparator = response.indexOf('|', firstSeparator + 1);
+    if (firstSeparator <= 0 || secondSeparator <= firstSeparator) {
+        Serial.printf("[CLOCK] Unexpected weather response: %s\n", response.c_str());
+        return false;
+    }
+
+    char location[32] = {};
+    char condition[32] = {};
+    char temperature[12] = {};
+    copyAsciiUpper(location, sizeof(location), response.substring(0, firstSeparator));
+    copyAsciiUpper(condition, sizeof(condition), response.substring(firstSeparator + 1, secondSeparator));
+    copyAsciiUpper(temperature, sizeof(temperature), response.substring(secondSeparator + 1));
+    ClockPage::setWeather(location, condition, temperature, true);
+    clockWeatherUpdated = true;
+    Serial.printf("[CLOCK] Weather updated: %s, %s, %s\n", location, condition, temperature);
+    return true;
+}
+
+void clockWeatherTask(void *) {
+    clockWeatherTaskRunning = true;
+    uint32_t nextAttemptMs = 0;
+    while (clockWeatherRequested) {
+        const uint32_t nowMs = millis();
+        if (static_cast<int32_t>(nowMs - nextAttemptMs) >= 0) {
+            const bool updated = fetchClockWeather();
+            // Retry quickly while Wi-Fi, DNS, or the weather endpoint is still
+            // becoming available. Once successful, refresh every 30 minutes.
+            nextAttemptMs = nowMs + (updated ? 30UL * 60UL * 1000UL : 10UL * 1000UL);
+        }
+        vTaskDelay(pdMS_TO_TICKS(250));
+    }
+    clockWeatherTaskRunning = false;
+    vTaskDelete(nullptr);
+}
+
+void prepareClockPage() {
+    clockWeatherRequested = true;
+    if (!clockWeatherTaskRunning) {
+        xTaskCreate(clockWeatherTask, "clock-weather", 6144, nullptr, 1, nullptr);
+    }
+    time_t now = time(nullptr);
+    tm timeInfo = {};
+    localtime_r(&now, &timeInfo);
+    lastRenderedClockMinute = static_cast<uint8_t>(timeInfo.tm_min);
+}
+
 void applyWifiSetting() {
     if (settingsState.wifiEnabled) {
         WiFi.mode(WIFI_STA);
@@ -151,6 +261,7 @@ void applyAudioSetting() {
 }
 
 void loadSettings() {
+    bool migratedContentUrl = false;
     if (settingsPreferences.begin("settings", true)) {
         settingsState.wifiEnabled = settingsPreferences.getBool("wifi", true);
         settingsState.cellularEnabled = settingsPreferences.getBool("cellular", true);
@@ -159,12 +270,31 @@ void loadSettings() {
         const String savedContentUrl = settingsPreferences.getString("contentUrl", "");
         const String savedVoice = settingsPreferences.getString("ttsVoice", "Jasper");
         std::strncpy(contentUrl, savedContentUrl.c_str(), sizeof(contentUrl) - 1);
+        if (contentUrl[0] == '\0') std::strcpy(contentUrl, CONTENT_URL_PREFIX);
+        // Migrate the known mistyped local server address used by earlier
+        // firmware/settings. The active epaper_s3 API is at 192.168.2.220.
+        constexpr char MISTYPED_CONTENT_HOST[] = "http://192.169.2.220";
+        constexpr size_t MISTYPED_CONTENT_HOST_LENGTH = sizeof(MISTYPED_CONTENT_HOST) - 1;
+        if (std::strncmp(contentUrl, MISTYPED_CONTENT_HOST,
+                         MISTYPED_CONTENT_HOST_LENGTH) == 0) {
+            const char *suffix = contentUrl + MISTYPED_CONTENT_HOST_LENGTH;
+            char corrected[sizeof(contentUrl)] = {};
+            snprintf(corrected, sizeof(corrected), "http://192.168.2.220%s", suffix);
+            std::strncpy(contentUrl, corrected, sizeof(contentUrl) - 1);
+            contentUrl[sizeof(contentUrl) - 1] = '\0';
+            migratedContentUrl = true;
+            Serial.printf("[CONTENT URL] Migrated mistyped server URL to %s\n", contentUrl);
+        }
+        std::strncpy(::savedContentUrl, contentUrl, sizeof(::savedContentUrl) - 1);
+        ::savedContentUrl[sizeof(::savedContentUrl) - 1] = '\0';
         SettingsPage::setVoice(savedVoice.c_str());
         settingsPreferences.end();
     }
     if (settingsState.volumePercent > 100) settingsState.volumePercent = 100;
     SettingsPage::setState(settingsState);
+    UiLocalization::setLanguage(settingsState.language);
     loadWifiCredentials();
+    if (migratedContentUrl) saveSettings();
 }
 
 void scanWifiNetworks() {
@@ -192,10 +322,35 @@ void connectSelectedWifi() {
     WiFi.mode(WIFI_STA);
     WiFi.setAutoReconnect(true);
     WiFi.begin(selectedWifiSsid, wifiPasswordInput);
-    const uint32_t started = millis();
+    uint32_t started = millis();
     while (WiFi.status() != WL_CONNECTED && millis() - started < 10000) delay(100);
+
+    bool usedSavedPassword = false;
+    const bool sameSavedNetwork = savedWifiSsid[0] != '\0' &&
+        std::strcmp(selectedWifiSsid, savedWifiSsid) == 0;
+    const bool passwordChanged = std::strcmp(wifiPasswordInput, savedWifiPassword) != 0;
+    if (WiFi.status() != WL_CONNECTED && sameSavedNetwork && passwordChanged) {
+        Serial.printf("[WIFI] New password failed for %s; retrying last successful password\n",
+                      selectedWifiSsid);
+        WiFi.disconnect(true, false);
+        delay(100);
+        WiFi.mode(WIFI_STA);
+        WiFi.setAutoReconnect(true);
+        WiFi.begin(selectedWifiSsid, savedWifiPassword);
+        started = millis();
+        while (WiFi.status() != WL_CONNECTED && millis() - started < 10000) delay(100);
+        usedSavedPassword = WiFi.status() == WL_CONNECTED;
+    }
+
     if (WiFi.status() == WL_CONNECTED) {
-        saveWifiCredentials();
+        if (usedSavedPassword) {
+            std::strncpy(wifiPasswordInput, savedWifiPassword, sizeof(wifiPasswordInput) - 1);
+            wifiPasswordInput[sizeof(wifiPasswordInput) - 1] = '\0';
+            Serial.printf("[WIFI] Reconnected to %s with last successful password\n",
+                          selectedWifiSsid);
+        } else {
+            saveWifiCredentials();
+        }
         saveSettings();
         Serial.printf("[WIFI] Connected to %s, IP=%s\n", selectedWifiSsid,
                       WiFi.localIP().toString().c_str());
@@ -288,6 +443,22 @@ void updateWifiTopbar() {
     lastWifiConnected = connected;
     Serial.printf("[TOPBAR] WiFi %s\n", connected ? "connected" : "disconnected");
     refreshWifiTopbar(connected);
+}
+
+void updateClockPage() {
+    if (currentPage != PageId::Clock) return;
+    if (clockWeatherUpdated) {
+        clockWeatherUpdated = false;
+        refreshCurrentPage();
+        return;
+    }
+    time_t now = time(nullptr);
+    tm timeInfo = {};
+    localtime_r(&now, &timeInfo);
+    const uint8_t minute = static_cast<uint8_t>(timeInfo.tm_min);
+    if (minute == lastRenderedClockMinute) return;
+    lastRenderedClockMinute = minute;
+    refreshCurrentPage();
 }
 
 MainPage::FunctionIcon mainIconFor(PageId page) {
@@ -533,6 +704,7 @@ void handleTouch(TPoint point, TEvent event) {
             return;
         case SettingsPage::Action::CycleLanguage:
             settingsState.language = settingsState.language == 0 ? 1 : 0;
+            UiLocalization::setLanguage(settingsState.language);
             break;
         case SettingsPage::Action::OpenVoiceSelection:
             SettingsPage::showVoiceSelection();
@@ -631,7 +803,7 @@ void handleTouch(TPoint point, TEvent event) {
         }
         case SettingsPage::Action::UrlBackspace: {
             const size_t length = std::strlen(contentUrl);
-            if (length > 0) contentUrl[length - 1] = '\0';
+            if (length > CONTENT_URL_PREFIX_LENGTH) contentUrl[length - 1] = '\0';
             SettingsPage::showContentUrl(contentUrl);
             refreshCurrentRegion(10, 68, 220, 58);
             return;
@@ -652,17 +824,23 @@ void handleTouch(TPoint point, TEvent event) {
             refreshCurrentPage();
             return;
         case SettingsPage::Action::UrlSave:
-            saveSettings();
-            SettingsPage::showSettings();
+            if (contentUrlReachable(contentUrl)) {
+                std::strncpy(savedContentUrl, contentUrl, sizeof(savedContentUrl) - 1);
+                savedContentUrl[sizeof(savedContentUrl) - 1] = '\0';
+                saveSettings();
+                SettingsPage::showSettings();
+                Serial.printf("[CONTENT URL] Saved reachable URL: %s\n", contentUrl);
+            } else {
+                std::strncpy(contentUrl, savedContentUrl, sizeof(contentUrl) - 1);
+                contentUrl[sizeof(contentUrl) - 1] = '\0';
+                SettingsPage::showContentUrl(contentUrl);
+                Serial.printf("[CONTENT URL] New URL unreachable; restored: %s\n", contentUrl);
+            }
             refreshCurrentPage();
             return;
         case SettingsPage::Action::UrlCancel:
-            if (settingsPreferences.begin("settings", true)) {
-                const String saved = settingsPreferences.getString("contentUrl", "");
-                settingsPreferences.end();
-                std::strncpy(contentUrl, saved.c_str(), sizeof(contentUrl) - 1);
-                contentUrl[sizeof(contentUrl) - 1] = '\0';
-            }
+            std::strncpy(contentUrl, savedContentUrl, sizeof(contentUrl) - 1);
+            contentUrl[sizeof(contentUrl) - 1] = '\0';
             SettingsPage::showSettings();
             refreshCurrentPage();
             return;
@@ -672,6 +850,25 @@ void handleTouch(TPoint point, TEvent event) {
         saveSettings();
         SettingsPage::setState(settingsState);
         refreshCurrentPage();
+        return;
+    }
+
+    if (currentPage == PageId::Calendar) {
+        const CalendarPage::Action action = CalendarPage::actionAt(uiX, uiY);
+        if (action != CalendarPage::Action::None) {
+            CalendarPage::navigate(action);
+            refreshCurrentPage();
+        }
+        return;
+    }
+
+    if (currentPage == PageId::Calculator) {
+        if (CalculatorPage::handleTap(uiX, uiY)) refreshCurrentPage();
+        return;
+    }
+
+    if (currentPage == PageId::Book) {
+        if (BookPage::handleTap(uiX, uiY)) refreshCurrentPage();
         return;
     }
 
@@ -774,8 +971,17 @@ void processTouchAction() {
     const PageId nextPage = touchAction.page;
     touchAction.pending = false;
 
+    if (currentPage == PageId::Clock && nextPage != PageId::Clock) {
+        clockWeatherRequested = false;
+    }
+
     Serial.printf("[UI] Opening %s page\n", pageName(nextPage));
     if (nextPage == PageId::Settings) SettingsPage::showSettings();
+    if (nextPage == PageId::Clock) prepareClockPage();
+    if (nextPage == PageId::Book) {
+        BookPage::setContentUrl(contentUrl);
+        BookPage::openLibrary();
+    }
     rendererFor(nextPage)(transitionFrame);
 
     // Keep the current top-bar pixels untouched and refresh only the function
@@ -899,5 +1105,6 @@ void loop() {
     touch.loop();
     processTouchAction();
     updateWifiTopbar();
+    updateClockPage();
     delay(5);
 }

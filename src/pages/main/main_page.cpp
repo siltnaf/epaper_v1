@@ -4,6 +4,8 @@
 
 #include "devices/epd_xingtai/epd_xingtai.h"
 #include "pages/settings/settings_bitmap.h"
+#include "pages/calendar/calendar_bitmap.h"
+#include "pages/recording/recording_bitmap.h"
 #include "pages/book/book_bitmap.h"
 #include "pages/voice/voice_bitmap.h"
 #include "pages/calculator/calculator_bitmap.h"
@@ -29,30 +31,6 @@ void hline(uint8_t *frame, int x, int y, int width) {
 
 void vline(uint8_t *frame, int x, int y, int height) {
     for (int i = 0; i < height; ++i) pixel(frame, x, y + i);
-}
-
-void fillRect(uint8_t *frame, int x, int y, int width, int height) {
-    for (int row = 0; row < height; ++row) hline(frame, x, y + row, width);
-}
-
-void circle(uint8_t *frame, int centerX, int centerY, int radius) {
-    for (int y = -radius; y <= radius; ++y) {
-        for (int x = -radius; x <= radius; ++x) {
-            if (x * x + y * y <= radius * radius) pixel(frame, centerX + x, centerY + y);
-        }
-    }
-}
-
-void circleOutline(uint8_t *frame, int centerX, int centerY, int radius, int thickness) {
-    const int innerRadius = radius - thickness;
-    for (int y = -radius; y <= radius; ++y) {
-        for (int x = -radius; x <= radius; ++x) {
-            const int distance = x * x + y * y;
-            if (distance <= radius * radius && distance >= innerRadius * innerRadius) {
-                pixel(frame, centerX + x, centerY + y);
-            }
-        }
-    }
 }
 
 void roundedFrame(uint8_t *frame, int x, int y, int width, int height) {
@@ -115,38 +93,6 @@ void icon(uint8_t *frame, int x, int y, const uint8_t *bitmap, bool selected) {
     }
 }
 
-void calendarIcon(uint8_t *frame, int x, int y, bool selected) {
-    constexpr int padding = 4;
-    roundedFrame(frame, x - padding, y - padding, 56, 56, selected);
-
-    // Rasterized from src/pages/calendar/calendar.svg (24x24 viewBox).
-    circleOutline(frame, x + 24, y + 28, 20, 3);
-    hline(frame, x + 4, y + 18, 40);
-    vline(frame, x + 14, y + 4, 7);
-    vline(frame, x + 34, y + 4, 7);
-    hline(frame, x + 5, y + 18, 38);
-
-    // The source SVG contains the date mark "12" in the body.
-    hline(frame, x + 15, y + 29, 4);
-    vline(frame, x + 18, y + 29, 10);
-    hline(frame, x + 15, y + 38, 7);
-    circleOutline(frame, x + 29, y + 34, 5, 2);
-}
-
-void recordingIcon(uint8_t *frame, int x, int y, bool selected) {
-    constexpr int padding = 4;
-    roundedFrame(frame, x - padding, y - padding, 56, 56, selected);
-
-    // Rasterized from src/pages/recording/recording.svg (64x64 viewBox).
-    circleOutline(frame, x + 24, y + 17, 12, 4);
-    fillRect(frame, x + 12, y + 17, 4, 17);
-    fillRect(frame, x + 32, y + 17, 4, 17);
-    circleOutline(frame, x + 24, y + 31, 15, 3);
-    fillRect(frame, x + 21, y + 38, 6, 7);
-    fillRect(frame, x + 17, y + 44, 14, 4);
-    fillRect(frame, x + 21, y + 48, 6, 1);
-}
-
 }
 
 namespace MainPage {
@@ -176,7 +122,7 @@ void render(uint8_t *frame, FunctionIcon selectedIcon) {
     const int y2 = y1 + iconSize + rowGap;
     const int y3 = y2 + iconSize + rowGap;
     icon(frame, x1, y1, SettingsBitmap::DATA, selectedIcon == FunctionIcon::Settings);
-    calendarIcon(frame, x2, y1, selectedIcon == FunctionIcon::Calendar);
+    icon(frame, x2, y1, CalendarBitmap::DATA, selectedIcon == FunctionIcon::Calendar);
     icon(frame, x3, y1, CalculatorBitmap::DATA, selectedIcon == FunctionIcon::Calculator);
     icon(frame, x1, y2, ClockBitmap::DATA, selectedIcon == FunctionIcon::Clock);
     icon(frame, x2, y2, BookBitmap::DATA, selectedIcon == FunctionIcon::Book);
@@ -184,7 +130,8 @@ void render(uint8_t *frame, FunctionIcon selectedIcon) {
     icon(frame, x1, y3, MusicBitmap::DATA, selectedIcon == FunctionIcon::Music);
     icon(frame, x2, y3, PoemBitmap::DATA, selectedIcon == FunctionIcon::Poem);
     icon(frame, x3, y3, LearnBitmap::DATA, selectedIcon == FunctionIcon::Learn);
-    recordingIcon(frame, x1, y3 + iconSize + rowGap, selectedIcon == FunctionIcon::Recording);
+    icon(frame, x1, y3 + iconSize + rowGap, RecordingBitmap::DATA,
+         selectedIcon == FunctionIcon::Recording);
 }
 
 }

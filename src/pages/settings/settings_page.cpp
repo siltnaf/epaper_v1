@@ -2,6 +2,7 @@
 
 #include "devices/epd_xingtai/epd_xingtai.h"
 #include "font/basic_font.h"
+#include "ui/localization.h"
 
 #include <cstring>
 
@@ -176,10 +177,15 @@ void fillRect(uint8_t *frame, int x, int y, int width, int height) {
 }
 
 int textWidth(const char *text, int scale) {
+    if (text && static_cast<uint8_t>(*text) >= 0x80) return UiLocalization::textWidth(text, scale);
     return text && *text ? static_cast<int>(std::strlen(text)) * (BasicFont::ENGLISH_WIDTH + 1) * scale - scale : 0;
 }
 
 void text(uint8_t *frame, int x, int y, const char *value, int scale = 2) {
+    if (value && static_cast<uint8_t>(*value) >= 0x80) {
+        UiLocalization::drawText(frame, x, y, value, scale);
+        return;
+    }
     for (const char *cursor = value; cursor && *cursor; ++cursor) {
         if (*cursor == ' ') {
             x += (BasicFont::ENGLISH_WIDTH + 1) * scale;
@@ -209,7 +215,8 @@ void toggle(uint8_t *frame, int x, int y, bool enabled) {
     rect(frame, x + 1, y + 1, width - 2, height - 2);
     const int knobX = enabled ? x + width - 22 : x + 4;
     fillRect(frame, knobX, y + 4, 18, height - 8);
-    text(frame, x - 38, y + 7, enabled ? "ON" : "OFF", 1);
+    text(frame, x - 38, y + 7,
+         UiLocalization::isChinese() ? (enabled ? "开" : "关") : (enabled ? "ON" : "OFF"), 1);
 }
 
 bool inRect(int16_t x, int16_t y, int left, int top, int width, int height) {
@@ -230,7 +237,8 @@ void button(uint8_t *frame, int x, int y, int width, int height, const char *lab
 }
 
 void renderSettings(uint8_t *frame) {
-    centeredText(frame, 40, "SETTINGS", 1);
+    const bool cn = UiLocalization::isChinese();
+    centeredText(frame, 40, cn ? "设置" : "SETTINGS", 1);
 
     constexpr int rowTop = 58;
     constexpr int rowHeight = 40;
@@ -238,10 +246,10 @@ void renderSettings(uint8_t *frame) {
     const auto rowY = [](int index) { return 58 + index * 44; };
 
     rect(frame, 16, rowY(0), 208, rowHeight);
-    text(frame, 28, rowY(0) + 13, "CONTENT URL", 2);
+    text(frame, 28, rowY(0) + 13, cn ? "内容网址" : "CONTENT URL", cn ? 1 : 2);
 
     rect(frame, 16, rowY(1), 208, rowHeight);
-    text(frame, 28, rowY(1) + 13, "WIFI", 2);
+    text(frame, 28, rowY(1) + 13, cn ? "无线网络" : "WIFI", cn ? 1 : 2);
     toggle(frame, 156, rowY(1) + 7, state.wifiEnabled);
 
     rect(frame, 16, rowY(2), 208, rowHeight);
@@ -249,19 +257,19 @@ void renderSettings(uint8_t *frame) {
     toggle(frame, 156, rowY(2) + 7, state.cellularEnabled);
 
     rect(frame, 16, rowY(3), 208, rowHeight);
-    text(frame, 28, rowY(3) + 13, "SD CARD", 2);
-    text(frame, 154, rowY(3) + 14, sdMounted ? "READY" : "NONE", 1);
+    text(frame, 28, rowY(3) + 13, cn ? "存储卡" : "SD CARD", cn ? 1 : 2);
+    text(frame, 154, rowY(3) + 14, cn ? (sdMounted ? "就绪" : "未找到") : (sdMounted ? "READY" : "NONE"), 1);
 
     rect(frame, 16, rowY(4), 208, rowHeight);
-    text(frame, 28, rowY(4) + 13, "LANGUAGE", 2);
-    text(frame, 166, rowY(4) + 14, state.language == 0 ? "EN" : "CN", 1);
+    text(frame, 28, rowY(4) + 13, cn ? "语言" : "LANGUAGE", cn ? 1 : 2);
+    text(frame, 166, rowY(4) + 14, cn ? "中文" : "EN", 1);
 
     rect(frame, 16, rowY(5), 208, rowHeight);
-    text(frame, 28, rowY(5) + 13, "TTS VOICE", 2);
+    text(frame, 28, rowY(5) + 13, cn ? "语音" : "TTS VOICE", cn ? 1 : 2);
     text(frame, 154, rowY(5) + 14, VOICES[selectedVoice], 1);
 
     rect(frame, 16, rowY(6), 208, rowHeight);
-    text(frame, 28, rowY(6) + 13, "AUDIO", 2);
+    text(frame, 28, rowY(6) + 13, cn ? "音量" : "AUDIO", cn ? 1 : 2);
     button(frame, 132, rowY(6) + 4, 28, 32, "-");
     button(frame, 188, rowY(6) + 4, 28, 32, "+");
 
@@ -276,8 +284,9 @@ void renderSettings(uint8_t *frame) {
 }
 
 void renderVoices(uint8_t *frame) {
-    centeredText(frame, 30, "TTS VOICE", 2);
-    text(frame, 22, 56, "SELECT VOICE", 1);
+    const bool cn = UiLocalization::isChinese();
+    centeredText(frame, 34, cn ? "语音" : "TTS VOICE", 1);
+    text(frame, 22, 56, cn ? "选择语音" : "SELECT VOICE", 1);
     for (uint8_t index = 0; index < VOICE_COUNT; ++index) {
         const int column = index % 2;
         const int row = index / 2;
@@ -290,14 +299,15 @@ void renderVoices(uint8_t *frame) {
         }
         text(frame, x + 24, y + 13, VOICES[index], 1);
     }
-    button(frame, 14, 260, 100, 40, "BACK");
+    button(frame, 14, 260, 100, 40, cn ? "返回" : "BACK");
 }
 
 void renderNetworks(uint8_t *frame) {
-    centeredText(frame, 48, "SELECT WIFI", 2);
+    const bool cn = UiLocalization::isChinese();
+    centeredText(frame, 48, cn ? "选择无线网络" : "SELECT WIFI", cn ? 1 : 2);
     if (networkCount == 0) {
-        centeredText(frame, 150, "NO NETWORKS", 2);
-        button(frame, 70, 210, 100, 42, "RETRY");
+        centeredText(frame, 150, cn ? "未找到网络" : "NO NETWORKS", cn ? 1 : 2);
+        button(frame, 70, 210, 100, 42, cn ? "重试" : "RETRY");
         return;
     }
     for (uint8_t index = 0; index < networkCount; ++index) {
@@ -308,20 +318,22 @@ void renderNetworks(uint8_t *frame) {
 }
 
 void renderSd(uint8_t *frame) {
-    centeredText(frame, 42, "SD CARD", 2);
-    if (sdCount == 0) centeredText(frame, 92, "EMPTY", 2);
+    const bool cn = UiLocalization::isChinese();
+    centeredText(frame, 42, cn ? "存储卡" : "SD CARD", cn ? 1 : 2);
+    if (sdCount == 0) centeredText(frame, 92, cn ? "空" : "EMPTY", cn ? 1 : 2);
     for (uint8_t i = 0; i < sdCount; ++i) {
         const int y = 74 + i * 30;
         clippedText(frame, 20, y, sdNames[i], 30, 1);
-        if (sdDirectories[i]) text(frame, 190, y, "DIR", 1);
+        if (sdDirectories[i]) text(frame, UiLocalization::isChinese() ? 174 : 190, y,
+                                   UiLocalization::isChinese() ? "文件夹" : "DIR", 1);
     }
     if (formatPending) {
-        centeredText(frame, 300, "ERASE SD?", 2);
-        button(frame, 18, 340, 96, 42, "CANCEL");
-        button(frame, 126, 340, 96, 42, "CONFIRM");
+        centeredText(frame, 300, cn ? "擦除存储卡" : "ERASE SD?", cn ? 1 : 2);
+        button(frame, 18, 340, 96, 42, cn ? "取消" : "CANCEL");
+        button(frame, 126, 340, 96, 42, cn ? "确认" : "CONFIRM");
     } else {
-        button(frame, 18, 340, 96, 42, "BACK");
-        button(frame, 126, 340, 96, 42, "FORMAT");
+        button(frame, 18, 340, 96, 42, cn ? "返回" : "BACK");
+        button(frame, 126, 340, 96, 42, cn ? "格式化" : "FORMAT");
     }
 }
 
@@ -332,12 +344,15 @@ const char (*currentKeys())[11] {
 }
 
 void renderPassword(uint8_t *frame) {
-    centeredText(frame, 42, "WIFI PASSWORD", 2);
+    const bool cn = UiLocalization::isChinese();
+    centeredText(frame, 42, cn ? "无线网络密码" : "WIFI PASSWORD", cn ? 1 : 2);
     clippedText(frame, 12, 68, selectedSsid, 34, 1);
     rect(frame, 10, 88, 220, 38);
     const size_t length = std::strlen(enteredPassword);
-    const char *visiblePassword = length > 34 ? enteredPassword + length - 34 : enteredPassword;
-    clippedText(frame, 18, 104, visiblePassword, 34, 1);
+    constexpr size_t visiblePasswordCharacters = 17;
+    const char *visiblePassword = length > visiblePasswordCharacters
+        ? enteredPassword + length - visiblePasswordCharacters : enteredPassword;
+    clippedText(frame, 18, 100, visiblePassword, visiblePasswordCharacters, 2);
 
     const char (*keys)[11] = currentKeys();
     for (int row = 0; row < 3; ++row) {
@@ -348,25 +363,31 @@ void renderPassword(uint8_t *frame) {
         for (int column = 0; column < count; ++column) {
             rect(frame, startX + column * keyWidth, y, keyWidth, 40);
             char label[2] = {keys[row][column], '\0'};
-            text(frame, startX + column * keyWidth + 9, y + 16, label, 1);
+            text(frame, startX + column * keyWidth + (keyWidth - textWidth(label, 2)) / 2,
+                 y + (40 - BasicFont::ENGLISH_HEIGHT * 2) / 2, label, 2);
         }
     }
 
     button(frame, 8, 288, 54, 38, keyboard == Keyboard::Lowercase ? "ABC" :
            keyboard == Keyboard::Uppercase ? "123" : "abc");
-    button(frame, 66, 288, 108, 38, "SPACE");
-    button(frame, 178, 288, 54, 38, "DEL");
-    button(frame, 8, 342, 108, 44, "CONNECT");
-    button(frame, 124, 342, 108, 44, "CANCEL");
+    button(frame, 66, 288, 108, 38, cn ? "空格" : "SPACE");
+    button(frame, 178, 288, 54, 38, cn ? "删除" : "DEL");
+    button(frame, 8, 342, 108, 44, cn ? "连接" : "CONNECT");
+    button(frame, 124, 342, 108, 44, cn ? "取消" : "CANCEL");
 }
 
 void renderContentUrl(uint8_t *frame) {
-    centeredText(frame, 42, "CONTENT URL", 2);
+    const bool cn = UiLocalization::isChinese();
+    centeredText(frame, 42, cn ? "内容网址" : "CONTENT URL", cn ? 1 : 2);
     rect(frame, 10, 68, 220, 58);
     const size_t length = std::strlen(enteredUrl);
-    const char *visible = length > 68 ? enteredUrl + length - 68 : enteredUrl;
-    clippedText(frame, 18, 84, visible, 34, 1);
-    if (std::strlen(visible) > 34) clippedText(frame, 18, 102, visible + 34, 34, 1);
+    constexpr size_t charactersPerLine = 17;
+    constexpr size_t visibleCharacters = charactersPerLine * 2;
+    const char *visible = length > visibleCharacters ? enteredUrl + length - visibleCharacters : enteredUrl;
+    clippedText(frame, 18, 78, visible, charactersPerLine, 2);
+    if (std::strlen(visible) > charactersPerLine) {
+        clippedText(frame, 18, 98, visible + charactersPerLine, charactersPerLine, 2);
+    }
 
     const char (*keys)[11] = currentKeys();
     for (int row = 0; row < 3; ++row) {
@@ -377,15 +398,16 @@ void renderContentUrl(uint8_t *frame) {
         for (int column = 0; column < count; ++column) {
             rect(frame, startX + column * keyWidth, y, keyWidth, 40);
             char label[2] = {keys[row][column], '\0'};
-            text(frame, startX + column * keyWidth + 9, y + 16, label, 1);
+            text(frame, startX + column * keyWidth + (keyWidth - textWidth(label, 2)) / 2,
+                 y + (40 - BasicFont::ENGLISH_HEIGHT * 2) / 2, label, 2);
         }
     }
     button(frame, 8, 288, 54, 38, keyboard == Keyboard::Lowercase ? "ABC" :
            keyboard == Keyboard::Uppercase ? "123" : "abc");
-    button(frame, 66, 288, 108, 38, "SPACE");
-    button(frame, 178, 288, 54, 38, "DEL");
-    button(frame, 8, 342, 108, 44, "SAVE");
-    button(frame, 124, 342, 108, 44, "CANCEL");
+    button(frame, 66, 288, 108, 38, cn ? "空格" : "SPACE");
+    button(frame, 178, 288, 54, 38, cn ? "删除" : "DEL");
+    button(frame, 8, 342, 108, 44, cn ? "保存" : "SAVE");
+    button(frame, 124, 342, 108, 44, cn ? "取消" : "CANCEL");
 }
 
 }
@@ -398,7 +420,7 @@ void setState(const State &newState) {
 
 void render(uint8_t *frame) {
     std::memset(frame, 0x00, XingtaiEpd::FRAME_BYTES);
-    if (view == View::Scanning) centeredText(frame, 170, "SCANNING WIFI", 2);
+    if (view == View::Scanning) centeredText(frame, 170, UiLocalization::isChinese() ? "正在扫描无线网络" : "SCANNING WIFI", UiLocalization::isChinese() ? 1 : 2);
     else if (view == View::Networks) renderNetworks(frame);
     else if (view == View::Password) renderPassword(frame);
     else if (view == View::Sd) renderSd(frame);

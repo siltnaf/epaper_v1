@@ -1,12 +1,19 @@
 #include "pages/calendar/calendar_page.h"
 
 #include "devices/epd_xingtai/epd_xingtai.h"
+#include "ui/localization.h"
 
 #include <Arduino.h>
 #include <cstring>
 #include <ctime>
 
 namespace {
+
+int viewedYear = 0;
+int viewedMonth = 0;
+int currentYear = 0;
+int currentMonth = 0;
+int currentDay = 0;
 
 void pixel(uint8_t *frame, int x, int y) {
     if (x < 0 || x >= XingtaiEpd::WIDTH || y < 0 || y >= XingtaiEpd::HEIGHT) return;
@@ -71,10 +78,68 @@ void text(uint8_t *frame, int x, int y, const char *value, int scale = 1) {
     }
 }
 
+void dateText(uint8_t *frame, int x, int y, const char *value) {
+    for (const char *cursor = value; cursor && *cursor; ++cursor) {
+        const uint8_t *bitmap = glyph(*cursor);
+        if (bitmap) {
+            for (int row = 0; row < 7; ++row) {
+                const int top = y + row * 3 / 2;
+                const int bottom = y + (row + 1) * 3 / 2;
+                for (int column = 0; column < 5; ++column) {
+                    if ((bitmap[row] & (0x10U >> column)) == 0) continue;
+                    const int left = x + column * 3 / 2;
+                    const int right = x + (column + 1) * 3 / 2;
+                    fillRect(frame, left, top, right - left, bottom - top);
+                }
+            }
+        }
+        x += 9;
+    }
+}
+
+int dateTextWidth(const char *value) {
+    return value && *value ? static_cast<int>(std::strlen(value)) * 9 - 1 : 0;
+}
+
 int daysInMonth(int year, int month) {
     static const int days[] = {31,28,31,30,31,30,31,31,30,31,30,31};
     if (month == 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0)) return 29;
     return days[month - 1];
+}
+
+int textWidth(const char *value, int scale) {
+    return value && *value ? static_cast<int>(std::strlen(value)) * 6 * scale - scale : 0;
+}
+
+void chevron(uint8_t *frame, int centerX, int centerY, bool right) {
+    for (int offset = -4; offset <= 4; ++offset) {
+        const int x = right ? centerX - abs(offset) / 2 : centerX + abs(offset) / 2;
+        pixel(frame, x, centerY + offset);
+    }
+}
+
+void navigationButton(uint8_t *frame, int x, bool right, bool year) {
+    rect(frame, x, 36, 28, 28);
+    chevron(frame, x + (year ? 10 : 14), 49, right);
+    if (year) chevron(frame, x + 17, 49, right);
+}
+
+void loadCurrentDate() {
+    time_t now = time(nullptr);
+    struct tm current = {};
+    localtime_r(&now, &current);
+    currentYear = current.tm_year + 1900;
+    currentMonth = current.tm_mon + 1;
+    currentDay = current.tm_mday;
+    if (currentYear < 2020) {
+        currentYear = 2026;
+        currentMonth = 1;
+        currentDay = 1;
+    }
+    if (viewedYear == 0) {
+        viewedYear = currentYear;
+        viewedMonth = currentMonth;
+    }
 }
 
 }
@@ -82,49 +147,85 @@ int daysInMonth(int year, int month) {
 namespace CalendarPage {
 void render(uint8_t *frame) {
     std::memset(frame, 0x00, XingtaiEpd::FRAME_BYTES);
-    time_t now = time(nullptr);
-    struct tm current = {};
-    localtime_r(&now, &current);
-    int year = current.tm_year + 1900;
-    int month = current.tm_mon + 1;
-    int today = current.tm_mday;
-    if (year < 2020) { year = 2026; month = 1; today = 1; }
+    loadCurrentDate();
+
+    navigationButton(frame, 8, false, true);
+    navigationButton(frame, 40, false, false);
+    navigationButton(frame, 172, true, false);
+    navigationButton(frame, 204, true, true);
 
     char title[16] = {};
-    snprintf(title, sizeof(title), "%04d-%02d", year, month);
-    text(frame, 78, 14, title, 2);
+    snprintf(title, sizeof(title), "%04d-%02d", viewedYear, viewedMonth);
+    text(frame, (XingtaiEpd::WIDTH - textWidth(title, 2)) / 2, 43, title, 2);
     const char *weekdays = "SMTWTFS";
+    const char *chineseWeekdays[] = {"日", "一", "二", "三", "四", "五", "六"};
     for (int day = 0; day < 7; ++day) {
-        const char label[2] = {weekdays[day], '\0'};
-        text(frame, 16 + day * 30, 52, label, 1);
+        if (UiLocalization::isChinese()) UiLocalization::drawText(frame, 16 + day * 32, 68, chineseWeekdays[day], 1);
+        else {
+            const char label[2] = {weekdays[day], '\0'};
+            text(frame, 21 + day * 32, 72, label, 1);
+        }
     }
 
     constexpr int left = 8;
-    constexpr int top = 68;
+    constexpr int top = 86;
     constexpr int cellWidth = 32;
-    constexpr int cellHeight = 48;
+    constexpr int cellHeight = 52;
     for (int row = 0; row < 6; ++row)
         for (int column = 0; column < 7; ++column)
             rect(frame, left + column * cellWidth, top + row * cellHeight, cellWidth, cellHeight);
 
-    struct tm first = current;
-    first.tm_year = year - 1900;
-    first.tm_mon = month - 1;
+    struct tm first = {};
+    first.tm_year = viewedYear - 1900;
+    first.tm_mon = viewedMonth - 1;
     first.tm_mday = 1;
     first.tm_hour = 12;
     mktime(&first);
     const int firstWeekday = first.tm_wday;
-    const int count = daysInMonth(year, month);
+    const int count = daysInMonth(viewedYear, viewedMonth);
     for (int day = 1; day <= count; ++day) {
         const int index = firstWeekday + day - 1;
         const int row = index / 7;
         const int column = index % 7;
         const int x = left + column * cellWidth;
         const int y = top + row * cellHeight;
-        if (day == today) rect(frame, x + 3, y + 3, cellWidth - 6, cellHeight - 6);
+        if (viewedYear == currentYear && viewedMonth == currentMonth && day == currentDay) {
+            rect(frame, x + 3, y + 3, cellWidth - 6, cellHeight - 6);
+        }
         char number[3] = {};
         snprintf(number, sizeof(number), "%d", day);
-        text(frame, x + 12, y + 16, number, 2);
+        dateText(frame, x + (cellWidth - dateTextWidth(number)) / 2,
+                 y + (cellHeight - 10) / 2, number);
+    }
+}
+
+Action actionAt(int16_t x, int16_t y) {
+    if (y < 36 || y >= 64) return Action::None;
+    if (x >= 8 && x < 36) return Action::PreviousYear;
+    if (x >= 40 && x < 68) return Action::PreviousMonth;
+    if (x >= 172 && x < 200) return Action::NextMonth;
+    if (x >= 204 && x < 232) return Action::NextYear;
+    return Action::None;
+}
+
+void navigate(Action action) {
+    loadCurrentDate();
+    switch (action) {
+    case Action::PreviousYear: --viewedYear; break;
+    case Action::NextYear: ++viewedYear; break;
+    case Action::PreviousMonth:
+        if (--viewedMonth < 1) {
+            viewedMonth = 12;
+            --viewedYear;
+        }
+        break;
+    case Action::NextMonth:
+        if (++viewedMonth > 12) {
+            viewedMonth = 1;
+            ++viewedYear;
+        }
+        break;
+    default: break;
     }
 }
 }
