@@ -121,9 +121,12 @@ void FT6X36::loop()
 		processTouch();
 	}
 
-	// Some panel revisions hold INT low rather than producing a clean falling
-	// edge. Poll while asserted so touch still works when that edge is missed.
-	if (digitalRead(_intPin) == LOW && millis() - _lastPollTime >= 10)
+	// Movement samples are not guaranteed to produce a falling edge on every
+	// FT6336 panel. Once a touch starts, poll continuously until LiftUp so a
+	// finger sweep has enough Contact positions for reliable direction/distance
+	// classification. Also poll while INT is held low for edge-less revisions.
+	if ((_touchActive || digitalRead(_intPin) == LOW) &&
+		millis() - _lastPollTime >= 10)
 	{
 		_lastPollTime = millis();
 		processTouch();
@@ -148,11 +151,9 @@ void FT6X36::processTouch()
 		_touchActive = true;
 		_touchStartTime = millis();
 		fireEvent(point, TEvent::TouchStart);
-		// This firmware uses discrete tap targets rather than gestures. Dispatch
-		// on the interrupt-driven press sample so UI actions do not wait for the
-		// controller's later LiftUp report.
-		fireEvent(point, TEvent::Tap);
-		_tapFiredOnPress = true;
+		// Wait until LiftUp before classifying the interaction. Firing Tap here
+		// opens list rows before a finger sweep can be recognized as a swipe.
+		_tapFiredOnPress = false;
 	}
 	else if (event == TRawEvent::Contact)
 	{
@@ -164,8 +165,7 @@ void FT6X36::processTouch()
 			_touchActive = true;
 			_touchStartTime = millis();
 			fireEvent(point, TEvent::TouchStart);
-			fireEvent(point, TEvent::Tap);
-			_tapFiredOnPress = true;
+			_tapFiredOnPress = false;
 		}
 		if (_pointIdx < 10)
 		{
@@ -194,7 +194,10 @@ void FT6X36::processTouch()
 			fireEvent(point, TEvent::DragEnd);
 			_dragMode = false;
 		}
-		if (!_tapFiredOnPress && _points[0].aboutEqual(point) && _touchEndTime - _touchStartTime <= 300)
+		const int32_t deltaX = static_cast<int32_t>(point.x) - _points[0].x;
+		const int32_t deltaY = static_cast<int32_t>(point.y) - _points[0].y;
+		if (!_tapFiredOnPress && abs(deltaX) <= 15 && abs(deltaY) <= 15 &&
+			_touchEndTime - _touchStartTime <= 700)
 		{
 			fireEvent(point, TEvent::Tap);
 			_points[0] = {0, 0};

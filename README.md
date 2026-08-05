@@ -1,3 +1,38 @@
+# Xiaozhi Chinese font cache
+
+The Booklist page uses the official Xiaozhi **PuHui 20 px / 4 bpp** font without
+embedding its 1.24 MB bitmap in the application firmware. On the first Booklist
+open, the firmware downloads Xiaozhi's release asset from:
+
+`https://github.com/78/xiaozhi-fonts/releases/download/assets/none-font_puhui_common_20_4-none.bin`
+
+At startup, a low-priority background task checks the `/fonts` folder and the
+cached file `/fonts/xiaozhi-puhui-20.assets.bin`. A valid cache is opened
+immediately. If it is missing, the task waits for Wi-Fi, downloads it, and saves
+the successful Xiaozhi URL in ESP32 NVS/flash under the `xiaozhi-font` namespace.
+The remembered URL is tried first on future downloads, with the built-in release
+URL as a fallback. Booklist does not block while this happens. Later opens use
+random-access glyph reads from SD and do not require network access. Removing
+the cached file causes the background task to download it again on the next boot.
+
+Boot initializes networking before mounting/checking the font cache. Wi-Fi is
+the preferred transport whenever its setting is enabled: the saved network gets
+a 15-second priority window and a successful Wi-Fi connection keeps the ML307R
+powered down. If Wi-Fi is switched off, 4G power is applied immediately; if
+Wi-Fi has no saved credentials or times out, the modem is powered as fallback.
+While neither transport is connected, firmware explicitly retries the saved
+Wi-Fi network every 15 seconds and probes ML307 registration/PDP state with
+`AT+MIPCALL?` (requesting it with `AT+MIPCALL=1` when needed). Polling pauses as
+soon as either Wi-Fi or a real 4G PDP context is connected, and resumes if that
+active connection drops. The ML307 probe runs in a low-priority task so touch
+and e-paper UI processing are not blocked by AT-command timeouts.
+At present, `epaper_v1` has a complete Wi-Fi TCP/IP client and ML307R
+power/registration/PDP-state management, but application HTTP requests are not
+yet routed through the modem's AT HTTP commands. Font and Book HTTP downloads
+therefore still use Wi-Fi sockets. True 4G downloading requires adding that
+AT-based HTTP transport rather than treating PDP readiness alone as an ESP32
+socket interface.
+
 # ESP32-S3 3.7-inch e-paper bring-up
 
 This is a clean PlatformIO/Arduino starting point for the custom ESP32-S3

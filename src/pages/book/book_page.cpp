@@ -1,29 +1,44 @@
 #include "pages/book/book_page.h"
 
 #include <Arduino.h>
+#include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <SD_MMC.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
 
 #include "devices/epd_xingtai/epd_xingtai.h"
+#include "devices/sd_card/sd_card.h"
+#include "font/xiaozhi_font.h"
+#include "ui/loading_indicator.h"
 #include "ui/localization.h"
 
 #include <cstring>
 
 namespace {
 
-constexpr uint8_t ITEMS_PER_PAGE = 5;
-constexpr int LIST_TOP = 105;
-constexpr int ROW_HEIGHT = 54;
-constexpr int ROW_GAP = 7;
-constexpr int READER_COLUMNS = 36;
-constexpr int READER_LINES = 27;
-constexpr int READER_CHARS_PER_PAGE = READER_COLUMNS * READER_LINES;
+constexpr uint8_t ITEMS_PER_PAGE = 10;
+constexpr int LIST_TOP = 82;
+constexpr int ROW_HEIGHT = 30;
+constexpr int ROW_GAP = 2;
+constexpr int PAGER_TOP = 52;
+constexpr int PAGER_HEIGHT = 25;
+constexpr int PAGER_BUTTON_WIDTH = 34;
+constexpr char BOOK_SD_FOLDER[] = "/book";
+constexpr int READER_CONTENT_X = 10;
+constexpr int READER_CONTENT_Y = 82;
+constexpr int READER_CONTENT_WIDTH = 220;
+constexpr int READER_CONTENT_BOTTOM = 378;
+constexpr int READER_LINE_HEIGHT = 25;
+constexpr int READER_LINES_PER_PAGE =
+    (READER_CONTENT_BOTTOM - READER_CONTENT_Y) / READER_LINE_HEIGHT;
+constexpr uint16_t MAX_READER_PAGES = 128;
 
 struct BookItem {
     int32_t id = 0;
     char title[64] = {};
+    bool saved = false;
 };
 
 enum class View : uint8_t { Library, Reader };
@@ -35,9 +50,16 @@ int32_t libraryPage = 1;
 View view = View::Library;
 char contentBaseUrl[128] = "http://";
 char statusText[64] = "OPENING LIBRARY";
+int32_t selectedBookId = 0;
+int8_t selectedLibraryIndex = -1;
 char selectedTitle[64] = {};
+char selectedAuthor[64] = {};
+char selectedCategory[64] = {};
 String selectedContent;
 int readerPage = 0;
+uint32_t readerPageOffsets[MAX_READER_PAGES + 1] = {};
+uint16_t readerPageTotal = 1;
+bool pendingSave = false;
 
 void pixel(uint8_t *frame, int x, int y) {
     if (x < 0 || x >= XingtaiEpd::WIDTH || y < 0 || y >= XingtaiEpd::HEIGHT) return;
@@ -66,6 +88,11 @@ void rect(uint8_t *frame, int x, int y, int width, int height) {
     line(frame, x + width - 1, y, x + width - 1, y + height - 1);
 }
 
+void boldRect(uint8_t *frame, int x, int y, int width, int height) {
+    rect(frame, x, y, width, height);
+    if (width > 2 && height > 2) rect(frame, x + 1, y + 1, width - 2, height - 2);
+}
+
 bool pointInRect(int16_t x, int16_t y, int left, int top, int width, int height) {
     return x >= left && x < left + width && y >= top && y < top + height;
 }
@@ -78,6 +105,270 @@ void drawArrow(uint8_t *frame, int centerX, int centerY, bool right) {
     const int direction = right ? 1 : -1;
     line(frame, centerX - direction * 5, centerY - 7, centerX + direction * 3, centerY);
     line(frame, centerX + direction * 3, centerY, centerX - direction * 5, centerY + 7);
+}
+
+void drawDoubleArrow(uint8_t *frame, int centerX, int centerY, bool right) {
+    drawArrow(frame, centerX - (right ? 4 : -4), centerY, right);
+    drawArrow(frame, centerX + (right ? 4 : -4), centerY, right);
+}
+
+void drawCheckmark(uint8_t *frame, int centerX, int centerY) {
+    line(frame, centerX - 7, centerY, centerX - 2, centerY + 6);
+    line(frame, centerX - 2, centerY + 6, centerX + 8, centerY - 7);
+}
+
+bool nextUtf8Codepoint(const char *&cursor, uint32_t &codepoint) {
+    const uint8_t *source = reinterpret_cast<const uint8_t *>(cursor);
+    if (!source || source[0] == 0) return false;
+    if (source[0] < 0x80) {
+        codepoint = source[0];
+        cursor += 1;
+        return true;
+    }
+    if ((source[0] & 0xE0) == 0xC0 && (source[1] & 0xC0) == 0x80) {
+        codepoint = ((source[0] & 0x1F) << 6) | (source[1] & 0x3F);
+        cursor += 2;
+        return true;
+    }
+    if ((source[0] & 0xF0) == 0xE0 && (source[1] & 0xC0) == 0x80 &&
+        (source[2] & 0xC0) == 0x80) {
+        codepoint = ((source[0] & 0x0F) << 12) | ((source[1] & 0x3F) << 6) |
+                    (source[2] & 0x3F);
+        cursor += 3;
+        return true;
+    }
+    if ((source[0] & 0xF8) == 0xF0 && (source[1] & 0xC0) == 0x80 &&
+        (source[2] & 0xC0) == 0x80 && (source[3] & 0xC0) == 0x80) {
+        codepoint = ((source[0] & 0x07) << 18) | ((source[1] & 0x3F) << 12) |
+                    ((source[2] & 0x3F) << 6) | (source[3] & 0x3F);
+        cursor += 4;
+        return true;
+    }
+    codepoint = '?';
+    cursor += 1;
+    return true;
+}
+
+void drawChineseGlyph(uint8_t *frame, const XiaozhiFont::Glyph *glyph, int x, int y,
+                      int clipRight, int clipBottom) {
+    if (!glyph) return;
+    for (uint16_t glyphY = 0; glyphY < glyph->height && y + glyphY < clipBottom; ++glyphY) {
+        for (uint16_t glyphX = 0; glyphX < glyph->width && x + glyphX < clipRight; ++glyphX) {
+            const uint32_t alphaIndex = static_cast<uint32_t>(glyphY) * glyph->width + glyphX;
+            const uint8_t packed = glyph->bitmap[alphaIndex / 2U];
+            const uint8_t alpha = (alphaIndex & 1U) ? (packed & 0x0FU) : (packed >> 4);
+            // Use only the strongest half of PuHui's 4-bit coverage values.
+            // This removes the antialiased edge pixels that looked too bold on
+            // the monochrome e-paper waveform while keeping the glyph geometry.
+            if (alpha >= 11) pixel(frame, x + glyphX, y + glyphY);
+        }
+    }
+}
+
+void drawUtf8Title(uint8_t *frame, int x, int y, int width, int height, const char *value) {
+    const int right = x + width;
+    const int bottom = y + height;
+    const char *cursor = value;
+    uint32_t codepoint = 0;
+    int drawX = x;
+    while (nextUtf8Codepoint(cursor, codepoint) && drawX < right) {
+        if (codepoint < 0x80) {
+            char text[2] = {static_cast<char>(codepoint), '\0'};
+            UiLocalization::drawText(frame, drawX, y + (height - 7) / 2, text, 1);
+            drawX += 7;
+            continue;
+        }
+        const XiaozhiFont::Glyph *glyph = XiaozhiFont::glyph(codepoint);
+        if (!glyph) {
+            drawX += 17;
+            continue;
+        }
+        const int advance = max(1, static_cast<int>(glyph->advance)) + 1;
+        if (drawX + advance > right) break;
+        constexpr int FONT_LINE_HEIGHT = 25;
+        constexpr int FONT_BASELINE = 6;
+        const int fontTop = y + (height - FONT_LINE_HEIGHT) / 2;
+        const int glyphTop = fontTop + FONT_LINE_HEIGHT - FONT_BASELINE -
+                             glyph->height - glyph->offsetY;
+        drawChineseGlyph(frame, glyph, drawX + glyph->offsetX,
+                         glyphTop, right, bottom);
+        drawX += advance;
+    }
+}
+
+void copyUtf8(char *destination, size_t destinationSize, const char *source, const char *fallback) {
+    if (!destination || destinationSize == 0) return;
+    const char *value = source && source[0] ? source : fallback;
+    value = value ? value : "";
+    size_t input = 0;
+    size_t output = 0;
+    while (value[input] != '\0' && output + 1 < destinationSize) {
+        const uint8_t first = static_cast<uint8_t>(value[input]);
+        size_t sequenceLength = 1;
+        if ((first & 0xE0U) == 0xC0U) sequenceLength = 2;
+        else if ((first & 0xF0U) == 0xE0U) sequenceLength = 3;
+        else if ((first & 0xF8U) == 0xF0U) sequenceLength = 4;
+        bool complete = true;
+        for (size_t byte = 1; byte < sequenceLength; ++byte) {
+            if (value[input + byte] == '\0' ||
+                (static_cast<uint8_t>(value[input + byte]) & 0xC0U) != 0x80U) {
+                complete = false;
+                break;
+            }
+        }
+        if (!complete || output + sequenceLength >= destinationSize) break;
+        for (size_t byte = 0; byte < sequenceLength; ++byte) {
+            destination[output++] = value[input++];
+        }
+    }
+    destination[output] = '\0';
+}
+
+int codepointAdvance(uint32_t codepoint) {
+    if (codepoint == '\t') return 28;
+    if (codepoint < 0x80) return codepoint == ' ' ? 5 : 7;
+    const XiaozhiFont::Glyph *glyph = XiaozhiFont::glyph(codepoint);
+    return glyph ? max(1, static_cast<int>(glyph->advance)) + 1 : 18;
+}
+
+void updateReaderPagination() {
+    readerPageTotal = 1;
+    readerPageOffsets[0] = 0;
+    const char *base = selectedContent.c_str();
+    const char *cursor = base;
+    int line = 0;
+    int lineWidth = 0;
+    while (*cursor != '\0') {
+        const char *codepointStart = cursor;
+        uint32_t codepoint = 0;
+        if (!nextUtf8Codepoint(cursor, codepoint)) break;
+        if (codepoint == '\r') continue;
+        if (codepoint == '\n') {
+            lineWidth = 0;
+            if (++line >= READER_LINES_PER_PAGE && readerPageTotal < MAX_READER_PAGES) {
+                readerPageOffsets[readerPageTotal++] = static_cast<uint32_t>(cursor - base);
+                line = 0;
+            }
+            continue;
+        }
+
+        const int advance = codepointAdvance(codepoint);
+        if (lineWidth > 0 && lineWidth + advance > READER_CONTENT_WIDTH) {
+            lineWidth = 0;
+            if (++line >= READER_LINES_PER_PAGE && readerPageTotal < MAX_READER_PAGES) {
+                readerPageOffsets[readerPageTotal++] =
+                    static_cast<uint32_t>(codepointStart - base);
+                line = 0;
+            }
+        }
+        lineWidth += advance;
+    }
+    readerPageOffsets[readerPageTotal] = selectedContent.length();
+    if (readerPage < 0) readerPage = 0;
+    if (readerPage >= readerPageTotal) readerPage = readerPageTotal - 1;
+    Serial.printf("[BOOK] Reader pagination bytes=%u pages=%u lines_per_page=%d\n",
+                  selectedContent.length(), readerPageTotal, READER_LINES_PER_PAGE);
+}
+
+bool ensureBookDirectory(int32_t bookId, char *directory, size_t directorySize) {
+    if (!SdCard::isMounted() || bookId <= 0 || !directory || directorySize == 0) return false;
+    if (!SD_MMC.exists(BOOK_SD_FOLDER) && !SD_MMC.mkdir(BOOK_SD_FOLDER)) return false;
+    snprintf(directory, directorySize, "%s/%ld", BOOK_SD_FOLDER, static_cast<long>(bookId));
+    return SD_MMC.exists(directory) || SD_MMC.mkdir(directory);
+}
+
+bool isBookSavedOnSd(int32_t bookId) {
+    if (!SdCard::isMounted() || bookId <= 0) return false;
+    char metaPath[64] = {};
+    char contentPath[64] = {};
+    snprintf(metaPath, sizeof(metaPath), "%s/%ld/meta.txt",
+             BOOK_SD_FOLDER, static_cast<long>(bookId));
+    snprintf(contentPath, sizeof(contentPath), "%s/%ld/content.txt",
+             BOOK_SD_FOLDER, static_cast<long>(bookId));
+    if (!SD_MMC.exists(metaPath) || !SD_MMC.exists(contentPath)) return false;
+    File contentFile = SD_MMC.open(contentPath, FILE_READ);
+    const bool valid = contentFile && contentFile.size() > 0;
+    if (contentFile) contentFile.close();
+    return valid;
+}
+
+bool saveBookToSd(int32_t bookId, const char *title, const char *author,
+                  const char *category, const String &content) {
+    char directory[40] = {};
+    if (!ensureBookDirectory(bookId, directory, sizeof(directory))) {
+        Serial.printf("[BOOK SD] Could not create cache folder for id=%ld\n", static_cast<long>(bookId));
+        return false;
+    }
+
+    char contentPath[64] = {};
+    char temporaryPath[72] = {};
+    snprintf(contentPath, sizeof(contentPath), "%s/content.txt", directory);
+    snprintf(temporaryPath, sizeof(temporaryPath), "%s/content.part", directory);
+    SD_MMC.remove(temporaryPath);
+    File contentFile = SD_MMC.open(temporaryPath, FILE_WRITE);
+    if (!contentFile) return false;
+    const size_t written = contentFile.print(content);
+    contentFile.flush();
+    contentFile.close();
+    if (written != content.length()) {
+        SD_MMC.remove(temporaryPath);
+        Serial.printf("[BOOK SD] Short write id=%ld expected=%u written=%u\n",
+                      static_cast<long>(bookId), content.length(), written);
+        return false;
+    }
+    SD_MMC.remove(contentPath);
+    if (!SD_MMC.rename(temporaryPath, contentPath)) {
+        SD_MMC.remove(temporaryPath);
+        return false;
+    }
+
+    char metaPath[64] = {};
+    snprintf(metaPath, sizeof(metaPath), "%s/meta.txt", directory);
+    SD_MMC.remove(metaPath);
+    File metaFile = SD_MMC.open(metaPath, FILE_WRITE);
+    if (!metaFile) return false;
+    metaFile.printf("%ld\n%s\n%s\n%s\n", static_cast<long>(bookId),
+                    title ? title : "", author ? author : "", category ? category : "");
+    metaFile.flush();
+    metaFile.close();
+    Serial.printf("[BOOK SD] Saved id=%ld bytes=%u folder=%s\n",
+                  static_cast<long>(bookId), content.length(), directory);
+    return true;
+}
+
+bool loadBookFromSd(const BookItem &book) {
+    if (!SdCard::isMounted() || book.id <= 0) return false;
+    char directory[40] = {};
+    snprintf(directory, sizeof(directory), "%s/%ld", BOOK_SD_FOLDER, static_cast<long>(book.id));
+    char metaPath[64] = {};
+    char contentPath[64] = {};
+    snprintf(metaPath, sizeof(metaPath), "%s/meta.txt", directory);
+    snprintf(contentPath, sizeof(contentPath), "%s/content.txt", directory);
+    File metaFile = SD_MMC.open(metaPath, FILE_READ);
+    File contentFile = SD_MMC.open(contentPath, FILE_READ);
+    if (!metaFile || !contentFile) {
+        if (metaFile) metaFile.close();
+        if (contentFile) contentFile.close();
+        return false;
+    }
+    metaFile.readStringUntil('\n');
+    const String title = metaFile.readStringUntil('\n');
+    const String author = metaFile.readStringUntil('\n');
+    const String category = metaFile.readStringUntil('\n');
+    metaFile.close();
+    copyUtf8(selectedTitle, sizeof(selectedTitle), title.c_str(), book.title);
+    copyUtf8(selectedAuthor, sizeof(selectedAuthor), author.c_str(), "");
+    copyUtf8(selectedCategory, sizeof(selectedCategory), category.c_str(), "");
+    selectedContent = contentFile.readString();
+    contentFile.close();
+    if (selectedContent.isEmpty()) return false;
+    selectedBookId = book.id;
+    readerPage = 0;
+    updateReaderPagination();
+    view = View::Reader;
+    Serial.printf("[BOOK SD] Loaded id=%ld bytes=%u from %s\n",
+                  static_cast<long>(book.id), selectedContent.length(), directory);
+    return true;
 }
 
 void asciiCopy(char *destination, size_t size, const String &source, const char *fallback) {
@@ -148,6 +439,7 @@ String endpointBase() {
 }
 
 bool httpGet(const String &url, String &payload) {
+    UiLoadingIndicator::Scope loadingIndicator;
     Serial.printf("[BOOK API] request method=GET url=%s wifi_status=%d ip=%s gateway=%s dns=%s heap=%u\n",
                   url.c_str(), static_cast<int>(WiFi.status()),
                   WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str(),
@@ -254,33 +546,91 @@ int matchingBrace(const String &json, int start) {
 
 bool loadLibrary() {
     bookCount = 0;
-    if (std::strlen(contentBaseUrl) <= 7) {
-        std::strcpy(statusText, "SET CONTENT URL FIRST");
-        return false;
-    }
     String payload;
-    const String url = endpointBase() + "?page=" + String(libraryPage) + "&perPage=" + String(ITEMS_PER_PAGE);
-    if (!httpGet(url, payload)) {
+    bool remoteLoaded = false;
+    if (std::strlen(contentBaseUrl) > 7) {
+        const String url = endpointBase() + "?page=" + String(libraryPage) +
+                           "&perPage=" + String(ITEMS_PER_PAGE);
+        remoteLoaded = httpGet(url, payload);
+    }
+    if (!remoteLoaded) {
+        // The remote library is optional once books have been cached. Build a
+        // local page directly from /book/<id>/meta.txt + content.txt.
+        if (!SdCard::isMounted()) return false;
+        File root = SD_MMC.open(BOOK_SD_FOLDER);
+        if (!root || !root.isDirectory()) return false;
+        const int32_t firstItem = (libraryPage - 1) * ITEMS_PER_PAGE;
+        int32_t validIndex = 0;
+        bookTotal = 0;
+        File entry = root.openNextFile();
+        while (entry) {
+            if (entry.isDirectory()) {
+                String directory = entry.name();
+                const int slash = directory.lastIndexOf('/');
+                const int32_t id = directory.substring(slash + 1).toInt();
+                if (isBookSavedOnSd(id)) {
+                    if (validIndex >= firstItem && bookCount < ITEMS_PER_PAGE) {
+                        BookItem &book = books[bookCount];
+                        book.id = id;
+                        book.saved = true;
+                        char metaPath[64] = {};
+                        snprintf(metaPath, sizeof(metaPath), "%s/%ld/meta.txt",
+                                 BOOK_SD_FOLDER, static_cast<long>(id));
+                        File meta = SD_MMC.open(metaPath, FILE_READ);
+                        if (meta) {
+                            meta.readStringUntil('\n');
+                            const String title = meta.readStringUntil('\n');
+                            meta.close();
+                            char fallback[24] = {};
+                            snprintf(fallback, sizeof(fallback), "BOOK %ld", static_cast<long>(id));
+                            copyUtf8(book.title, sizeof(book.title), title.c_str(), fallback);
+                            ++bookCount;
+                        }
+                    }
+                    ++validIndex;
+                    ++bookTotal;
+                }
+            }
+            entry.close();
+            entry = root.openNextFile();
+        }
+        root.close();
+        if (bookCount > 0) {
+            snprintf(statusText, sizeof(statusText), "%u SAVED BOOKS", bookCount);
+            Serial.printf("[BOOK SD] Offline library page=%ld items=%u total=%ld\n",
+                          static_cast<long>(libraryPage), bookCount,
+                          static_cast<long>(bookTotal));
+            return true;
+        }
+        std::strcpy(statusText, "NO ONLINE OR SAVED BOOKS");
         return false;
     }
     Serial.printf("[BOOK] Library payload preview: %.180s\n", payload.c_str());
-    bookTotal = jsonInteger(payload, "total", 0, payload.length(), 0);
-    const int itemsKey = findKey(payload, "items");
-    int cursor = itemsKey < 0 ? -1 : payload.indexOf('[', itemsKey);
-    while (cursor >= 0 && bookCount < ITEMS_PER_PAGE) {
-        const int objectStart = payload.indexOf('{', cursor);
-        const int arrayEnd = payload.indexOf(']', cursor);
-        if (objectStart < 0 || (arrayEnd >= 0 && objectStart > arrayEnd)) break;
-        const int objectEnd = matchingBrace(payload, objectStart);
-        if (objectEnd < 0) break;
+    JsonDocument document;
+    const DeserializationError error = deserializeJson(document, payload);
+    if (error) {
+        snprintf(statusText, sizeof(statusText), "JSON %s", error.c_str());
+        Serial.printf("[BOOK API] JSON parse failed: %s\n", error.c_str());
+        return false;
+    }
+    bookTotal = document["total"] | 0;
+    JsonArray items = document["items"].as<JsonArray>();
+    if (items.isNull()) {
+        std::strcpy(statusText, "NO ITEMS IN JSON");
+        Serial.println("[BOOK API] Parsed JSON has no items array");
+        return false;
+    }
+    for (JsonObject item : items) {
+        if (bookCount >= ITEMS_PER_PAGE) break;
         BookItem &book = books[bookCount];
-        book.id = jsonInteger(payload, "id", objectStart, objectEnd, 0);
-        const String title = jsonString(payload, "title", objectStart, objectEnd);
+        book.id = item["id"] | 0;
         char fallback[24] = {};
         snprintf(fallback, sizeof(fallback), "BOOK %ld", static_cast<long>(book.id));
-        asciiCopy(book.title, sizeof(book.title), title, fallback);
+        copyUtf8(book.title, sizeof(book.title), item["title"] | "", fallback);
+        book.saved = isBookSavedOnSd(book.id);
+        Serial.printf("[BOOK API] parsed item index=%u id=%ld title=%s\n",
+                      bookCount, static_cast<long>(book.id), book.title);
         if (book.id > 0) ++bookCount;
-        cursor = objectEnd;
     }
     if (bookCount == 0) {
         std::strcpy(statusText, "NO BOOKS FOUND");
@@ -291,22 +641,42 @@ bool loadLibrary() {
 }
 
 bool loadBook(const BookItem &book) {
+    if (loadBookFromSd(book)) return true;
+
     String payload;
-    if (!httpGet(endpointBase() + "/" + String(book.id), payload)) {
+    bool loaded = false;
+    const String url = endpointBase() + "/" + String(book.id);
+    for (uint8_t attempt = 1; attempt <= 3 && !loaded; ++attempt) {
+        Serial.printf("[BOOK] Detail fetch id=%ld attempt=%u/3\n",
+                      static_cast<long>(book.id), attempt);
+        loaded = httpGet(url, payload);
+        if (!loaded && attempt < 3) delay(800);
+    }
+    if (!loaded) {
         std::strcpy(statusText, "BOOK LOAD FAILED");
         return false;
     }
-    const int end = payload.length();
-    String title = jsonString(payload, "title", 0, end);
-    if (title.isEmpty()) title = book.title;
-    asciiCopy(selectedTitle, sizeof(selectedTitle), title, book.title);
-    selectedContent = normalizeContent(jsonString(payload, "content", 0, end));
+    JsonDocument document;
+    const DeserializationError error = deserializeJson(document, payload);
+    if (error) {
+        Serial.printf("[BOOK API] Detail JSON parse failed: %s\n", error.c_str());
+        std::strcpy(statusText, "BOOK JSON FAILED");
+        return false;
+    }
+    selectedBookId = document["id"] | book.id;
+    copyUtf8(selectedTitle, sizeof(selectedTitle), document["title"] | "", book.title);
+    copyUtf8(selectedAuthor, sizeof(selectedAuthor), document["author"] | "", "");
+    copyUtf8(selectedCategory, sizeof(selectedCategory), document["category"] | "", "");
+    selectedContent = document["content"] | "";
     if (selectedContent.isEmpty()) {
         std::strcpy(statusText, "BOOK HAS NO CONTENT");
         return false;
     }
     readerPage = 0;
+    updateReaderPagination();
     view = View::Reader;
+    // Save is deferred until the caller has refreshed the reader display.
+    pendingSave = true;
     return true;
 }
 
@@ -315,24 +685,28 @@ int libraryPageCount() {
 }
 
 int readerPageCount() {
-    return selectedContent.length() > 0
-        ? (selectedContent.length() + READER_CHARS_PER_PAGE - 1) / READER_CHARS_PER_PAGE : 1;
+    return readerPageTotal;
 }
 
 void renderLibrary(uint8_t *frame) {
-    if (UiLocalization::isChinese()) drawCentered(frame, 40, "中文内容", 1);
-    else drawCentered(frame, 40, "BOOK LIBRARY", 2);
-    rect(frame, 12, 70, 34, 26);
-    drawArrow(frame, 29, 83, false);
-    rect(frame, 194, 70, 34, 26);
-    drawArrow(frame, 211, 83, true);
+    if (UiLocalization::isChinese()) drawUtf8Title(frame, 91, 34, 58, 18, "书单");
+    else drawCentered(frame, 36, "BOOKLIST", 2);
+
+    rect(frame, 4, PAGER_TOP, PAGER_BUTTON_WIDTH, PAGER_HEIGHT);
+    drawDoubleArrow(frame, 21, PAGER_TOP + PAGER_HEIGHT / 2, false);
+    rect(frame, 42, PAGER_TOP, PAGER_BUTTON_WIDTH, PAGER_HEIGHT);
+    drawArrow(frame, 59, PAGER_TOP + PAGER_HEIGHT / 2, false);
+    rect(frame, 164, PAGER_TOP, PAGER_BUTTON_WIDTH, PAGER_HEIGHT);
+    drawArrow(frame, 181, PAGER_TOP + PAGER_HEIGHT / 2, true);
+    rect(frame, 202, PAGER_TOP, PAGER_BUTTON_WIDTH, PAGER_HEIGHT);
+    drawDoubleArrow(frame, 219, PAGER_TOP + PAGER_HEIGHT / 2, true);
     char pager[24] = {};
     if (UiLocalization::isChinese()) {
         snprintf(pager, sizeof(pager), "%ld/%d", static_cast<long>(libraryPage), libraryPageCount());
     } else {
         snprintf(pager, sizeof(pager), "PAGE %ld OF %d", static_cast<long>(libraryPage), libraryPageCount());
     }
-    drawCentered(frame, 79, pager);
+    drawCentered(frame, 61, pager);
 
     if (bookCount == 0) {
         drawCentered(frame, 190, statusText);
@@ -341,14 +715,14 @@ void renderLibrary(uint8_t *frame) {
     }
     for (uint8_t index = 0; index < bookCount; ++index) {
         const int top = LIST_TOP + index * (ROW_HEIGHT + ROW_GAP);
-        rect(frame, 12, top, 216, ROW_HEIGHT);
+        if (index == selectedLibraryIndex) boldRect(frame, 12, top, 216, ROW_HEIGHT);
+        else rect(frame, 12, top, 216, ROW_HEIGHT);
         char number[8] = {};
         snprintf(number, sizeof(number), "%u", static_cast<unsigned>((libraryPage - 1) * ITEMS_PER_PAGE + index + 1));
-        UiLocalization::drawText(frame, 20, top + 10, number, 2);
-        char title[31] = {};
-        std::strncpy(title, books[index].title, sizeof(title) - 1);
-        UiLocalization::drawText(frame, 50, top + 9, title, 1);
-        drawArrow(frame, 215, top + ROW_HEIGHT / 2, true);
+        UiLocalization::drawText(frame, 18, top + 9, number, 1);
+        drawUtf8Title(frame, 34, top + 1, 171, ROW_HEIGHT - 2, books[index].title);
+        if (books[index].saved) drawCheckmark(frame, 215, top + ROW_HEIGHT / 2);
+        else drawArrow(frame, 215, top + ROW_HEIGHT / 2, true);
     }
 }
 
@@ -356,28 +730,46 @@ void renderReader(uint8_t *frame) {
     rect(frame, 8, 38, 50, 26);
     UiLocalization::drawText(frame, UiLocalization::isChinese() ? 16 : 15, 47,
                              UiLocalization::isChinese() ? "返回" : "BACK");
-    char title[27] = {};
-    std::strncpy(title, selectedTitle, sizeof(title) - 1);
-    UiLocalization::drawText(frame, 66, 47, title);
+    drawUtf8Title(frame, 66, 39, 164, 24, selectedTitle);
     line(frame, 8, 74, 231, 74);
 
-    const int start = readerPage * READER_CHARS_PER_PAGE;
-    int x = 12;
-    int y = 86;
-    int column = 0;
-    int row = 0;
-    for (int index = start; index < static_cast<int>(selectedContent.length()) && row < READER_LINES; ++index) {
-        const char character = selectedContent[index];
-        if (character == ' ' && column == 0) continue;
-        char glyph[2] = {character, '\0'};
-        UiLocalization::drawText(frame, x, y, glyph);
-        x += 6;
-        if (++column >= READER_COLUMNS) {
-            column = 0;
-            ++row;
-            x = 12;
-            y += 11;
+    const uint32_t start = readerPageOffsets[readerPage];
+    const uint32_t end = readerPageOffsets[readerPage + 1];
+    const char *base = selectedContent.c_str();
+    const char *cursor = base + start;
+    int x = READER_CONTENT_X;
+    int lineIndex = 0;
+    while (*cursor != '\0' && static_cast<uint32_t>(cursor - base) < end &&
+           lineIndex < READER_LINES_PER_PAGE) {
+        uint32_t codepoint = 0;
+        if (!nextUtf8Codepoint(cursor, codepoint)) break;
+        if (codepoint == '\r') continue;
+        if (codepoint == '\n') {
+            x = READER_CONTENT_X;
+            ++lineIndex;
+            continue;
         }
+        const int advance = codepointAdvance(codepoint);
+        if (x > READER_CONTENT_X && x + advance > READER_CONTENT_X + READER_CONTENT_WIDTH) {
+            x = READER_CONTENT_X;
+            if (++lineIndex >= READER_LINES_PER_PAGE) break;
+        }
+        const int lineTop = READER_CONTENT_Y + lineIndex * READER_LINE_HEIGHT;
+        if (codepoint < 0x80) {
+            char text[2] = {static_cast<char>(codepoint), '\0'};
+            UiLocalization::drawText(frame, x, lineTop + 9, text, 1);
+        } else {
+            const XiaozhiFont::Glyph *glyph = XiaozhiFont::glyph(codepoint);
+            if (glyph) {
+                constexpr int FONT_BASELINE = 6;
+                const int glyphTop = lineTop + READER_LINE_HEIGHT - FONT_BASELINE -
+                                     glyph->height - glyph->offsetY;
+                drawChineseGlyph(frame, glyph, x + glyph->offsetX, glyphTop,
+                                 READER_CONTENT_X + READER_CONTENT_WIDTH,
+                                 lineTop + READER_LINE_HEIGHT);
+            }
+        }
+        x += advance;
     }
     rect(frame, 8, 386, 34, 24);
     drawArrow(frame, 25, 398, false);
@@ -401,25 +793,62 @@ void setContentUrl(const char *url) {
 void openLibrary() {
     view = View::Library;
     libraryPage = 1;
+    selectedLibraryIndex = -1;
     std::strcpy(statusText, UiLocalization::isChinese() ? "正在获取内容" : "LOADING BOOKS");
     loadLibrary();
 }
 
+void processPendingSave() {
+    if (!pendingSave || view != View::Reader || selectedBookId <= 0) return;
+    pendingSave = false;
+    if (saveBookToSd(selectedBookId, selectedTitle, selectedAuthor,
+                     selectedCategory, selectedContent)) {
+        for (BookItem &book : books) {
+            if (book.id == selectedBookId) {
+                book.saved = true;
+                break;
+            }
+        }
+    } else {
+        Serial.printf("[BOOK SD] Displayed id=%ld, but SD save failed\n",
+                      static_cast<long>(selectedBookId));
+    }
+}
+
 bool handleTap(int16_t x, int16_t y) {
     if (view == View::Library) {
-        if (pointInRect(x, y, 12, 70, 34, 26) && libraryPage > 1) {
+        if (pointInRect(x, y, 4, PAGER_TOP, PAGER_BUTTON_WIDTH, PAGER_HEIGHT) &&
+            libraryPage > 1) {
+            selectedLibraryIndex = -1;
+            libraryPage = 1;
+            loadLibrary();
+            return true;
+        }
+        if (pointInRect(x, y, 42, PAGER_TOP, PAGER_BUTTON_WIDTH, PAGER_HEIGHT) &&
+            libraryPage > 1) {
+            selectedLibraryIndex = -1;
             --libraryPage;
             loadLibrary();
             return true;
         }
-        if (pointInRect(x, y, 194, 70, 34, 26) && libraryPage < libraryPageCount()) {
+        if (pointInRect(x, y, 164, PAGER_TOP, PAGER_BUTTON_WIDTH, PAGER_HEIGHT) &&
+            libraryPage < libraryPageCount()) {
+            selectedLibraryIndex = -1;
             ++libraryPage;
+            loadLibrary();
+            return true;
+        }
+        if (pointInRect(x, y, 202, PAGER_TOP, PAGER_BUTTON_WIDTH, PAGER_HEIGHT) &&
+            libraryPage < libraryPageCount()) {
+            selectedLibraryIndex = -1;
+            libraryPage = libraryPageCount();
             loadLibrary();
             return true;
         }
         for (uint8_t index = 0; index < bookCount; ++index) {
             const int top = LIST_TOP + index * (ROW_HEIGHT + ROW_GAP);
             if (pointInRect(x, y, 12, top, 216, ROW_HEIGHT)) {
+                selectedLibraryIndex = static_cast<int8_t>(index);
                 loadBook(books[index]);
                 return true;
             }
@@ -437,6 +866,50 @@ bool handleTap(int16_t x, int16_t y) {
     }
     if (pointInRect(x, y, 198, 386, 34, 24) && readerPage + 1 < readerPageCount()) {
         ++readerPage;
+        return true;
+    }
+    return false;
+}
+
+bool handleSwipe(int16_t deltaX, int16_t deltaY) {
+    constexpr int16_t SWIPE_THRESHOLD = 35;
+    const bool horizontal = abs(deltaX) >= abs(deltaY);
+    const int16_t primaryDelta = horizontal ? deltaX : deltaY;
+    if (abs(primaryDelta) < SWIPE_THRESHOLD) return false;
+
+    // Natural page movement: sweeping content left/up advances; sweeping it
+    // right/down goes back. Both axes are supported for one-handed use.
+    const bool next = primaryDelta < 0;
+    if (view == View::Library) {
+        if (next && libraryPage < libraryPageCount()) {
+            selectedLibraryIndex = -1;
+            ++libraryPage;
+            loadLibrary();
+            Serial.printf("[BOOK SWIPE] Library next page=%ld axis=%s\n",
+                          static_cast<long>(libraryPage), horizontal ? "horizontal" : "vertical");
+            return true;
+        }
+        if (!next && libraryPage > 1) {
+            selectedLibraryIndex = -1;
+            --libraryPage;
+            loadLibrary();
+            Serial.printf("[BOOK SWIPE] Library previous page=%ld axis=%s\n",
+                          static_cast<long>(libraryPage), horizontal ? "horizontal" : "vertical");
+            return true;
+        }
+        return false;
+    }
+
+    if (next && readerPage + 1 < readerPageCount()) {
+        ++readerPage;
+        Serial.printf("[BOOK SWIPE] Reader next page=%d/%d axis=%s\n",
+                      readerPage + 1, readerPageCount(), horizontal ? "horizontal" : "vertical");
+        return true;
+    }
+    if (!next && readerPage > 0) {
+        --readerPage;
+        Serial.printf("[BOOK SWIPE] Reader previous page=%d/%d axis=%s\n",
+                      readerPage + 1, readerPageCount(), horizontal ? "horizontal" : "vertical");
         return true;
     }
     return false;

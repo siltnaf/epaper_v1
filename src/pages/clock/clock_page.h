@@ -4,7 +4,7 @@
 namespace ClockPage {
 
 void setWeather(const char *location, const char *condition, const char *temperature,
-                bool available);
+                const char *humidity, const char *windSpeed, bool available);
 void render(uint8_t *frame);
 
 }

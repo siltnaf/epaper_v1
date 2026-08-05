@@ -1,7 +1,11 @@
 #include "devices/sd_card/sd_card.h"
 
 #include <Arduino.h>
+#include <HTTPClient.h>
 #include <SD_MMC.h>
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <WiFiClientSecure.h>
 
 #include <cstring>
 
@@ -11,6 +15,76 @@ namespace SdCard {
 
 bool isMounted() {
     return SD_MMC.cardType() != CARD_NONE;
+}
+
+bool downloadFile(const char *url, const char *path, uint32_t minimumBytes) {
+    if (!url || !path || !isMounted() || WiFi.status() != WL_CONNECTED) return false;
+
+    const String destination(path);
+    const int slash = destination.lastIndexOf('/');
+    if (slash > 0) {
+        const String directory = destination.substring(0, slash);
+        if (!SD_MMC.exists(directory) && !SD_MMC.mkdir(directory)) {
+            Serial.printf("[SD] Could not create directory %s\n", directory.c_str());
+            return false;
+        }
+    }
+
+    const String temporary = destination + ".part";
+    SD_MMC.remove(temporary);
+    File output = SD_MMC.open(temporary, FILE_WRITE);
+    if (!output) {
+        Serial.printf("[SD] Could not open %s for writing\n", temporary.c_str());
+        return false;
+    }
+
+    HTTPClient http;
+    http.setConnectTimeout(10000);
+    http.setTimeout(45000);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    http.setReuse(false);
+    http.setUserAgent("ESP32-ePaper-XiaozhiFont/1.0");
+    WiFiClient plainClient;
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();
+    const bool began = String(url).startsWith("https://") ? http.begin(secureClient, url)
+                                                          : http.begin(plainClient, url);
+    if (!began) {
+        output.close();
+        SD_MMC.remove(temporary);
+        Serial.printf("[SD] Invalid download URL %s\n", url);
+        return false;
+    }
+
+    Serial.printf("[SD] Downloading %s to %s\n", url, destination.c_str());
+    const int responseCode = http.GET();
+    int written = -1;
+    if (responseCode >= 200 && responseCode < 300) {
+        written = http.writeToStream(&output);
+    }
+    output.flush();
+    output.close();
+    http.end();
+
+    File downloaded = SD_MMC.open(temporary, FILE_READ);
+    const uint32_t actualBytes = downloaded ? static_cast<uint32_t>(downloaded.size()) : 0;
+    if (downloaded) downloaded.close();
+    if (responseCode < 200 || responseCode >= 300 || written < 0 || actualBytes < minimumBytes) {
+        Serial.printf("[SD] Download failed http=%d written=%d size=%lu\n",
+                      responseCode, written, static_cast<unsigned long>(actualBytes));
+        SD_MMC.remove(temporary);
+        return false;
+    }
+
+    SD_MMC.remove(destination);
+    if (!SD_MMC.rename(temporary, destination)) {
+        Serial.printf("[SD] Could not rename %s to %s\n", temporary.c_str(), destination.c_str());
+        SD_MMC.remove(temporary);
+        return false;
+    }
+    Serial.printf("[SD] Download complete: %lu bytes at %s\n",
+                  static_cast<unsigned long>(actualBytes), destination.c_str());
+    return true;
 }
 
 uint8_t listRoot(char names[][33], bool directories[], uint8_t capacity) {

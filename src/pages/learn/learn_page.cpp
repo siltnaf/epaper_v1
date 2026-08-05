@@ -1,11 +1,9 @@
 #include "pages/learn/learn_page.h"
 
-#include "devices/epd_xingtai/epd_xingtai.h"
-
-#include <cstring>
+#include "pages/offline/offline_content_page.h"
 
 namespace LearnPage {
-void render(uint8_t *frame) {
-    std::memset(frame, 0x00, XingtaiEpd::FRAME_BYTES);
-}
+void open() { OfflineContentPage::open(OfflineContentPage::Kind::Learn); }
+bool handleTap(int16_t x, int16_t y) { return OfflineContentPage::handleTap(OfflineContentPage::Kind::Learn, x, y); }
+void render(uint8_t *frame) { OfflineContentPage::render(OfflineContentPage::Kind::Learn, frame); }
 }
