@@ -26,6 +26,7 @@ enum class Action : uint8_t {
     SdConfirmFormat,
     VolumeDown,
     VolumeUp,
+    TestAudio,
     RetryWifiScan,
     SelectWifiNetwork,
     WifiKey,

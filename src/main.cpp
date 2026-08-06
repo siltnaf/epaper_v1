@@ -4,6 +4,7 @@
 #include <Wire.h>
 #include <WiFi.h>
 
+#include <cmath>
 #include <cstring>
 
 #include "board_pins.h"
@@ -18,7 +19,7 @@
 #include "pages/calendar/calendar_page.h"
 #include "pages/calculator/calculator_page.h"
 #include "pages/clock/clock_page.h"
-#include "pages/learn/learn_page.h"
+#include "pages/word/word_page.h"
 #include "pages/main/main_page.h"
 #include "pages/music/music_page.h"
 #include "pages/poem/poem_page.h"
@@ -50,7 +51,7 @@ enum class PageId : uint8_t {
     Voice,
     Music,
     Poem,
-    Learn,
+    Word,
     Recording,
 };
 
@@ -125,6 +126,9 @@ void wipeContentAreaWhite();
 void refreshVoiceDirtyRows();
 void refreshMusicDirtyRows();
 void refreshPoemDirtyRows();
+void refreshPoemDisplay();
+void refreshWordStrokeWindow(bool wipeFirst);
+void clearFrameRegion(uint8_t *buffer, int left, int top, int width, int height);
 void showTopbarLoading(bool visible);
 
 void IRAM_ATTR onTouchInterruptSignal() {
@@ -143,13 +147,16 @@ void serviceTouchInterruptBeforeI2c() {
     const bool voiceActive = currentPage == PageId::Voice && VoicePage::isAudioActive();
     const bool musicActive = currentPage == PageId::Music && MusicPage::isAudioActive();
     const bool poemActive = currentPage == PageId::Poem && PoemPage::isAudioActive();
-    if (!pending || (!voiceActive && !musicActive && !poemActive)) return;
+    const bool wordActive = currentPage == PageId::Word &&
+                            (WordPage::isAudioActive() || WordPage::isAnimating());
+    if (!pending || (!voiceActive && !musicActive && !poemActive && !wordActive)) return;
 
     Serial.printf("[TOUCH IRQ] Stopping %s audio before FT6336 I2C read\n",
-                  voiceActive ? "Voice" : musicActive ? "Music" : "Poem");
+                   voiceActive ? "Voice" : musicActive ? "Music" : poemActive ? "Poem" : "Word");
     if (voiceActive) VoicePage::stopAudioFromTouchInterrupt();
     else if (musicActive) MusicPage::stopAudioFromTouchInterrupt();
-    else PoemPage::stopAudioFromTouchInterrupt();
+    else if (poemActive) PoemPage::stopAudioFromTouchInterrupt();
+    else WordPage::stopFromTouchInterrupt();
     // Audio codec setup and FT6336 share Wire. Reclock/recover the bus only
     // after the audio task has stopped, then let touch.loop() read coordinates.
     recoverSharedI2c();
@@ -387,16 +394,37 @@ void prepareClockPage() {
     lastRenderedClockMinute = static_cast<uint8_t>(timeInfo.tm_min);
 }
 
-void applyWifiSetting() {
+void applyWifiSetting(bool waitForConnection = false) {
     if (settingsState.wifiEnabled) {
         WiFi.mode(WIFI_STA);
         WiFi.setAutoReconnect(true);
         configTime(8 * 3600, 0, "pool.ntp.org", "time.nist.gov");
         if (savedWifiSsid[0] != '\0') {
+            // A user-triggered enable should restart association immediately,
+            // even if the ESP32 Wi-Fi state machine still remembers a prior
+            // disabled/disconnected session.
+            WiFi.disconnect(false, false);
+            delay(50);
             WiFi.begin(savedWifiSsid, savedWifiPassword);
             wifiPriorityStartedMs = millis();
             lastWifiReconnectAttemptMs = wifiPriorityStartedMs;
             Serial.printf("[NETWORK] WiFi priority connection started for %s\n", savedWifiSsid);
+            if (waitForConnection) {
+                constexpr uint32_t IMMEDIATE_WIFI_TIMEOUT_MS = 10000;
+                const uint32_t started = millis();
+                while (WiFi.status() != WL_CONNECTED &&
+                       millis() - started < IMMEDIATE_WIFI_TIMEOUT_MS) {
+                    serviceTouchInterruptBeforeI2c();
+                    delay(100);
+                }
+                if (WiFi.status() == WL_CONNECTED) {
+                    Serial.printf("[NETWORK] WiFi connected immediately SSID=%s IP=%s\n",
+                                  savedWifiSsid, WiFi.localIP().toString().c_str());
+                } else {
+                    Serial.printf("[NETWORK] WiFi immediate connection timed out SSID=%s status=%d\n",
+                                  savedWifiSsid, static_cast<int>(WiFi.status()));
+                }
+            }
         } else {
             wifiPriorityStartedMs = 0;
             Serial.println("[NETWORK] WiFi is enabled but no saved network is available");
@@ -481,6 +509,36 @@ void applyAudioSetting() {
     if (audio.isInitialized()) audio.setOutputVolume(settingsState.volumePercent);
     audio.setSpeakerEnabled(settingsState.volumePercent > 0);
     Serial.printf("[SETTINGS] Audio volume %u%%\n", settingsState.volumePercent);
+}
+
+void playAudioTestBeep() {
+    if (!audio.isInitialized() || settingsState.volumePercent == 0) {
+        Serial.println("[AUDIO TEST] Codec unavailable or volume is muted");
+        return;
+    }
+
+    OpusPlayer::stop();
+    audio.setOutputVolume(settingsState.volumePercent);
+    audio.setSpeakerEnabled(true);
+    constexpr uint32_t sampleRate = Es8311::DEFAULT_SAMPLE_RATE;
+    constexpr uint32_t frequency = 880;
+    constexpr size_t sampleCount = sampleRate / 4;
+    constexpr size_t chunkSamples = 256;
+    int16_t samples[chunkSamples] = {};
+    for (size_t offset = 0; offset < sampleCount; offset += chunkSamples) {
+        const size_t count = min(chunkSamples, sampleCount - offset);
+        for (size_t i = 0; i < count; ++i) {
+            const float phase = 2.0f * PI * frequency * (offset + i) / sampleRate;
+            samples[i] = static_cast<int16_t>(sinf(phase) * 9000.0f);
+        }
+        if (audio.write(samples, count, 500) != count) {
+            Serial.println("[AUDIO TEST] Short PCM write");
+            break;
+        }
+    }
+    std::memset(samples, 0, sizeof(samples));
+    audio.write(samples, chunkSamples, 500);
+    Serial.printf("[AUDIO TEST] Beep played at %u%% volume\n", settingsState.volumePercent);
 }
 
 void loadSettings() {
@@ -595,7 +653,7 @@ const char *pageName(PageId page) {
     case PageId::Voice: return "Voice";
     case PageId::Music: return "Music";
     case PageId::Poem: return "Poem";
-    case PageId::Learn: return "Learn";
+    case PageId::Word: return "Word";
     case PageId::Recording: return "Recording";
     default: return "Main";
     }
@@ -611,7 +669,7 @@ PageRenderer rendererFor(PageId page) {
     case PageId::Voice: return VoicePage::render;
     case PageId::Music: return MusicPage::render;
     case PageId::Poem: return PoemPage::render;
-    case PageId::Learn: return LearnPage::render;
+    case PageId::Word: return WordPage::render;
     case PageId::Recording: return RecordingPage::render;
     default: return MainPage::render;
     }
@@ -623,7 +681,7 @@ void refreshCurrentPage() {
     std::memcpy(transitionFrame, frame, topBarBytes);
     if (currentPage == PageId::Book || currentPage == PageId::Voice ||
         currentPage == PageId::Music || currentPage == PageId::Poem ||
-        currentPage == PageId::Learn) {
+        currentPage == PageId::Word) {
         // Drive the old SD-backed content area white before drawing its next
         // list/detail/page state, reducing ghosted text and borders.
         wipeContentAreaWhite();
@@ -652,6 +710,29 @@ void refreshCurrentRegion(uint16_t x, uint16_t y, uint16_t width, uint16_t heigh
     constexpr size_t topBarBytes = static_cast<size_t>(32) * (XingtaiEpd::WIDTH / 8);
     std::memcpy(transitionFrame, frame, topBarBytes);
     epaper.displayPartial(frame, transitionFrame, x, y, width, height);
+    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+    epaper.sleep();
+}
+
+void refreshPoemDisplay() {
+    constexpr uint16_t popupX = 12;
+    constexpr uint16_t popupY = 82;
+    constexpr uint16_t popupWidth = 216;
+    constexpr uint16_t popupHeight = 10 * 30 + 9 * 2;
+
+    // The poem reader is an in-place window. Only scrub and redraw the window
+    // rectangle; leave the playlist and the rest of the page untouched.
+    epaper.displayPartial(frame, whiteFrame, popupX, popupY,
+                          popupWidth, popupHeight);
+    std::memset(frame + popupY * (XingtaiEpd::WIDTH / 8), 0x00,
+                static_cast<size_t>(popupHeight) * (XingtaiEpd::WIDTH / 8));
+    epaper.sleep();
+
+    PoemPage::render(transitionFrame);
+    constexpr size_t topBarBytes = static_cast<size_t>(32) * (XingtaiEpd::WIDTH / 8);
+    std::memcpy(transitionFrame, frame, topBarBytes);
+    epaper.displayPartial(frame, transitionFrame, popupX, popupY,
+                          popupWidth, popupHeight);
     std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
     epaper.sleep();
 }
@@ -716,6 +797,27 @@ void refreshPoemDirtyRows() {
     epaper.sleep();
 }
 
+void refreshWordStrokeWindow(bool wipeFirst) {
+    // Keep the partial waveform strictly inside the image card and away from
+    // its border, which prevents the border from being disturbed.
+    constexpr uint16_t strokeLeft = 22;
+    constexpr uint16_t strokeTop = 80;
+    constexpr uint16_t strokeWidth = 108;
+    constexpr uint16_t strokeHeight = 108;
+
+    WordPage::render(transitionFrame);
+    if (wipeFirst) {
+        epaper.displayPartial(frame, whiteFrame, strokeLeft, strokeTop,
+                              strokeWidth, strokeHeight);
+        clearFrameRegion(frame, strokeLeft, strokeTop, strokeWidth, strokeHeight);
+        epaper.sleep();
+    }
+    epaper.displayPartial(frame, transitionFrame, strokeLeft, strokeTop,
+                          strokeWidth, strokeHeight);
+    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+    epaper.sleep();
+}
+
 void clearFrameRegion(uint8_t *buffer, int left, int top, int width, int height) {
     for (int y = top; y < top + height; ++y) {
         for (int x = left; x < left + width; ++x) {
@@ -735,7 +837,8 @@ void showTopbarLoading(bool visible) {
         std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
         clearFrameRegion(transitionFrame, loadingLeft, loadingTop,
                          loadingWidth, loadingHeight);
-        UiLocalization::drawCentered(transitionFrame, 12, "LOADING", 1);
+        UiLocalization::drawCentered(transitionFrame, 12,
+                                     UiLocalization::isChinese() ? "下载中" : "LOADING", 1);
         epaper.displayPartial(frame, transitionFrame, loadingLeft, loadingTop,
                               loadingWidth, loadingHeight);
     } else {
@@ -794,7 +897,7 @@ MainPage::FunctionIcon mainIconFor(PageId page) {
     case PageId::Voice: return MainPage::FunctionIcon::Voice;
     case PageId::Music: return MainPage::FunctionIcon::Music;
     case PageId::Poem: return MainPage::FunctionIcon::Poem;
-    case PageId::Learn: return MainPage::FunctionIcon::Learn;
+    case PageId::Word: return MainPage::FunctionIcon::Word;
     case PageId::Recording: return MainPage::FunctionIcon::Recording;
     default: return MainPage::FunctionIcon::None;
     }
@@ -820,7 +923,7 @@ bool mainIconBounds(PageId page, uint16_t &x, uint16_t &y, uint16_t &width, uint
     case PageId::Voice: column = 2; row = 1; break;
     case PageId::Music: column = 0; row = 2; break;
     case PageId::Poem: column = 1; row = 2; break;
-    case PageId::Learn: column = 2; row = 2; break;
+    case PageId::Word: column = 2; row = 2; break;
     case PageId::Recording: column = 0; row = 3; break;
     default: return false;
     }
@@ -932,7 +1035,7 @@ PageId mainPageAt(int16_t x, int16_t y) {
     constexpr PageId pages[4][3] = {
         {PageId::Settings, PageId::Calendar, PageId::Calculator},
         {PageId::Clock, PageId::Book, PageId::Voice},
-        {PageId::Music, PageId::Poem, PageId::Learn},
+        {PageId::Music, PageId::Poem, PageId::Word},
         {PageId::Recording, PageId::Main, PageId::Main},
     };
 
@@ -996,21 +1099,33 @@ void handleTouch(TPoint point, TEvent event) {
             const int16_t deltaX = touchGestureLastX - touchGestureStartX;
             const int16_t deltaY = touchGestureLastY - touchGestureStartY;
             touchGestureActive = false;
-            if ((currentPage == PageId::Book || currentPage == PageId::Voice ||
-                 currentPage == PageId::Music || currentPage == PageId::Poem) &&
+            const bool poemPopupOpen = currentPage == PageId::Poem && PoemPage::isPopupOpen();
+            if ((poemPopupOpen || currentPage == PageId::Book ||
+                 currentPage == PageId::Voice || currentPage == PageId::Music ||
+                 currentPage == PageId::Poem || currentPage == PageId::Word) &&
                 touchGestureStartY >= 32 &&
                 (abs(deltaX) >= 35 || abs(deltaY) >= 35)) {
                 Serial.printf("[TOUCH] SWIPE start=(%d,%d) end=(%d,%d) delta=(%d,%d)\n",
                               touchGestureStartX, touchGestureStartY,
                               touchGestureLastX, touchGestureLastY, deltaX, deltaY);
-                const bool changed = currentPage == PageId::Book
+                const bool changed = poemPopupOpen
+                    ? PoemPage::handleSwipe(deltaX, deltaY)
+                    : currentPage == PageId::Book
                     ? BookPage::handleSwipe(deltaX, deltaY)
                     : currentPage == PageId::Voice
                         ? VoicePage::handleSwipe(deltaX, deltaY)
                         : currentPage == PageId::Music
                             ? MusicPage::handleSwipe(deltaX, deltaY)
-                            : PoemPage::handleSwipe(deltaX, deltaY);
-                if (changed) refreshCurrentPage();
+                            : currentPage == PageId::Word
+                                ? WordPage::handleSwipe(deltaX, deltaY)
+                                : PoemPage::handleSwipe(deltaX, deltaY);
+                if (changed) {
+                    if (poemPopupOpen || (currentPage == PageId::Poem && PoemPage::isPopupOpen())) {
+                        refreshPoemDisplay();
+                    } else {
+                        refreshCurrentPage();
+                    }
+                }
             }
         }
         return;
@@ -1023,22 +1138,34 @@ void handleTouch(TPoint point, TEvent event) {
     // audio and returning Wire to FT6336. Consume that same physical tap before
     // global navigation so it cannot leave a stale suppression flag behind.
     if ((currentPage == PageId::Voice || currentPage == PageId::Music ||
-         currentPage == PageId::Poem) &&
+         currentPage == PageId::Poem || currentPage == PageId::Word) &&
         suppressNextAudioTap) {
         suppressNextAudioTap = false;
         Serial.println("[TOUCH IRQ] Playback-stop tap consumed");
         if (currentPage == PageId::Voice) refreshVoiceDirtyRows();
         else if (currentPage == PageId::Music) refreshMusicDirtyRows();
-        else if (PoemPage::handleTap(uiX, uiY)) refreshCurrentPage();
+        else if (currentPage == PageId::Poem && PoemPage::handleTap(uiX, uiY)) refreshCurrentPage();
+        else if (currentPage == PageId::Word && WordPage::handleTap(uiX, uiY)) {
+            if (WordPage::takeReplayRefreshRequest()) refreshWordStrokeWindow(true);
+            else refreshCurrentPage();
+        }
         else refreshCurrentPage();
         return;
     }
 
-    // Home is a global navigation action. Handle it before any page-specific
-    // touch routing so every current and future page returns to the main page.
+    // Home is global, including while a poem popup overlays the library.
+    // Handle it before popup-local routing so the overlay cannot consume it.
     if (isHomeIcon(uiX, uiY)) {
         Serial.println("[NAVIGATION] Home tapped");
         queuePage(PageId::Main);
+        return;
+    }
+
+    // The poem reader is an in-place overlay while the page state remains the
+    // library. Give the overlay first refusal so its controls cannot fall
+    // through to the playlist underneath.
+    if (currentPage == PageId::Poem && PoemPage::isPopupOpen()) {
+        if (PoemPage::handleTap(uiX, uiY)) refreshPoemDisplay();
         return;
     }
 
@@ -1055,7 +1182,7 @@ void handleTouch(TPoint point, TEvent event) {
             return;
         case SettingsPage::Action::ToggleWifi:
             settingsState.wifiEnabled = !settingsState.wifiEnabled;
-            applyWifiSetting();
+            applyWifiSetting(settingsState.wifiEnabled);
             applyCellularSetting();
             break;
         case SettingsPage::Action::RefreshSdCard:
@@ -1118,6 +1245,9 @@ void handleTouch(TPoint point, TEvent event) {
                 ? settingsState.volumePercent + 10 : 100;
             applyAudioSetting();
             break;
+        case SettingsPage::Action::TestAudio:
+            playAudioTestBeep();
+            return;
         case SettingsPage::Action::RetryWifiScan:
             scanWifiNetworks();
             return;
@@ -1301,12 +1431,22 @@ void handleTouch(TPoint point, TEvent event) {
     }
 
     if (currentPage == PageId::Poem) {
-        if (PoemPage::handleTap(uiX, uiY)) refreshCurrentPage();
+        const bool popupWasOpen = PoemPage::isPopupOpen();
+        if (PoemPage::handleTap(uiX, uiY)) {
+            if (popupWasOpen || PoemPage::isPopupOpen()) refreshPoemDisplay();
+            else refreshCurrentPage();
+        }
         return;
     }
 
-    if (currentPage == PageId::Learn) {
-        if (LearnPage::handleTap(uiX, uiY)) refreshCurrentPage();
+    if (currentPage == PageId::Word) {
+        if (WordPage::handleTap(uiX, uiY)) {
+            if (WordPage::takeReplayRefreshRequest()) {
+                refreshWordStrokeWindow(true);
+            } else {
+                refreshCurrentPage();
+            }
+        }
         return;
     }
 
@@ -1422,6 +1562,9 @@ void processTouchAction() {
     if (currentPage == PageId::Poem && nextPage != PageId::Poem) {
         PoemPage::stopAudio();
     }
+    if (currentPage == PageId::Word && nextPage != PageId::Word) {
+        WordPage::stopAudio();
+    }
 
     Serial.printf("[UI] Opening %s page\n", pageName(nextPage));
     if (nextPage == PageId::Main) {
@@ -1449,7 +1592,11 @@ void processTouchAction() {
         PoemPage::setVoice(SettingsPage::voiceName());
         PoemPage::openLibrary();
     }
-    if (nextPage == PageId::Learn) LearnPage::open();
+    if (nextPage == PageId::Word) {
+        WordPage::setContentUrl(contentUrl);
+        WordPage::setVoice(SettingsPage::voiceName());
+        WordPage::open();
+    }
     rendererFor(nextPage)(transitionFrame);
 
     // Keep the current top-bar pixels untouched and refresh only the function
@@ -1516,9 +1663,6 @@ void setup() {
     beginTouch();
     Serial.println("[BOOT] Touch controller initialization complete");
 
-    Serial.println("[BOOT] Rendering Asundar splash frame...");
-    AsundarPage::render(frame);
-
     Serial.println("[BOOT] Initializing e-paper controller...");
     epaper.begin();
     recoverSharedI2c();
@@ -1545,22 +1689,24 @@ void setup() {
     } else {
         Serial.println("[CAL] Using saved touch calibration");
     }
-    Serial.println("[BOOT] Refreshing Asundar splash...");
+    Serial.println("[BOOT] Rendering Asundar startup logo...");
+    AsundarPage::render(frame);
     epaper.display(frame);
-    Serial.println("[BOOT] Asundar splash refresh complete");
+    epaper.sleep();
+    delay(900);
+    recoverSharedI2c();
 
-    // Keep the splash-to-home transition direct: do not clear the panel or
-    // insert a delay. The controller still needs its mandatory refresh to
-    // replace the splash pixels with the home pixels.
     Serial.println("[BOOT] Rendering main page frame...");
     // Always establish a clean initial top bar. The runtime state monitor adds
     // Wi-Fi only after the Home frame is physically present and connectivity
     // has been observed in the normal event loop.
     lastWifiConnected = false;
     MainPage::setWifiConnected(false);
-    MainPage::render(frame);
-    Serial.println("[BOOT] Refreshing main page...");
-    epaper.display(frame);
+    MainPage::render(transitionFrame);
+    Serial.println("[BOOT] Transitioning to main page...");
+    epaper.displayPartial(frame, transitionFrame, 0, 0,
+                          XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT);
+    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
     Serial.println("[BOOT] Putting e-paper controller to sleep...");
     epaper.sleep();
     Serial.println("[BOOT] Main page refresh complete");
@@ -1601,6 +1747,9 @@ void loop() {
     }
     if (PoemPage::processAudio() && currentPage == PageId::Poem) {
         refreshCurrentPage();
+    }
+    if (currentPage == PageId::Word && WordPage::processAnimation()) {
+        refreshWordStrokeWindow(false);
     }
     int16_t marqueeTop = 0;
     if (VoicePage::advanceMarquee(marqueeTop) && currentPage == PageId::Voice) {

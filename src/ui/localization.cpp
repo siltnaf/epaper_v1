@@ -1,5 +1,6 @@
 #include "ui/localization.h"
 #include "devices/epd_xingtai/epd_xingtai.h"
+#include "font/xiaozhi_font.h"
 #include "font/basic_font.h"
 #include <cstring>
 
@@ -97,12 +98,32 @@ void block(uint8_t*f,int x,int y,int s){for(int yy=0;yy<s;++yy)for(int xx=0;xx<s
 uint32_t nextCodepoint(const char *&p){const uint8_t*c=(const uint8_t*)p;if(c[0]<0x80){++p;return c[0];}if((c[0]&0xE0)==0xC0){p+=2;return ((c[0]&0x1F)<<6)|(c[1]&0x3F);}if((c[0]&0xF0)==0xE0){p+=3;return ((c[0]&0x0F)<<12)|((c[1]&0x3F)<<6)|(c[2]&0x3F);}++p;return '?';}
 const uint8_t* asciiGlyph(uint32_t cp){if(cp>='A'&&cp<='Z')return BasicFont::english((char)cp);if(cp>='a'&&cp<='z')return BasicFont::english((char)(cp-'a'+'A'));if(cp>='0'&&cp<='9')return DIGITS[cp-'0'];if(cp==':')return COLON;if(cp=='-')return MINUS;if(cp=='+')return PLUS;if(cp=='/')return SLASH;if(cp=='.')return PERIOD;return nullptr;}
 const ChineseGlyph* chineseGlyph(uint32_t cp){for(const auto &g:CHINESE_GLYPHS)if(g.codepoint==cp)return &g;return nullptr;}
-int glyphWidth(uint32_t cp,int scale){return cp<0x80?6*scale:17*scale;}
+int glyphWidth(uint32_t cp,int scale){
+    if(cp<0x80) return 6*scale;
+    if(const XiaozhiFont::Glyph *glyph=XiaozhiFont::glyph(cp))
+        return (static_cast<int>(glyph->advance)+1)*scale;
+    return 17*scale;
+}
+
+void drawXiaozhiGlyph(uint8_t *frame,const XiaozhiFont::Glyph *glyph,
+                     int x,int y,int scale){
+    if(!glyph) return;
+    const int top=y+16*scale-static_cast<int>(glyph->height)*scale-
+                  static_cast<int>(glyph->offsetY)*scale;
+    for(uint16_t row=0;row<glyph->height;++row)
+        for(uint16_t column=0;column<glyph->width;++column){
+            const uint32_t index=static_cast<uint32_t>(row)*glyph->width+column;
+            const uint8_t packed=glyph->bitmap[index/2U];
+            const uint8_t alpha=(index&1U)?(packed&0x0FU):(packed>>4);
+            if(alpha>=11) block(frame,x+(glyph->offsetX+column)*scale,
+                                top+row*scale,scale);
+        }
+}
 }
 namespace UiLocalization {
 void setLanguage(uint8_t language){selectedLanguage=language==0?0:1;}
 bool isChinese(){return selectedLanguage==1;}
 int textWidth(const char*value,int scale){int w=0;const char*p=value;while(p&&*p){uint32_t cp=nextCodepoint(p);w+=glyphWidth(cp,scale);}return w>0?w-scale:0;}
-void drawText(uint8_t*f,int x,int y,const char*value,int scale){const char*p=value;while(p&&*p){uint32_t cp=nextCodepoint(p);if(cp<0x80){const uint8_t*g=asciiGlyph(cp);if(g)for(int r=0;r<7;++r)for(int c=0;c<5;++c)if(g[r]&(0x10U>>c))block(f,x+c*scale,y+r*scale,scale);}else{const ChineseGlyph*g=chineseGlyph(cp);if(g)for(int r=0;r<16;++r)for(int c=0;c<16;++c)if(g->bitmap[r*2+c/8]&(0x80U>>(c%8)))block(f,x+c*scale,y+r*scale,scale);}x+=glyphWidth(cp,scale);}}
+void drawText(uint8_t*f,int x,int y,const char*value,int scale){const char*p=value;while(p&&*p){uint32_t cp=nextCodepoint(p);if(cp<0x80){const uint8_t*g=asciiGlyph(cp);if(g)for(int r=0;r<7;++r)for(int c=0;c<5;++c)if(g[r]&(0x10U>>c))block(f,x+c*scale,y+r*scale,scale);}else if(const ChineseGlyph*g=chineseGlyph(cp)){for(int r=0;r<16;++r)for(int c=0;c<16;++c)if(g->bitmap[r*2+c/8]&(0x80U>>(c%8)))block(f,x+c*scale,y+r*scale,scale);}else if(const XiaozhiFont::Glyph*g=XiaozhiFont::glyph(cp)){drawXiaozhiGlyph(f,g,x,y,scale);}x+=glyphWidth(cp,scale);}}
 void drawCentered(uint8_t*f,int y,const char*v,int scale){drawText(f,(XingtaiEpd::WIDTH-textWidth(v,scale))/2,y,v,scale);}
 }

@@ -23,9 +23,6 @@ constexpr int READER_W = 220;
 constexpr int READER_LINE_H = 25;
 constexpr int READER_LINES = 11;
 constexpr uint16_t MAX_PAGES = 128;
-constexpr int LEARN_BITMAP_W = 180;
-constexpr int LEARN_BITMAP_H = 120;
-constexpr size_t LEARN_BITMAP_BYTES = (LEARN_BITMAP_W * LEARN_BITMAP_H + 7) / 8;
 
 struct Item {
     int32_t id = 0;
@@ -43,14 +40,11 @@ String selectedContent;
 uint32_t pageOffsets[MAX_PAGES + 1] = {};
 uint16_t pageCount = 1;
 uint16_t currentPage = 0;
-uint8_t learnBitmap[LEARN_BITMAP_BYTES] = {};
-bool learnBitmapLoaded = false;
 
 const char *folderFor(Kind kind) {
     switch (kind) {
     case Kind::Music: return "/music";
     case Kind::Poem: return "/poems";
-    case Kind::Learn: return "/character";
     default: return "/voice";
     }
 }
@@ -59,7 +53,6 @@ const char *titleFor(Kind kind) {
     switch (kind) {
     case Kind::Music: return "OFFLINE MUSIC";
     case Kind::Poem: return "OFFLINE POEMS";
-    case Kind::Learn: return "OFFLINE LEARN";
     default: return "OFFLINE VOICE";
     }
 }
@@ -178,11 +171,6 @@ bool loadItemMetadata(const char *directory, Kind kind, Item &item) {
         char audioPath[128] = {};
         snprintf(audioPath, sizeof(audioPath), "%s/%s", directory, second.c_str());
         if (!second.length() || !SD_MMC.exists(audioPath)) return false;
-    } else if (kind == Kind::Learn) {
-        snprintf(item.detail, sizeof(item.detail), "%s%s%s", second.c_str(),
-                 second.length() && fourth.length() ? " / " : "", fourth.c_str());
-        snprintf(path, sizeof(path), "%s/bitmap.bin", directory);
-        if (!SD_MMC.exists(path)) return false;
     } else {
         snprintf(item.detail, sizeof(item.detail), "%s%s%s", second.c_str(),
                  second.length() && third.length() ? " / " : "", third.c_str());
@@ -198,7 +186,6 @@ void loadItems(Kind kind) {
     selectedIndex = -1;
     lastSelectedIndex = -1;
     selectedContent = "";
-    learnBitmapLoaded = false;
     if (!SdCard::isMounted()) return;
     File root = SD_MMC.open(folderFor(kind));
     if (!root || !root.isDirectory()) return;
@@ -259,7 +246,6 @@ void selectItem(uint8_t index) {
         lastSelectedIndex = index;
     }
     currentPage = 0;
-    learnBitmapLoaded = false;
     const Item &item = items[index];
     if (activeKind == Kind::Voice || activeKind == Kind::Poem) {
         char path[96] = {};
@@ -268,12 +254,6 @@ void selectItem(uint8_t index) {
         selectedContent = content ? content.readString() : String();
         if (content) content.close();
         paginateContent();
-    } else if (activeKind == Kind::Learn) {
-        char path[96] = {};
-        snprintf(path, sizeof(path), "%s/bitmap.bin", item.directory);
-        File bitmap = SD_MMC.open(path, FILE_READ);
-        learnBitmapLoaded = bitmap && bitmap.read(learnBitmap, sizeof(learnBitmap)) == sizeof(learnBitmap);
-        if (bitmap) bitmap.close();
     }
 }
 
@@ -353,28 +333,6 @@ void renderMusicDetail(uint8_t *frame) {
     UiLocalization::drawCentered(frame, 275, "DECODER NOT INSTALLED");
 }
 
-void renderLearnDetail(uint8_t *frame) {
-    const Item &item = items[selectedIndex];
-    rect(frame, 8, 38, 48, 25); UiLocalization::drawText(frame, 16, 47, "BACK");
-    drawUtf8Line(frame, 64, 38, 166, 25, item.title);
-    if (learnBitmapLoaded) {
-        const int left = 30, top = 90;
-        rect(frame, left - 1, top - 1, LEARN_BITMAP_W + 2, LEARN_BITMAP_H + 2);
-        for (int y = 0; y < LEARN_BITMAP_H; ++y) {
-            for (int x = 0; x < LEARN_BITMAP_W; ++x) {
-                const size_t bit = static_cast<size_t>(y) * LEARN_BITMAP_W + x;
-                // epaper_s3 stores black source pixels as zero in this 1-bpp asset.
-                if ((learnBitmap[bit / 8] & (0x80U >> (bit % 8))) == 0) pixel(frame, left + x, top + y);
-            }
-        }
-    }
-    drawUtf8Line(frame, 20, 235, 200, 30, item.detail);
-    char strokePath[96] = {};
-    snprintf(strokePath, sizeof(strokePath), "%s/strokes.bin", item.directory);
-    UiLocalization::drawCentered(frame, 285,
-        SD_MMC.exists(strokePath) ? "STROKES SAVED" : "IMAGE SAVED");
-}
-
 }
 
 namespace OfflineContentPage {
@@ -413,8 +371,7 @@ void render(Kind kind, uint8_t *frame) {
     std::memset(frame, 0x00, XingtaiEpd::FRAME_BYTES);
     if (selectedIndex < 0) renderList(frame);
     else if (kind == Kind::Voice || kind == Kind::Poem) renderTextReader(frame);
-    else if (kind == Kind::Music) renderMusicDetail(frame);
-    else renderLearnDetail(frame);
+    else renderMusicDetail(frame);
 }
 
 }

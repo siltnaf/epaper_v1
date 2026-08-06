@@ -14,7 +14,7 @@ enum class FunctionIcon : uint8_t {
     Voice,
     Music,
     Poem,
-    Learn,
+    Word,
     Recording,
 };
 

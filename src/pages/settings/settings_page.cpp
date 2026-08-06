@@ -266,7 +266,8 @@ void renderSettings(uint8_t *frame) {
 
     rect(frame, 16, rowY(5), 208, rowHeight);
     text(frame, 28, rowY(5) + 13, cn ? "语音" : "TTS VOICE", cn ? 1 : 2);
-    text(frame, 154, rowY(5) + 14, VOICES[selectedVoice], 1);
+    text(frame, 220 - textWidth(VOICES[selectedVoice], 2), rowY(5) + 13,
+         VOICES[selectedVoice], 2);
 
     rect(frame, 16, rowY(6), 208, rowHeight);
     text(frame, 28, rowY(6) + 13, cn ? "音量" : "AUDIO", cn ? 1 : 2);
@@ -281,6 +282,10 @@ void renderSettings(uint8_t *frame) {
         volume[1] = static_cast<char>('0' + value % 10);
     } else volume[0] = static_cast<char>('0' + value);
     text(frame, 181 - textWidth(volume, 1), rowY(6) + 16, volume, 1);
+
+    rect(frame, 16, rowY(7), 208, rowHeight);
+    text(frame, 28, rowY(7) + 13, cn ? "声音测试" : "AUDIO TEST", cn ? 1 : 2);
+    button(frame, 164, rowY(7) + 4, 52, 32, cn ? "测试" : "TEST");
 }
 
 void renderVoices(uint8_t *frame) {
@@ -297,7 +302,8 @@ void renderVoices(uint8_t *frame) {
             rect(frame, x + 3, y + 3, 94, 28);
             fillRect(frame, x + 8, y + 12, 8, 8);
         }
-        text(frame, x + 24, y + 13, VOICES[index], 1);
+        text(frame, x + (100 - textWidth(VOICES[index], 2)) / 2,
+             y + (34 - BasicFont::ENGLISH_HEIGHT * 2) / 2, VOICES[index], 2);
     }
     button(frame, 14, 260, 100, 40, cn ? "返回" : "BACK");
 }
@@ -473,6 +479,7 @@ Action actionAt(int16_t x, int16_t y) {
     if (inRect(x, y, 16, rowY(5), 208, rowHeight)) return Action::OpenVoiceSelection;
     if (inRect(x, y, 116, rowY(6), 56, rowHeight)) return Action::VolumeDown;
     if (inRect(x, y, 172, rowY(6), 52, rowHeight)) return Action::VolumeUp;
+    if (inRect(x, y, 16, rowY(7), 208, rowHeight)) return Action::TestAudio;
     return Action::None;
 }
 

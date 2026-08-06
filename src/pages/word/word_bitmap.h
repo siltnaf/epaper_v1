@@ -1,7 +1,7 @@
 #pragma once
 
 #include <stdint.h>
-namespace LearnBitmap {
+namespace WordBitmap {
 constexpr uint8_t WIDTH = 48;
 constexpr uint8_t HEIGHT = 48;
 constexpr uint8_t ROW_BYTES = 6;

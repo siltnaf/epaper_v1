@@ -40,6 +40,14 @@ constexpr int MARQUEE_X = 34;
 constexpr int MARQUEE_WIDTH = 171;
 constexpr int MARQUEE_HEIGHT = ROW_HEIGHT - 2;
 constexpr int MARQUEE_ROW_BYTES = (MARQUEE_WIDTH + 7) / 8;
+constexpr int POPUP_X = 12;
+constexpr int POPUP_Y = LIST_TOP;
+constexpr int POPUP_W = 216;
+constexpr int POPUP_H = ROW_HEIGHT * ITEMS_PER_PAGE + ROW_GAP * (ITEMS_PER_PAGE - 1);
+constexpr int POPUP_CONTENT_X = 22;
+constexpr int POPUP_CONTENT_Y = POPUP_Y + 54;
+constexpr int POPUP_CONTENT_W = 196;
+constexpr int POPUP_CONTENT_BOTTOM = POPUP_Y + POPUP_H - 14;
 
 struct PoemItem {
     int32_t id = 0;
@@ -72,6 +80,7 @@ bool pendingAudioStart = false;
 int8_t activePoemIndex = -1;
 uint8_t marqueeBitmap[MARQUEE_ROW_BYTES * MARQUEE_HEIGHT] = {};
 bool marqueeReady = false;
+bool poemPopupOpen = false;
 uint16_t marqueeOffset = 0;
 uint32_t nextMarqueeMs = 0;
 int8_t dirtyRowA = -1;
@@ -944,7 +953,7 @@ int readerPageCount() {
 }
 
 void renderLibrary(uint8_t *frame) {
-    if (UiLocalization::isChinese()) drawUtf8Title(frame, 78, 34, 84, 18, "诗词");
+    if (UiLocalization::isChinese()) drawUtf8Title(frame, 91, 34, 58, 18, "诗词");
     else drawCentered(frame, 36, "POEMS", 2);
 
     rect(frame, 4, PAGER_TOP, PAGER_BUTTON_WIDTH, PAGER_HEIGHT);
@@ -981,6 +990,75 @@ void renderLibrary(uint8_t *frame) {
             if (!marqueeReady) captureMarquee(frame, top);
         } else if (stories[index].saved) drawCheckmark(frame, 215, top + ROW_HEIGHT / 2);
         else drawArrow(frame, 215, top + ROW_HEIGHT / 2, true);
+    }
+}
+
+void renderPoemPopup(uint8_t *frame) {
+    // Keep the playlist underneath and cover only its first five rows. This
+    // makes the reader feel like a window rather than a page transition.
+    for (int y = POPUP_Y; y < POPUP_Y + POPUP_H; ++y) {
+        for (int x = POPUP_X; x < POPUP_X + POPUP_W; ++x) {
+            frame[static_cast<size_t>(y) * (XingtaiEpd::WIDTH / 8) + x / 8] &=
+                static_cast<uint8_t>(~(0x80U >> (x % 8)));
+        }
+    }
+    boldRect(frame, POPUP_X, POPUP_Y, POPUP_W, POPUP_H);
+    rect(frame, POPUP_X + 7, POPUP_Y + 7, 42, 24);
+    const char *backLabel = UiLocalization::isChinese() ? "返回" : "BACK";
+    const int backWidth = UiLocalization::textWidth(backLabel, 1);
+    UiLocalization::drawText(frame, POPUP_X + 7 + (42 - backWidth) / 2,
+                             POPUP_Y + 15, backLabel);
+    drawUtf8Title(frame, POPUP_X + 56, POPUP_Y + 5, 112, 28, selectedTitle);
+    drawPlayPause(frame, POPUP_X + POPUP_W - 18, POPUP_Y + 19, poemPlaying);
+
+    char byline[132] = {};
+    if (selectedDynasty[0] && selectedAuthor[0]) {
+        snprintf(byline, sizeof(byline), "%s · %s", selectedDynasty, selectedAuthor);
+    } else {
+        snprintf(byline, sizeof(byline), "%s%s", selectedDynasty, selectedAuthor);
+    }
+    drawUtf8Title(frame, POPUP_CONTENT_X, POPUP_Y + 34, POPUP_CONTENT_W, 18, byline);
+    line(frame, POPUP_X + 7, POPUP_Y + 51, POPUP_X + POPUP_W - 8, POPUP_Y + 51);
+
+    const char *base = selectedContent.c_str();
+    const char *cursor = base + readerPageOffsets[readerPage];
+    const char *end = base + readerPageOffsets[readerPage + 1];
+    int drawY = POPUP_CONTENT_Y;
+    int drawX = POPUP_CONTENT_X;
+    while (cursor < end && drawY + READER_LINE_HEIGHT <= POPUP_CONTENT_BOTTOM) {
+        const char *codepointStart = cursor;
+        uint32_t codepoint = 0;
+        if (!nextUtf8Codepoint(cursor, codepoint)) break;
+        if (codepoint == '\r') continue;
+        if (codepoint == '\n') {
+            drawX = POPUP_CONTENT_X;
+            drawY += READER_LINE_HEIGHT;
+            continue;
+        }
+        const int advance = codepoint < 0x80 ? 6 : codepointAdvance(codepoint);
+        if (drawX > POPUP_CONTENT_X && drawX + advance > POPUP_CONTENT_X + POPUP_CONTENT_W) {
+            cursor = codepointStart;
+            drawX = POPUP_CONTENT_X;
+            drawY += READER_LINE_HEIGHT;
+            continue;
+        }
+        if (codepoint < 0x80) {
+            char text[2] = {static_cast<char>(codepoint), '\0'};
+            UiLocalization::drawText(frame, drawX, drawY + 7, text, 1);
+        } else if (const XiaozhiFont::Glyph *glyph = XiaozhiFont::glyph(codepoint)) {
+            constexpr int baseline = 6;
+            const int glyphTop = drawY + READER_LINE_HEIGHT - baseline -
+                                 glyph->height - glyph->offsetY;
+            drawChineseGlyph(frame, glyph, drawX + glyph->offsetX, glyphTop,
+                             POPUP_CONTENT_X + POPUP_CONTENT_W, POPUP_CONTENT_BOTTOM);
+        }
+        drawX += advance;
+    }
+
+    if (readerPageCount() > 1) {
+        char pager[16] = {};
+        snprintf(pager, sizeof(pager), "%d/%d", readerPage + 1, readerPageCount());
+        drawCentered(frame, POPUP_Y + POPUP_H - 8, pager);
     }
 }
 
@@ -1076,6 +1154,7 @@ void openLibrary() {
     dirtyRowA = -1;
     dirtyRowB = -1;
     view = View::Library;
+    poemPopupOpen = false;
     libraryPage = 1;
     std::strcpy(statusText, UiLocalization::isChinese() ? "正在获取诗词" : "LOADING POEMS");
     loadLibrary();
@@ -1089,6 +1168,30 @@ void processPendingSave() {
 }
 
 bool handleTap(int16_t x, int16_t y) {
+    if (poemPopupOpen) {
+        if (pointInRect(x, y, POPUP_X + 3, POPUP_Y + 3, 50, 32)) {
+            stopAudio();
+            poemPopupOpen = false;
+            selectedContent = "";
+            readerPage = 0;
+            return true;
+        }
+        if (pointInRect(x, y, POPUP_X + POPUP_W - 34, POPUP_Y + 5, 28, 28)) {
+            pendingAudioStart = true;
+            return true;
+        }
+        if (pointInRect(x, y, 14, 370, 44, 26) && readerPage > 0) {
+            --readerPage;
+            return true;
+        }
+        if (pointInRect(x, y, 182, 370, 44, 26) &&
+            readerPage + 1 < readerPageCount()) {
+            ++readerPage;
+            return true;
+        }
+        return false;
+    }
+
     if (view == View::Library) {
         if (pointInRect(x, y, 4, PAGER_TOP, PAGER_BUTTON_WIDTH, PAGER_HEIGHT) &&
             libraryPage > 1) {
@@ -1124,35 +1227,25 @@ bool handleTap(int16_t x, int16_t y) {
                 stopAudio();
                 std::strcpy(audioStatus, UiLocalization::isChinese() ? "正在准备语音" : "PREPARING AUDIO");
                 if (!loadPoem(stories[index])) return true;
+                view = View::Library;
+                poemPopupOpen = true;
                 activePoemIndex = -1;
                 marqueeReady = false;
                 marqueeOffset = 0;
                 // The main loop starts audio only after this reader popup has
                 // been physically refreshed, avoiding SD/font/audio races.
-                pendingAudioStart = true;
+                pendingAudioStart = false;
                 return true;
             }
         }
         return false;
     }
 
-    if (pointInRect(x, y, 14, 44, 48, 26)) {
-        stopAudio();
-        view = View::Library;
-        selectedContent = "";
-        readerPage = 0;
-        return true;
-    }
-    if (pointInRect(x, y, 14, 370, 44, 26) && readerPage > 0) {
-        --readerPage;
-        return true;
-    }
-    if (pointInRect(x, y, 182, 370, 44, 26) &&
-        readerPage + 1 < readerPageCount()) {
-        ++readerPage;
-        return true;
-    }
     return false;
+}
+
+bool isPopupOpen() {
+    return poemPopupOpen;
 }
 
 bool processAudio() {
@@ -1233,6 +1326,17 @@ bool handleSwipe(int16_t deltaX, int16_t deltaY) {
     // Natural page movement: sweeping content left/up advances; sweeping it
     // right/down goes back. Both axes are supported for one-handed use.
     const bool next = primaryDelta < 0;
+    if (poemPopupOpen) {
+        if (next && readerPage + 1 < readerPageCount()) {
+            ++readerPage;
+            return true;
+        }
+        if (!next && readerPage > 0) {
+            --readerPage;
+            return true;
+        }
+        return false;
+    }
     if (view == View::Library) {
         if (next && libraryPage < libraryPageCount()) {
             ++libraryPage;
@@ -1250,20 +1354,15 @@ bool handleSwipe(int16_t deltaX, int16_t deltaY) {
         }
         return false;
     }
-    if (next && readerPage + 1 < readerPageCount()) {
-        ++readerPage;
-        return true;
-    }
-    if (!next && readerPage > 0) {
-        --readerPage;
-        return true;
-    }
     return false;
 }
 
 void render(uint8_t *frame) {
     std::memset(frame, 0x00, XingtaiEpd::FRAME_BYTES);
-    if (view == View::Library) renderLibrary(frame);
+    if (view == View::Library) {
+        renderLibrary(frame);
+        if (poemPopupOpen) renderPoemPopup(frame);
+    }
     else renderPlayer(frame);
 }
 

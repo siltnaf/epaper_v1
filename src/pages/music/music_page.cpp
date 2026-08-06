@@ -418,7 +418,7 @@ bool downloadSong(const String &url, const char *path) {
 bool ensureSongOpus(uint8_t index, char *path, size_t pathSize) {
     if (index >= songCount) return false;
     SongItem &song = songs[index];
-    if (cachedSongPath(song.id, path, pathSize)) {
+    if (cachedSongPath(song.id, path, pathSize) && isSongSavedOnSd(song.id)) {
         song.saved = true;
         Serial.printf("[MUSIC AUDIO] Using cache id=%ld path=%s\n",
                       static_cast<long>(song.id), path);
@@ -437,11 +437,25 @@ bool ensureSongOpus(uint8_t index, char *path, size_t pathSize) {
     snprintf(metaPath, sizeof(metaPath), "%s/meta.txt", directory);
     SD_MMC.remove(metaPath);
     File meta = SD_MMC.open(metaPath, FILE_WRITE);
-    if (meta) {
-        meta.printf("%ld\n%s\nsong.opus\n%s\n%s\n", static_cast<long>(song.id),
-                    song.title, song.source, url.c_str());
-        meta.close();
+    if (!meta) {
+        Serial.printf("[MUSIC SD] Could not write metadata id=%ld path=%s\n",
+                      static_cast<long>(song.id), metaPath);
+        SD_MMC.remove(path);
+        return false;
     }
+    meta.printf("%ld\n%s\nsong.opus\n%s\n%s\n", static_cast<long>(song.id),
+                song.title, song.source, url.c_str());
+    meta.flush();
+    meta.close();
+    if (!isSongSavedOnSd(song.id)) {
+        Serial.printf("[MUSIC SD] Saved song verification failed id=%ld\n",
+                      static_cast<long>(song.id));
+        SD_MMC.remove(metaPath);
+        SD_MMC.remove(path);
+        return false;
+    }
+    Serial.printf("[MUSIC SD] Saved offline copy id=%ld title=%s path=%s\n",
+                  static_cast<long>(song.id), song.title, path);
     song.saved = true;
     return true;
 }
@@ -462,11 +476,21 @@ bool loadSavedSongs() {
     File entry = root.openNextFile();
     while (entry && songCount < ITEMS_PER_PAGE) {
         if (entry.isDirectory()) {
-            String directory = entry.name();
-            const int slash = directory.lastIndexOf('/');
-            const int32_t id = directory.substring(slash + 1).toInt();
+            String entryName = entry.name();
+            const int slash = entryName.lastIndexOf('/');
+            const int32_t id = entryName.substring(slash + 1).toInt();
+            if (id <= 0) {
+                entry.close();
+                entry = root.openNextFile();
+                continue;
+            }
+            // SD_MMC can report either "/music/12" or "12" depending on
+            // the Arduino core version. Always rebuild the absolute path.
+            char directory[64] = {};
+            snprintf(directory, sizeof(directory), "%s/%ld", MUSIC_SD_FOLDER,
+                     static_cast<long>(id));
             char metaPath[96] = {};
-            snprintf(metaPath, sizeof(metaPath), "%s/meta.txt", directory.c_str());
+            snprintf(metaPath, sizeof(metaPath), "%s/meta.txt", directory);
             File meta = SD_MMC.open(metaPath, FILE_READ);
             if (meta) {
                 meta.readStringUntil('\n');
@@ -474,7 +498,7 @@ bool loadSavedSongs() {
                 const String filename = meta.readStringUntil('\n');
                 const String source = meta.readStringUntil('\n');
                 meta.close();
-                if (id > 0 && isSongSavedOnSd(id)) {
+                if (isSongSavedOnSd(id)) {
                     SongItem &song = songs[songCount++];
                     song.id = id;
                     copyUtf8(song.title, sizeof(song.title), title.c_str(), "UNTITLED");
@@ -503,6 +527,10 @@ bool loadLibrary() {
     marqueeReady = false;
     songCount = 0;
     selectedIndex = -1;
+    // With Wi-Fi disabled, do not spend time making a network request. The
+    // SD library is the authoritative source for previously played songs.
+    if (WiFi.status() != WL_CONNECTED && loadSavedSongs()) return true;
+
     String payload;
     const String url = endpointBase() + "?page=" + String(libraryPage) +
                        "&perPage=" + String(ITEMS_PER_PAGE);

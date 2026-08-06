@@ -20,6 +20,12 @@ void pixel(uint8_t *frame, int x, int y) {
     frame[static_cast<size_t>(y) * (XingtaiEpd::WIDTH / 8) + x / 8] |= 0x80U >> (x % 8);
 }
 
+void clearPixel(uint8_t *frame, int x, int y) {
+    if (x < 0 || x >= XingtaiEpd::WIDTH || y < 0 || y >= XingtaiEpd::HEIGHT) return;
+    frame[static_cast<size_t>(y) * (XingtaiEpd::WIDTH / 8) + x / 8] &=
+        static_cast<uint8_t>(~(0x80U >> (x % 8)));
+}
+
 void rect(uint8_t *frame, int x, int y, int width, int height) {
     for (int i = 0; i < width; ++i) {
         pixel(frame, x + i, y);
@@ -90,6 +96,26 @@ void dateText(uint8_t *frame, int x, int y, const char *value) {
                     const int left = x + column * 3 / 2;
                     const int right = x + (column + 1) * 3 / 2;
                     fillRect(frame, left, top, right - left, bottom - top);
+                }
+            }
+        }
+        x += 9;
+    }
+}
+
+void invertedDateText(uint8_t *frame, int x, int y, const char *value) {
+    for (const char *cursor = value; cursor && *cursor; ++cursor) {
+        const uint8_t *bitmap = glyph(*cursor);
+        if (bitmap) {
+            for (int row = 0; row < 7; ++row) {
+                const int top = y + row * 3 / 2;
+                const int bottom = y + (row + 1) * 3 / 2;
+                for (int column = 0; column < 5; ++column) {
+                    if ((bitmap[row] & (0x10U >> column)) == 0) continue;
+                    const int left = x + column * 3 / 2;
+                    const int right = x + (column + 1) * 3 / 2;
+                    for (int py = top; py < bottom; ++py)
+                        for (int px = left; px < right; ++px) clearPixel(frame, px, py);
                 }
             }
         }
@@ -189,13 +215,15 @@ void render(uint8_t *frame) {
         const int column = index % 7;
         const int x = left + column * cellWidth;
         const int y = top + row * cellHeight;
-        if (viewedYear == currentYear && viewedMonth == currentMonth && day == currentDay) {
-            rect(frame, x + 3, y + 3, cellWidth - 6, cellHeight - 6);
-        }
+        const bool today = viewedYear == currentYear && viewedMonth == currentMonth &&
+                           day == currentDay;
+        if (today) fillRect(frame, x + 2, y + 2, cellWidth - 3, cellHeight - 3);
         char number[3] = {};
         snprintf(number, sizeof(number), "%d", day);
-        dateText(frame, x + (cellWidth - dateTextWidth(number)) / 2,
-                 y + (cellHeight - 10) / 2, number);
+        const int numberX = x + (cellWidth - dateTextWidth(number)) / 2;
+        const int numberY = y + (cellHeight - 10) / 2;
+        if (today) invertedDateText(frame, numberX, numberY, number);
+        else dateText(frame, numberX, numberY, number);
     }
 }
 

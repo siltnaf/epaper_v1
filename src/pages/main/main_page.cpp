@@ -12,7 +12,7 @@
 #include "pages/clock/clock_bitmap.h"
 #include "pages/music/music_bitmap.h"
 #include "pages/poem/poem_bitmap.h"
-#include "pages/learn/learn_bitmap.h"
+#include "pages/word/word_bitmap.h"
 #include "pages/topbar/topbar_assets.h"
 #include "pages/topbar/topbar_bitmap.h"
 
@@ -129,7 +129,7 @@ void render(uint8_t *frame, FunctionIcon selectedIcon) {
     icon(frame, x3, y2, VoiceBitmap::DATA, selectedIcon == FunctionIcon::Voice);
     icon(frame, x1, y3, MusicBitmap::DATA, selectedIcon == FunctionIcon::Music);
     icon(frame, x2, y3, PoemBitmap::DATA, selectedIcon == FunctionIcon::Poem);
-    icon(frame, x3, y3, LearnBitmap::DATA, selectedIcon == FunctionIcon::Learn);
+    icon(frame, x3, y3, WordBitmap::DATA, selectedIcon == FunctionIcon::Word);
     icon(frame, x1, y3 + iconSize + rowGap, RecordingBitmap::DATA,
          selectedIcon == FunctionIcon::Recording);
 }

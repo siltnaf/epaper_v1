@@ -4,7 +4,7 @@
 
 namespace OfflineContentPage {
 
-enum class Kind : uint8_t { Voice, Music, Poem, Learn };
+enum class Kind : uint8_t { Voice, Music, Poem };
 
 void open(Kind kind);
 bool handleTap(Kind kind, int16_t x, int16_t y);

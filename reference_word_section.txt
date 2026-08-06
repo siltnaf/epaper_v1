@@ -1,0 +1,531 @@
+﻿            // device.  Index the source bit continuously to match the API.
+            const int32_t bitIndex = sy * IMAGE_LEARN_BITMAP_W + sx;
+            uint8_t packed = bitmap[bitIndex / 8];
+            bool white = packed & (0x80 >> (bitIndex & 7));
+            if (!white) {
+                portraitPixel(x + dx, y + dy, 0x00);
+            }
+        }
+    }
+}
+
+static bool fetchImageLearnLibrary()
+{
+    if (serviceHomeAbortTouch()) return false;
+    if (WiFi.status() != WL_CONNECTED) {
+        if (loadSavedImageLearnFromSd()) {
+            return true;
+        }
+        snprintf(image_learn_status, sizeof(image_learn_status), "娌＄綉缁?);
+        return false;
+    }
+    warmupContentServer();
+    if (homeAbortRequested) return false;
+    int fetched_count = 0;
+    char url[320];
+    buildImageLearnApiUrl(url, sizeof(url));
+    if (url[0] == '\0') {
+        snprintf(image_learn_status, sizeof(image_learn_status), "Set Content URL first");
+        return false;
+    }
+    String payload;
+    bool loaded = false;
+    for (int attempt = 1; attempt <= 3 && !loaded; ++attempt) {
+        snprintf(image_learn_status, sizeof(image_learn_status), "Learn try %d/3...", attempt);
+        Serial.printf("Fetching image learn library (try %d/3): %s\n", attempt, url);
+        loaded = httpGetString(url, payload, image_learn_status, sizeof(image_learn_status), 8000);
+        if (homeAbortRequested) return false;
+        if (!loaded && attempt < 3) { WiFiClient().stop(); if (abortableDelay(1200)) return false; }
+    }
+    if (!loaded) return false;
+    JsonDocument doc;
+    DeserializationError err = deserializeJson(doc, payload);
+    if (err) {
+        snprintf(image_learn_status, sizeof(image_learn_status), "JSON parse failed");
+        Serial.printf("Image learn JSON parse failed: %s\n", err.c_str());
+        return false;
+    }
+    JsonArray items = doc["items"].as<JsonArray>();
+    image_learn_total = doc["total"] | 0;
+    if (items.isNull()) {
+        snprintf(image_learn_status, sizeof(image_learn_status), "No items in JSON");
+        return false;
+    }
+
+    image_learn_count = 0;
+    for (JsonObject item : items) {
+        if (fetched_count >= MAX_IMAGE_LEARN_ITEMS) break;
+        ImageLearnItem &learn = image_learn_items[fetched_count];
+        learn.id = item["id"] | 0;
+        copyJsonString(learn.word, sizeof(learn.word), item, "word", "Untitled");
+        copyJsonString(learn.pinyin, sizeof(learn.pinyin), item, "pinyin", "");
+        copyJsonString(learn.emoji, sizeof(learn.emoji), item, "emoji", "");
+        copyJsonString(learn.category, sizeof(learn.category), item, "category", "");
+        copyJsonString(learn.image_url, sizeof(learn.image_url), item, "image_url", "");
+        copyJsonString(learn.bitmap_url, sizeof(learn.bitmap_url), item, "bitmap_url", "");
+        learn.bitmap_loaded = false;
+        learn.saved = isImageLearnCharacterSavedOnSd(learn);
+        memset(image_learn_bitmaps[fetched_count], 0xFF, IMAGE_LEARN_BITMAP_BYTES);
+        ++fetched_count;
+    }
+    if (fetched_count <= 0) {
+        snprintf(image_learn_status, sizeof(image_learn_status), "No learn items found");
+        return false;
+    }
+    image_learn_count = fetched_count;
+
+    for (int i = 0; i < image_learn_count; ++i) {
+        if (serviceHomeAbortTouch()) return false;
+        char bitmapUrl[320];
+        char bitmapStatus[64];
+        if (loadImageLearnCharacterFromSd(image_learn_items[i], image_learn_bitmaps[i])) {
+            image_learn_items[i].saved = true;
+            continue;
+        }
+        buildImageLearnBitmapRequestUrl(image_learn_items[i], bitmapUrl, sizeof(bitmapUrl));
+        if (bitmapUrl[0] != '\0' && httpGetBytes(bitmapUrl,
+                                                 image_learn_bitmaps[i],
+                                                 IMAGE_LEARN_BITMAP_BYTES,
+                                                 bitmapStatus,
+                                                 sizeof(bitmapStatus),
+                                                 12000)) {
+            // Keep downloaded page cards in RAM only. Save to SD only when the
+            // user taps/opens a specific word card.
+            image_learn_items[i].bitmap_loaded = true;
+        } else {
+            Serial.printf("Image learn bitmap failed id=%ld status=%s url=%s\n",
+                          (long)image_learn_items[i].id,
+                          bitmapStatus,
+                          bitmapUrl);
+        }
+    }
+    snprintf(image_learn_status, sizeof(image_learn_status), "Loaded %d items", image_learn_count);
+    return true;
+}
+
+static void drawImageLearnLibraryLoadingScreen()
+{
+    memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+    drawTopStatusBar();
+    drawWindowsStartupProgressPanel(360, currentProgressPercent());
+}
+
+static void drawImageLearnRowsArea()
+{
+    portraitFillRect(0,
+                     LIST_PAGER_Y,
+                     PORTRAIT_WIDTH,
+                     PORTRAIT_HEIGHT - LIST_PAGER_Y - BOOK_LIST_REFRESH_BOTTOM_MARGIN,
+                     0xFF);
+
+    drawListPager(image_learn_current_page, image_learn_total, MAX_IMAGE_LEARN_ITEMS);
+
+    if (image_learn_count <= 0) {
+        if (isProgressStatus(image_learn_status)) {
+            drawWindowsStartupProgressPanel(300, currentProgressPercent());
+            return;
+        }
+        drawPortraitTextInRectCenteredScaled(image_learn_status, 34, 250, PORTRAIT_WIDTH - 68, 80, (GFXfont *)&FiraSans, 0.72f);
+        return;
+    }
+
+    for (int i = 0; i < image_learn_count; ++i) {
+        const int32_t col = i % 2;
+        const int32_t row = i / 2;
+        const int32_t x = IMAGE_LEARN_CARD_X + col * (IMAGE_LEARN_CARD_W + IMAGE_LEARN_CARD_GAP_X);
+        const int32_t y = IMAGE_LEARN_CARD_Y + row * (IMAGE_LEARN_CARD_H + IMAGE_LEARN_CARD_GAP_Y);
+        if (y + IMAGE_LEARN_CARD_H > PORTRAIT_HEIGHT - 10) break;
+
+        portraitFillRect(x, y, IMAGE_LEARN_CARD_W, IMAGE_LEARN_CARD_H, 0xFF);
+        portraitDrawRect(x, y, IMAGE_LEARN_CARD_W, IMAGE_LEARN_CARD_H, 0x00);
+
+        ImageLearnItem &item = image_learn_items[i];
+        if (item.saved) {
+            // Cards become saved after the user opens/taps them. Keep never-
+            // tapped cards at the thinnest possible single outline, and only
+            // add extra inner outlines for already-tapped/saved cards.
+            portraitDrawRect(x + 2, y + 2, IMAGE_LEARN_CARD_W - 4, IMAGE_LEARN_CARD_H - 4, 0x00);
+            portraitDrawRect(x + 4, y + 4, IMAGE_LEARN_CARD_W - 8, IMAGE_LEARN_CARD_H - 8, 0x00);
+        }
+        char topLine[72];
+        snprintf(topLine, sizeof(topLine), "%s %s", item.word, item.emoji);
+        drawUtf8ChineseTextInRectSingleWidth(topLine, x + 10, y + 14, IMAGE_LEARN_CARD_W - 20, 42);
+
+        const int32_t imageX = x + (IMAGE_LEARN_CARD_W - IMAGE_LEARN_IMAGE_W) / 2;
+        const int32_t imageY = y + 62;
+        portraitFillRect(imageX, imageY, IMAGE_LEARN_IMAGE_W, IMAGE_LEARN_IMAGE_H, 0xFF);
+        if (item.bitmap_loaded) {
+            drawImageLearnBitmap1bpp(imageX, imageY, IMAGE_LEARN_IMAGE_W, IMAGE_LEARN_IMAGE_H, image_learn_bitmaps[i]);
+        } else {
+            portraitDrawRect(imageX, imageY, IMAGE_LEARN_IMAGE_W, IMAGE_LEARN_IMAGE_H, 0x08);
+            drawPortraitTextInRectCenteredScaled("image", imageX, imageY + 22, IMAGE_LEARN_IMAGE_W, 38, (GFXfont *)&FiraSans, 0.46f);
+        }
+
+        drawUtf8ChineseTextInRectSingleWidth(item.word, x + 10, y + 158, IMAGE_LEARN_CARD_W - 20, 42);
+        drawPortraitTextInRectCenteredScaled(item.pinyin,
+                                             x + 10,
+                                             y + 198,
+                                             IMAGE_LEARN_CARD_W - 20,
+                                             28,
+                                             (GFXfont *)&FiraSans,
+                                             0.42f);
+    }
+}
+
+static void drawImageLearnLibraryScreen()
+{
+    memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+    drawTopStatusBar();
+    drawUtf8ChineseTextInRectSingleWidth("鐪嬪浘瀛︿腑鏂?, 0, 64, PORTRAIT_WIDTH, 40);
+    drawImageLearnRowsArea();
+}
+
+static void drawImageLearnDetailScreen()
+{
+    memset(framebuffer, 0xFF, EPD_WIDTH * EPD_HEIGHT / 2);
+    drawTopStatusBar();
+
+    if (selected_image_learn_index < 0 || selected_image_learn_index >= image_learn_count) {
+        drawUtf8ChineseTextInRectSingleWidth("鐪嬪浘瀛︿腑鏂?, 0, 64, PORTRAIT_WIDTH, 40);
+        drawPortraitTextInRectCenteredScaled("No selected card", 34, 300, PORTRAIT_WIDTH - 68, 70, (GFXfont *)&FiraSans, 0.72f);
+        return;
+    }
+
+    ImageLearnItem &item = image_learn_items[selected_image_learn_index];
+    drawUtf8ChineseTextInRectSingleWidth(item.word, 0, 64, PORTRAIT_WIDTH, 48);
+    drawPortraitTextInRectCenteredScaled(item.pinyin, 34, 108, PORTRAIT_WIDTH - 68, 34, (GFXfont *)&FiraSans, 0.52f);
+
+    // Back control in addition to the global top-left Home icon. Reuse the
+    // same return bitmap used by the poem player header for visual consistency.
+    drawPoemReturnIcon(PORTRAIT_WIDTH - 104, 70, RETURN_ICON_W, 0x00);
+
+    const int32_t imageX = (PORTRAIT_WIDTH - 280) / 2;
+    const int32_t imageY = 150;
+    const int32_t imageW = 280;
+    const int32_t imageH = 188;
+    portraitDrawRect(imageX - 6, imageY - 6, imageW + 12, imageH + 12, 0x00);
+    portraitFillRect(imageX, imageY, imageW, imageH, 0xFF);
+    if (item.bitmap_loaded) {
+        drawImageLearnBitmap1bpp(imageX, imageY, imageW, imageH, image_learn_bitmaps[selected_image_learn_index]);
+    } else {
+        portraitDrawRect(imageX, imageY, imageW, imageH, 0x08);
+        drawPortraitTextInRectCenteredScaled("image", imageX, imageY + 62, imageW, 52, (GFXfont *)&FiraSans, 0.56f);
+    }
+
+    drawUtf8ChineseTextInRectSingleWidth("鎸夌瑪鐢荤粌瀛?, 0, 360, PORTRAIT_WIDTH, 46);
+    drawChineseGlyphLargeProgress(item.word,
+                                  IMAGE_LEARN_DETAIL_GLYPH_X,
+                                  IMAGE_LEARN_DETAIL_GLYPH_Y,
+                                  IMAGE_LEARN_DETAIL_GLYPH_W,
+                                  IMAGE_LEARN_DETAIL_GLYPH_H,
+                                  image_learn_detail_progress);
+
+    drawBitmapIcon1bpp((PORTRAIT_WIDTH - REPLAY_ICON_W) / 2, 746, REPLAY_ICON_W, REPLAY_ICON_H, replay_icon, 0x00);
+}
+
+static void animateImageLearnDetailStroke()
+{
+    if (!showingImageLearnDetail || selected_image_learn_index < 0 || selected_image_learn_index >= image_learn_count) {
+        return;
+    }
+
+    const char *word = image_learn_items[selected_image_learn_index].word;
+    const char *p = word;
+    uint32_t cp = 0;
+    uint8_t strokeCount = 0;
+    if (word && utf8NextCodepoint(&p, &cp)) {
+        if (image_learn_stroke_cache.loaded && image_learn_stroke_cache.cp == cp && image_learn_stroke_cache.strokeCount > 0) {
+            strokeCount = image_learn_stroke_cache.strokeCount;
+        } else {
+            uint8_t knownStrokeCount = 0;
+            if (findLearnStrokeOrder(cp, &knownStrokeCount) && knownStrokeCount > 0) {
+                strokeCount = knownStrokeCount;
+            }
+        }
+    }
+    if (strokeCount == 0) {
+        // Unsupported-character bitmap fallback uses 8 virtual regions. Keep
+        // the same count here so each virtual region still finishes before the
+        // next one starts, instead of jumping through multiple regions at once.
+        strokeCount = 8;
+    }
+
+    static const int32_t STROKE_SUB_STEPS = 2;
+    static const uint32_t STROKE_FRAME_DELAY_MS = 15;
+    static const uint32_t STROKE_COMPLETE_PAUSE_MS = 10;
+
+    Rect_t glyphArea = portraitRectToPhysicalRect(IMAGE_LEARN_DETAIL_GLYPH_X - 4,
+                                                  IMAGE_LEARN_DETAIL_GLYPH_Y - 4,
+                                                  IMAGE_LEARN_DETAIL_GLYPH_W + 8,
+                                                  IMAGE_LEARN_DETAIL_GLYPH_H + 8);
+
+    epd_poweron();
+    epd_push_pixels(glyphArea, 55, 1);
+    epd_push_pixels(glyphArea, 55, 1);
+    epd_push_pixels(glyphArea, 55, 1);
+    epd_push_pixels(glyphArea, 55, 1);
+    epd_poweroff();
+
+    for (uint8_t stroke = 0; stroke < strokeCount; ++stroke) {
+        for (int32_t subStep = 0; subStep <= STROKE_SUB_STEPS; ++subStep) {
+            if (serviceHomeAbortTouch() || !showingImageLearnDetail) {
+                return;
+            }
+
+            // Convert explicit stroke/sub-step progress back into the existing
+            // 0..100 draw API.  This prevents a single frame from advancing
+            // across multiple stroke boundaries, so one stroke visibly reaches
+            // 100% before the next stroke begins.
+            image_learn_detail_progress = ((int32_t)stroke * 100 + (subStep * 100) / STROKE_SUB_STEPS) / strokeCount;
+            if (stroke == strokeCount - 1 && subStep == STROKE_SUB_STEPS) {
+                image_learn_detail_progress = 100;
+            }
+
+            drawChineseGlyphLargeProgress(word,
+                                          IMAGE_LEARN_DETAIL_GLYPH_X,
+                                          IMAGE_LEARN_DETAIL_GLYPH_Y,
+                                          IMAGE_LEARN_DETAIL_GLYPH_W,
+                                          IMAGE_LEARN_DETAIL_GLYPH_H,
+                                          image_learn_detail_progress);
+            uint8_t *glyphBuffer = copyPhysicalAreaFromFramebuffer(glyphArea);
+            if (!glyphBuffer) {
+                return;
+            }
+            epd_poweron();
+            epd_draw_grayscale_image(glyphArea, glyphBuffer);
+            epd_poweroff();
+            free(glyphBuffer);
+
+            if (abortableDelay(STROKE_FRAME_DELAY_MS)) {
+                return;
+            }
+        }
+
+        if (abortableDelay(STROKE_COMPLETE_PAUSE_MS)) {
+            return;
+        }
+    }
+
+    if (!serviceHomeAbortTouch() && showingImageLearnDetail && selected_image_learn_index >= 0 && selected_image_learn_index < image_learn_count) {
+        playImageLearnWordPronunciation(image_learn_items[selected_image_learn_index]);
+    }
+}
+
+static bool handleImageLearnDetailTouch(int16_t tx, int16_t ty)
+{
+    int32_t px = 0, py = 0;
+    if (!portraitPointFromTouch(tx, ty, &px, &py, true)) {
+        if (!portraitPointFromTouch(tx, ty, &px, &py, false)) return false;
+    }
+
+    if (pointInRect(px, py, PORTRAIT_WIDTH - 112, 62, 96, 72)) {
+        showingImageLearnDetail = false;
+        showingImageLearnLibrary = true;
+        selected_image_learn_index = -1;
+        image_learn_detail_progress = 100;
+        refreshDisplayExtended(drawImageLearnLibraryScreen, true, 80);
+        return true;
+    }
+
+    if (pointInRect(px, py,
+                    IMAGE_LEARN_DETAIL_GLYPH_X,
+                    IMAGE_LEARN_DETAIL_GLYPH_Y,
+                    IMAGE_LEARN_DETAIL_GLYPH_W,
+                    IMAGE_LEARN_DETAIL_GLYPH_H) ||
+        pointInRect(px, py,
+                    (PORTRAIT_WIDTH - REPLAY_ICON_W) / 2 - 18,
+                    728,
+                    REPLAY_ICON_W + 36,
+                    REPLAY_ICON_H + 36)) {
+        image_learn_detail_progress = 0;
+        ImageLearnItem &selectedItem = image_learn_items[selected_image_learn_index];
+        if (selectedItem.bitmap_loaded && saveImageLearnCharacterToSd(selectedItem, image_learn_bitmaps[selected_image_learn_index])) {
+            selectedItem.saved = true;
+        }
+        if (!loadLearnStrokeDataFromSdForItem(selectedItem) && fetchLearnStrokeDataForWord(selectedItem.word)) {
+            saveLearnStrokeDataToSdForItem(selectedItem);
+        }
+        animateImageLearnDetailStroke();
+        return true;
+    }
+
+    return false;
+}
+
+static bool openImageLearnDetailIndex(int index)
+{
+    if (index < 0 || index >= image_learn_count) {
+        return false;
+    }
+
+    selected_image_learn_index = index;
+    image_learn_detail_progress = 0;
+    ImageLearnItem &selectedItem = image_learn_items[selected_image_learn_index];
+    if (!selectedItem.bitmap_loaded) {
+        loadImageLearnCharacterFromSd(selectedItem, image_learn_bitmaps[selected_image_learn_index]);
+    }
+    if (!loadLearnStrokeDataFromSdForItem(selectedItem) && fetchLearnStrokeDataForWord(selectedItem.word)) {
+        saveLearnStrokeDataToSdForItem(selectedItem);
+    }
+    if (selectedItem.bitmap_loaded && saveImageLearnCharacterToSd(selectedItem, image_learn_bitmaps[selected_image_learn_index])) {
+        selectedItem.saved = true;
+    }
+    showingImageLearnLibrary = false;
+    showingImageLearnDetail = true;
+    refreshDisplayExtended(drawImageLearnDetailScreen, true, 80);
+    animateImageLearnDetailStroke();
+    touch_loop_interval = millis() + 300;
+    return true;
+}
+
+static bool handleImageLearnDetailSwipe(int16_t startX, int16_t startY, int16_t endX, int16_t endY)
+{
+    int32_t dx = 0;
+    int32_t dy = 0;
+    if (!getPortraitSwipeDelta(startX, startY, endX, endY, &dx, &dy)) {
+        return false;
+    }
+
+    const int32_t SWIPE_THRESHOLD = 70;
+    if (abs(dx) < SWIPE_THRESHOLD && abs(dy) < SWIPE_THRESHOLD) {
+        return false;
+    }
+
+    const bool nextCard = (abs(dx) >= abs(dy)) ? (dx < 0) : (dy < 0);
+    if (nextCard) {
+        if (selected_image_learn_index + 1 < image_learn_count) {
+            return openImageLearnDetailIndex(selected_image_learn_index + 1);
+        }
+        if (image_learn_current_page * MAX_IMAGE_LEARN_ITEMS < image_learn_total) {
+            int32_t previousPage = image_learn_current_page;
+            image_learn_current_page++;
+            if (!fetchImageLearnLibrary()) {
+                image_learn_current_page = previousPage;
+                return true;
+            }
+            return openImageLearnDetailIndex(0);
+        }
+        return true;
+    }
+
+    if (selected_image_learn_index > 0) {
+        return openImageLearnDetailIndex(selected_image_learn_index - 1);
+    }
+    if (image_learn_current_page > 1) {
+        int32_t previousPage = image_learn_current_page;
+        image_learn_current_page--;
+        if (!fetchImageLearnLibrary()) {
+            image_learn_current_page = previousPage;
+            return true;
+        }
+        return openImageLearnDetailIndex(image_learn_count - 1);
+    }
+
+    showingImageLearnDetail = false;
+    showingImageLearnLibrary = true;
+    selected_image_learn_index = -1;
+    image_learn_detail_progress = 100;
+    refreshDisplayExtended(drawImageLearnLibraryScreen, true, 90);
+    return true;
+}
+
+static void refreshImageLearnLibraryListArea()
+{
+    drawImageLearnRowsArea();
+
+    Rect_t pagerArea = portraitRectToPhysicalRect(LIST_PAGER_X, LIST_PAGER_Y, LIST_PAGER_W, LIST_PAGER_H);
+    uint8_t *pagerBuffer = copyPhysicalAreaFromFramebuffer(pagerArea);
+
+    const int32_t listRefreshH = PORTRAIT_HEIGHT - LIST_PAGER_Y - BOOK_LIST_REFRESH_BOTTOM_MARGIN;
+    Rect_t listArea = portraitRectToPhysicalRect(0, LIST_PAGER_Y, PORTRAIT_WIDTH, listRefreshH);
+    uint8_t *listBuffer = copyPhysicalAreaFromFramebuffer(listArea);
+    if (!pagerBuffer || !listBuffer) {
+        if (pagerBuffer) free(pagerBuffer);
+        if (listBuffer) free(listBuffer);
+        return;
+    }
+
+    epd_poweron();
+    epd_push_pixels(pagerArea, 55, 1);
+    epd_push_pixels(pagerArea, 55, 1);
+    epd_push_pixels(pagerArea, 55, 1);
+    epd_push_pixels(listArea, 55, 1);
+    epd_push_pixels(listArea, 55, 1);
+    epd_push_pixels(listArea, 55, 1);
+    epd_draw_grayscale_image(pagerArea, pagerBuffer);
+    epdDrawFastWithGhostControl(listArea, listBuffer, EPD_BALANCED_PARTIAL_FRAMES, true);
+    epd_poweroff();
+
+    free(pagerBuffer);
+    free(listBuffer);
+}
+
+static bool handleImageLearnLibraryTouch(int16_t tx, int16_t ty)
+{
+    auto openImageLearnCard = [&](int index) -> bool {
+        return openImageLearnDetailIndex(index);
+    };
+
+    auto cardIndexAt = [&](int32_t px, int32_t py) -> int {
+        const int32_t hitSlop = 10;
+        for (int i = 0; i < image_learn_count; ++i) {
+            const int32_t col = i % 2;
+            const int32_t row = i / 2;
+            const int32_t cardX = IMAGE_LEARN_CARD_X + col * (IMAGE_LEARN_CARD_W + IMAGE_LEARN_CARD_GAP_X);
+            const int32_t cardY = IMAGE_LEARN_CARD_Y + row * (IMAGE_LEARN_CARD_H + IMAGE_LEARN_CARD_GAP_Y);
+            if (pointInRect(px,
+                            py,
+                            cardX - hitSlop,
+                            cardY - hitSlop,
+                            IMAGE_LEARN_CARD_W + hitSlop * 2,
+                            IMAGE_LEARN_CARD_H + hitSlop * 2)) {
+                return i;
+            }
+        }
+        return -1;
+    };
+
+    // Pager buttons first - to prevent the cards slop area from blocking pager hits 
+    // when hitting exactly on the << < > >> buttons.
+    // Pass false to band-only slop consumption inside handleListPagerTouch using a temporary flag
+    // wait, we can't easily pass a flag, but we can do a quick check right here:
+    int32_t px = 0, py = 0;
+    
+    // Quick test if we definitely hit the pager
+    bool definitelyPager = false;
+    if (portraitPointFromTouch(tx, ty, &px, &py, true) && py >= LIST_PAGER_Y - 12 && py <= LIST_PAGER_Y + LIST_PAGER_H + 12) {
+        definitelyPager = true;
+    }
+    if (!definitelyPager && portraitPointFromTouch(tx, ty, &px, &py, false) && py >= LIST_PAGER_Y - 12 && py <= LIST_PAGER_Y + LIST_PAGER_H + 12) {
+        definitelyPager = true;
+    }
+
+    if (definitelyPager) {
+        if (handleListPagerTouch(tx, ty, tx, ty)) {
+            touch_loop_interval = millis() + 300;
+            return true;
+        }
+    }
+
+    // Then check cards
+    if (portraitPointFromTouch(tx, ty, &px, &py, true)) {
+        int index = cardIndexAt(px, py);
+        if (index >= 0) {
+            Serial.printf("[ImageLearnTouch] raw=(%d,%d) transform=alt:539-y,x portrait=(%ld,%ld) card=%d\n", tx, ty, (long)px, (long)py, index);
+            return openImageLearnCard(index);
+        }
+    }
+    if (portraitPointFromTouch(tx, ty, &px, &py, false)) {
+        int index = cardIndexAt(px, py);
+        if (index >= 0) {
+            Serial.printf("[ImageLearnTouch] raw=(%d,%d) transform=raw:x,y portrait=(%ld,%ld) card=%d\n", tx, ty, (long)px, (long)py, index);
+            return openImageLearnCard(index);
+        }
+    }
+
+    struct TouchCandidate {
+        int32_t px;
+        int32_t py;
+        const char *name;
+    } candidates[] = {
+        {PORTRAIT_WIDTH - 1 - ty, PORTRAIT_HEIGHT - 1 - tx, "alt-mirrorX:539-y,959-x"},
