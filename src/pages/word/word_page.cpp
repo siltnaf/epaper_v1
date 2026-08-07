@@ -96,6 +96,19 @@ bool animationActive = false;
 bool pronunciationPending = false;
 bool wordAudioActive = false;
 bool replayRefreshRequested = false;
+volatile bool libraryLoadRunning = false;
+volatile bool libraryLoadCompleted = false;
+volatile bool libraryAwaitingContent = false;
+
+struct OptionalLoadingScope {
+    explicit OptionalLoadingScope(bool enabled) : enabled(enabled) {
+        if (enabled) UiLoadingIndicator::show();
+    }
+    ~OptionalLoadingScope() {
+        if (enabled) UiLoadingIndicator::hide();
+    }
+    bool enabled;
+};
 
 bool parseStrokeData(const String &payload);
 
@@ -267,8 +280,8 @@ String absoluteUrl(const char *value) {
     return hostBase() + (url.startsWith("/") ? url : "/" + url);
 }
 
-bool httpGetText(const String &url, String &payload) {
-    UiLoadingIndicator::Scope loading;
+bool httpGetText(const String &url, String &payload, bool showLoading = true) {
+    OptionalLoadingScope loading(showLoading);
     if (WiFi.status() != WL_CONNECTED) return false;
     HTTPClient http;
     http.setConnectTimeout(7000);
@@ -506,7 +519,7 @@ bool loadOfflinePage() {
     return itemCount > 0;
 }
 
-bool loadPage() {
+bool loadPage(bool showLoading = true) {
     itemCount = 0;
     selectedIndex = -1;
     totalItems = 0;
@@ -520,7 +533,7 @@ bool loadPage() {
     const String url = apiBase() + "/api/image-learn?page=" + String(currentPage) +
                        "&perPage=" + String(ITEMS_PER_PAGE);
     String payload;
-    if (!httpGetText(url, payload)) {
+    if (!httpGetText(url, payload, showLoading)) {
         return loadOfflinePage();
     }
     JsonDocument document;
@@ -553,6 +566,14 @@ bool loadPage() {
     Serial.printf("[WORD] page=%ld items=%u total=%ld\n",
                   static_cast<long>(currentPage), itemCount, static_cast<long>(totalItems));
     return itemCount > 0;
+}
+
+void libraryLoadTask(void *) {
+    loadPage(false);
+    libraryAwaitingContent = false;
+    libraryLoadRunning = false;
+    libraryLoadCompleted = true;
+    vTaskDelete(nullptr);
 }
 
 uint8_t bitmapValue(const uint8_t *bitmap, int x, int y) {
@@ -767,8 +788,14 @@ void renderPager(uint8_t *frame) {
 }
 
 void renderLibrary(uint8_t *frame) {
+    if (UiLocalization::isChinese()) {
+        drawUtf8Centered(frame, 80, 34, 80, 18, "识字");
+    } else {
+        UiLocalization::drawCentered(frame, 36, "WORDS", 2);
+    }
     renderPager(frame);
     if (itemCount == 0) {
+        if (libraryAwaitingContent) return;
         UiLocalization::drawCentered(frame, 210, statusText);
         return;
     }
@@ -883,7 +910,30 @@ void open() {
     selectedIndex = -1;
     replayRefreshRequested = false;
     std::strcpy(statusText, UiLocalization::isChinese() ? "正在加载单词" : "LOADING WORDS");
-    loadPage();
+    itemCount = 0;
+    totalItems = 0;
+    libraryAwaitingContent = true;
+    libraryLoadCompleted = false;
+}
+
+bool startLibraryLoad() {
+    if (libraryLoadRunning) return false;
+    libraryLoadRunning = true;
+    libraryLoadCompleted = false;
+    if (xTaskCreate(libraryLoadTask, "word-library", 12288, nullptr, 1, nullptr) != pdPASS) {
+        libraryLoadRunning = false;
+        libraryAwaitingContent = false;
+        std::strcpy(statusText, "WORD TASK FAILED");
+        libraryLoadCompleted = true;
+        return false;
+    }
+    return true;
+}
+
+bool takeLibraryLoadCompleted() {
+    if (!libraryLoadCompleted) return false;
+    libraryLoadCompleted = false;
+    return true;
 }
 
 bool handleTap(int16_t x, int16_t y) {

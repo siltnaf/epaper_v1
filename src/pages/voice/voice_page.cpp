@@ -76,6 +76,19 @@ uint16_t marqueeOffset = 0;
 uint32_t nextMarqueeMs = 0;
 int8_t dirtyRowA = -1;
 int8_t dirtyRowB = -1;
+volatile bool libraryLoadRunning = false;
+volatile bool libraryLoadCompleted = false;
+volatile bool libraryAwaitingContent = false;
+
+struct OptionalLoadingScope {
+    explicit OptionalLoadingScope(bool enabled) : enabled(enabled) {
+        if (enabled) UiLoadingIndicator::show();
+    }
+    ~OptionalLoadingScope() {
+        if (enabled) UiLoadingIndicator::hide();
+    }
+    bool enabled;
+};
 
 bool cachedOpusPath(int32_t storyId, char *path, size_t pathSize);
 
@@ -512,8 +525,9 @@ String endpointBase() {
     return base + "/api/voice-stories";
 }
 
-bool httpGet(const String &url, String &payload, uint32_t timeoutMs = 20000) {
-    UiLoadingIndicator::Scope loadingIndicator;
+bool httpGet(const String &url, String &payload, uint32_t timeoutMs = 20000,
+             bool showLoading = true) {
+    OptionalLoadingScope loadingIndicator(showLoading);
     Serial.printf("[STORY API] request method=GET url=%s wifi_status=%d ip=%s gateway=%s dns=%s heap=%u\n",
                   url.c_str(), static_cast<int>(WiFi.status()),
                   WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str(),
@@ -799,14 +813,14 @@ int matchingBrace(const String &json, int start) {
     return -1;
 }
 
-bool loadLibrary() {
+bool loadLibrary(bool showLoading = true) {
     storyCount = 0;
     String payload;
     bool remoteLoaded = false;
     if (std::strlen(contentBaseUrl) > 7) {
         const String url = endpointBase() + "?page=" + String(libraryPage) +
                            "&perPage=" + String(ITEMS_PER_PAGE);
-        remoteLoaded = httpGet(url, payload);
+        remoteLoaded = httpGet(url, payload, 20000, showLoading);
     }
     if (!remoteLoaded) {
         // The remote library is optional once stories have been cached. Build a
@@ -895,6 +909,14 @@ bool loadLibrary() {
     return true;
 }
 
+void libraryLoadTask(void *) {
+    loadLibrary(false);
+    libraryAwaitingContent = false;
+    libraryLoadRunning = false;
+    libraryLoadCompleted = true;
+    vTaskDelete(nullptr);
+}
+
 bool loadStory(const StoryItem &story) {
     if (loadStoryFromSd(story)) return true;
 
@@ -964,6 +986,7 @@ void renderLibrary(uint8_t *frame) {
     drawCentered(frame, 61, pager);
 
     if (storyCount == 0) {
+        if (libraryAwaitingContent) return;
         drawCentered(frame, 190, statusText);
         drawCentered(frame, 215, UiLocalization::isChinese() ? "检查网络设置" : "CHECK WIFI AND URL");
         return;
@@ -1025,7 +1048,30 @@ void openLibrary() {
     view = View::Library;
     libraryPage = 1;
     std::strcpy(statusText, UiLocalization::isChinese() ? "正在获取故事" : "LOADING STORIES");
-    loadLibrary();
+    storyCount = 0;
+    storyTotal = 0;
+    libraryAwaitingContent = true;
+    libraryLoadCompleted = false;
+}
+
+bool startLibraryLoad() {
+    if (libraryLoadRunning) return false;
+    libraryLoadRunning = true;
+    libraryLoadCompleted = false;
+    if (xTaskCreate(libraryLoadTask, "voice-library", 8192, nullptr, 1, nullptr) != pdPASS) {
+        libraryLoadRunning = false;
+        libraryAwaitingContent = false;
+        std::strcpy(statusText, "VOICE TASK FAILED");
+        libraryLoadCompleted = true;
+        return false;
+    }
+    return true;
+}
+
+bool takeLibraryLoadCompleted() {
+    if (!libraryLoadCompleted) return false;
+    libraryLoadCompleted = false;
+    return true;
 }
 
 void processPendingSave() {

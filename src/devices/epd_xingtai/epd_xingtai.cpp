@@ -204,6 +204,72 @@ void XingtaiEpd::displayPartial(const uint8_t *oldFrame, const uint8_t *newFrame
     waitBusy();
 }
 
+void XingtaiEpd::displayPartialFollowUp(const uint8_t *oldFrame, const uint8_t *newFrame,
+                                       uint16_t x, uint16_t y,
+                                       uint16_t width, uint16_t height) {
+    if (oldFrame == nullptr || newFrame == nullptr || width == 0 || height == 0 ||
+        x >= WIDTH || y >= HEIGHT) {
+        return;
+    }
+
+    const uint16_t logicalXStart = x & ~0x07U;
+    const uint16_t logicalXEnd = min<uint16_t>(WIDTH - 1, (x + width - 1) | 0x07U);
+    const uint16_t logicalYEnd = min<uint16_t>(HEIGHT - 1, y + height - 1);
+    const uint16_t controllerXStart = logicalXStart;
+    const uint16_t controllerXEnd = logicalXEnd;
+    const uint16_t controllerYStart = HEIGHT - 1 - logicalYEnd;
+    const uint16_t controllerYEnd = HEIGHT - 1 - y;
+    const size_t rowBytes = WIDTH / 8;
+    const size_t windowBytes = (logicalXEnd - logicalXStart + 1) / 8;
+
+    // This path is valid only immediately after displayPartial(), before
+    // sleep/reset. Reuse the configured controller and retained image RAM so
+    // a two-stage white-pre-drive transition avoids another 600 ms reset and
+    // two full-screen seed transfers.
+    command(0x91);
+    waitBusy();
+    command(0x90);
+    waitBusy();
+    data(static_cast<uint8_t>(controllerXStart));
+    data(static_cast<uint8_t>(controllerXEnd));
+    data(static_cast<uint8_t>(controllerYStart >> 8));
+    data(static_cast<uint8_t>(controllerYStart));
+    data(static_cast<uint8_t>(controllerYEnd >> 8));
+    data(static_cast<uint8_t>(controllerYEnd));
+    data(0x01);
+
+    command(0x10);
+    waitBusy();
+    for (int logicalY = logicalYEnd; logicalY >= static_cast<int>(y); --logicalY) {
+        const uint8_t *row = oldFrame + static_cast<size_t>(logicalY) * rowBytes +
+                             logicalXStart / 8;
+        data(row, windowBytes);
+    }
+
+    command(0x13);
+    waitBusy();
+    for (int logicalY = logicalYEnd; logicalY >= static_cast<int>(y); --logicalY) {
+        const uint8_t *row = newFrame + static_cast<size_t>(logicalY) * rowBytes +
+                             logicalXStart / 8;
+        data(row, windowBytes);
+    }
+
+    command(0xE0);
+    data(0x02);
+    command(0xE5);
+    data(0x65);
+    command(0x92);
+    waitBusy();
+    command(0x04);
+    waitBusy();
+    delay(20);
+    command(0x12);
+    delay(20);
+    waitBusy();
+    command(0x02);
+    waitBusy();
+}
+
 void XingtaiEpd::drawTestPattern() {
     static uint8_t frame[FRAME_BYTES];
     // The Xingtai reference treats 0x00 as white and 0xFF as black.

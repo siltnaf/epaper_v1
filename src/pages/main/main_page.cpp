@@ -34,22 +34,25 @@ void vline(uint8_t *frame, int x, int y, int height) {
 }
 
 void roundedFrame(uint8_t *frame, int x, int y, int width, int height) {
-    // A compact 4-pixel corner radius keeps the frame crisp on the monochrome
-    // panel while matching the rounded app-tile treatment in the reference.
-    constexpr int radius = 4;
+    // A six-pixel radius gives the monochrome waveform enough connected pixels
+    // around each bend. The previous sparse four-pixel corner could appear
+    // broken after partial refreshes.
+    constexpr int radius = 6;
     hline(frame, x + radius, y, width - radius * 2);
     hline(frame, x + radius, y + height - 1, width - radius * 2);
     vline(frame, x, y + radius, height - radius * 2);
     vline(frame, x + width - 1, y + radius, height - radius * 2);
 
-    pixel(frame, x + 2, y + 1);
-    pixel(frame, x + 1, y + 2);
-    pixel(frame, x + width - 3, y + 1);
-    pixel(frame, x + width - 2, y + 2);
-    pixel(frame, x + 1, y + height - 3);
-    pixel(frame, x + 2, y + height - 2);
-    pixel(frame, x + width - 2, y + height - 3);
-    pixel(frame, x + width - 3, y + height - 2);
+    constexpr uint8_t cornerX[] = {4, 3, 2, 1, 1};
+    constexpr uint8_t cornerY[] = {1, 1, 2, 3, 4};
+    for (size_t index = 0; index < sizeof(cornerX); ++index) {
+        const int dx = cornerX[index];
+        const int dy = cornerY[index];
+        pixel(frame, x + dx, y + dy);
+        pixel(frame, x + width - 1 - dx, y + dy);
+        pixel(frame, x + dx, y + height - 1 - dy);
+        pixel(frame, x + width - 1 - dx, y + height - 1 - dy);
+    }
 }
 
 void roundedFrame(uint8_t *frame, int x, int y, int width, int height, bool bold) {

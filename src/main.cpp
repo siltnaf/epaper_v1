@@ -62,6 +62,7 @@ struct TouchAction {
 
 static uint8_t frame[XingtaiEpd::FRAME_BYTES];
 static uint8_t transitionFrame[XingtaiEpd::FRAME_BYTES];
+static uint8_t mainPageFrame[XingtaiEpd::FRAME_BYTES];
 static uint8_t whiteFrame[XingtaiEpd::FRAME_BYTES] = {};
 Preferences touchPreferences;
 Preferences settingsPreferences;
@@ -118,23 +119,37 @@ int16_t touchGestureStartY = 0;
 int16_t touchGestureLastX = 0;
 int16_t touchGestureLastY = 0;
 volatile bool touchInterruptPending = false;
+volatile bool touchWorkflowPriority = false;
+PageId openingLoadPage = PageId::Main;
+bool openingLoadVisible = false;
 bool suppressNextAudioTap = false;
+bool suppressMainIconReleaseTap = false;
+bool homeOutlinePressed = false;
+bool homeTouchActive = false;
 
 void recoverSharedI2c();
 void refreshCurrentPage();
 void refreshBookReaderContent();
 void refreshBookLibraryContent();
-void wipeContentAreaWhite();
+void wipeContentAreaWhite(bool sleepAfter = true);
 void refreshVoiceDirtyRows();
 void refreshMusicDirtyRows();
 void refreshPoemDirtyRows();
 void refreshPoemDisplay();
 void refreshWordStrokeWindow(bool wipeFirst);
+void queuePage(PageId page);
+void startMainIconFeedback(PageId page);
+void showHomePressedOutline();
+void restoreHomeIcon();
 void clearFrameRegion(uint8_t *buffer, int left, int top, int width, int height);
 void showTopbarLoading(bool visible);
+void processOpeningLibraryLoads();
+void startOpeningLibraryLoad(PageId page);
+void refreshOpeningLibraryContent(PageId page);
 
 void IRAM_ATTR onTouchInterruptSignal() {
     touchInterruptPending = true;
+    touchWorkflowPriority = true;
     // Stop decoding immediately from the GPIO interrupt path without touching
     // the shared I2C bus. Cleanup is completed in task context below.
     OpusPlayer::requestStopFromIsr();
@@ -694,7 +709,7 @@ void refreshCurrentPage() {
     epaper.sleep();
 }
 
-void wipeContentAreaWhite() {
+void wipeContentAreaWhite(bool sleepAfter) {
     constexpr uint16_t topBarHeight = 32;
     constexpr size_t topBarBytes = static_cast<size_t>(topBarHeight) *
                                    (XingtaiEpd::WIDTH / 8);
@@ -704,7 +719,7 @@ void wipeContentAreaWhite() {
     // the following partial update compares against the panel's actual pixels.
     std::memset(frame + topBarBytes, 0x00,
                 XingtaiEpd::FRAME_BYTES - topBarBytes);
-    epaper.sleep();
+    if (sleepAfter) epaper.sleep();
 }
 
 void refreshCurrentRegion(uint16_t x, uint16_t y, uint16_t width, uint16_t height) {
@@ -753,6 +768,65 @@ void refreshBookLibraryContent() {
                           listWidth, listHeight);
     std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
     epaper.sleep();
+}
+
+void refreshOpeningLibraryContent(PageId page) {
+    rendererFor(page)(transitionFrame);
+    constexpr uint16_t counterX = 78;
+    constexpr uint16_t counterY = 54;
+    constexpr uint16_t counterWidth = 84;
+    constexpr uint16_t counterHeight = 20;
+    epaper.displayPartial(frame, transitionFrame, counterX, counterY,
+                          counterWidth, counterHeight);
+    if (page == PageId::Word) {
+        epaper.displayPartial(frame, transitionFrame, 10, 82, 220, 324);
+    } else {
+        epaper.displayPartial(frame, transitionFrame, 12, 82, 216, 318);
+    }
+    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+    epaper.sleep();
+}
+
+void startOpeningLibraryLoad(PageId page) {
+    bool started = false;
+    switch (page) {
+    case PageId::Book: started = BookPage::startLibraryLoad(); break;
+    case PageId::Voice: started = VoicePage::startLibraryLoad(); break;
+    case PageId::Music: started = MusicPage::startLibraryLoad(); break;
+    case PageId::Poem: started = PoemPage::startLibraryLoad(); break;
+    case PageId::Word: started = WordPage::startLibraryLoad(); break;
+    default: return;
+    }
+    openingLoadPage = page;
+    openingLoadVisible = true;
+    showTopbarLoading(true);
+    if (!started) Serial.printf("[UI] %s opening worker was already active or failed to start\n",
+                                pageName(page));
+}
+
+void processOpeningLibraryLoads() {
+    struct Completion {
+        PageId page;
+        bool complete;
+    };
+    const Completion completions[] = {
+        {PageId::Book, BookPage::takeLibraryLoadCompleted()},
+        {PageId::Voice, VoicePage::takeLibraryLoadCompleted()},
+        {PageId::Music, MusicPage::takeLibraryLoadCompleted()},
+        {PageId::Poem, PoemPage::takeLibraryLoadCompleted()},
+        {PageId::Word, WordPage::takeLibraryLoadCompleted()},
+    };
+    for (const Completion &completion : completions) {
+        if (!completion.complete) continue;
+        if (openingLoadVisible && openingLoadPage == completion.page) {
+            showTopbarLoading(false);
+            openingLoadVisible = false;
+            openingLoadPage = PageId::Main;
+            if (currentPage == completion.page) {
+                refreshOpeningLibraryContent(completion.page);
+            }
+        }
+    }
 }
 
 void refreshPoemDisplay() {
@@ -868,6 +942,63 @@ void clearFrameRegion(uint8_t *buffer, int left, int top, int width, int height)
     }
 }
 
+void showHomePressedOutline() {
+    constexpr int left = 1;
+    constexpr int top = 1;
+    constexpr int width = 31;
+    constexpr int height = 29;
+    std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
+    auto setPixel = [](uint8_t *buffer, int x, int y) {
+        if (x < 0 || x >= XingtaiEpd::WIDTH || y < 0 || y >= XingtaiEpd::HEIGHT) return;
+        buffer[static_cast<size_t>(y) * (XingtaiEpd::WIDTH / 8) + x / 8] |=
+            static_cast<uint8_t>(0x80U >> (x % 8));
+    };
+    auto drawRect = [&](int inset) {
+        const int x1 = left + inset;
+        const int y1 = top + inset;
+        const int x2 = left + width - 1 - inset;
+        const int y2 = top + height - 1 - inset;
+        for (int x = x1 + 2; x <= x2 - 2; ++x) {
+            setPixel(transitionFrame, x, y1);
+            setPixel(transitionFrame, x, y2);
+        }
+        for (int y = y1 + 2; y <= y2 - 2; ++y) {
+            setPixel(transitionFrame, x1, y);
+            setPixel(transitionFrame, x2, y);
+        }
+        setPixel(transitionFrame, x1 + 1, y1 + 1);
+        setPixel(transitionFrame, x2 - 1, y1 + 1);
+        setPixel(transitionFrame, x1 + 1, y2 - 1);
+        setPixel(transitionFrame, x2 - 1, y2 - 1);
+    };
+    drawRect(0);
+    drawRect(1);
+    drawRect(2);
+    epaper.displayPartial(frame, transitionFrame, left, top, width, height);
+    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+    epaper.sleep();
+    homeOutlinePressed = true;
+}
+
+void restoreHomeIcon() {
+    if (!homeOutlinePressed) return;
+    constexpr uint16_t left = 0;
+    constexpr uint16_t top = 0;
+    constexpr uint16_t width = 34;
+    constexpr uint16_t height = 32;
+    std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
+    constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
+    for (uint16_t y = top; y < top + height; ++y) {
+        std::memcpy(transitionFrame + static_cast<size_t>(y) * rowBytes,
+                    mainPageFrame + static_cast<size_t>(y) * rowBytes,
+                    rowBytes);
+    }
+    epaper.displayPartial(frame, transitionFrame, left, top, width, height);
+    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+    epaper.sleep();
+    homeOutlinePressed = false;
+}
+
 void showTopbarLoading(bool visible) {
     constexpr int loadingLeft = 58;
     constexpr int loadingWidth = 120;
@@ -883,6 +1014,13 @@ void showTopbarLoading(bool visible) {
         epaper.displayPartial(frame, transitionFrame, loadingLeft, loadingTop,
                               loadingWidth, loadingHeight);
     } else {
+        // Reconstruct the physical loading state rather than assuming the
+        // shared transition buffer still contains it after page rendering.
+        std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
+        clearFrameRegion(transitionFrame, loadingLeft, loadingTop,
+                         loadingWidth, loadingHeight);
+        UiLocalization::drawCentered(transitionFrame, 12,
+                                     UiLocalization::isChinese() ? "下载中" : "LOADING", 1);
         epaper.displayPartial(transitionFrame, frame, loadingLeft, loadingTop,
                               loadingWidth, loadingHeight);
     }
@@ -891,6 +1029,8 @@ void showTopbarLoading(bool visible) {
 
 void refreshWifiTopbar(bool connected) {
     MainPage::setWifiConnected(connected);
+    // Keep the persistent Home framebuffer ready for instant navigation.
+    MainPage::render(mainPageFrame);
     std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
     clearFrameRegion(transitionFrame, 178, 0, 28, 32);
     if (connected) Topbar::drawWifi(transitionFrame, 181, 2);
@@ -974,6 +1114,26 @@ bool mainIconBounds(PageId page, uint16_t &x, uint16_t &y, uint16_t &width, uint
     width = frameSize;
     height = frameSize;
     return true;
+}
+
+void startMainIconFeedback(PageId page) {
+    uint16_t x = 0;
+    uint16_t y = 0;
+    uint16_t width = 0;
+    uint16_t height = 0;
+    if (page == PageId::Main || !mainIconBounds(page, x, y, width, height)) {
+        return;
+    }
+
+    MainPage::render(transitionFrame, mainIconFor(page));
+    epaper.displayPartial(frame, transitionFrame, x, y, width, height);
+    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+    epaper.sleep();
+    suppressMainIconReleaseTap = true;
+    Serial.printf("[FUNCTION ICON] Pressed: %s\n", pageName(page));
+    // Navigation is queued immediately on first contact. The destination page
+    // replaces the pressed tile, so no 500 ms restore timer is required.
+    queuePage(page);
 }
 
 bool rawToDisplay(TPoint raw, int16_t &x, int16_t &y) {
@@ -1121,6 +1281,25 @@ void handleTouch(TPoint point, TEvent event) {
     const int16_t uiY = XingtaiEpd::HEIGHT - 1 - y;
 
     if (event == TEvent::TouchStart) {
+        if (currentPage != PageId::Main && isHomeIcon(uiX, uiY)) {
+            touchGestureActive = false;
+            homeTouchActive = true;
+            suppressMainIconReleaseTap = true;
+            showHomePressedOutline();
+            // Keep the current page active for the lifetime of this physical
+            // touch. Switching pages here lets later Contact/LiftUp samples be
+            // routed against Main and can reopen the page that was just left.
+            Serial.println("[NAVIGATION] Home pressed; waiting for release");
+            return;
+        }
+        if (currentPage == PageId::Main) {
+            const PageId page = mainPageAt(uiX, uiY);
+            if (page != PageId::Main) {
+                touchGestureActive = false;
+                startMainIconFeedback(page);
+                return;
+            }
+        }
         touchGestureActive = true;
         touchGestureStartX = touchGestureLastX = uiX;
         touchGestureStartY = touchGestureLastY = uiY;
@@ -1134,6 +1313,12 @@ void handleTouch(TPoint point, TEvent event) {
         return;
     }
     if (event == TEvent::TouchEnd) {
+        if (homeOutlinePressed) restoreHomeIcon();
+        if (homeTouchActive) {
+            homeTouchActive = false;
+            Serial.println("[NAVIGATION] Home released; opening cached framebuffer");
+            queuePage(PageId::Main);
+        }
         if (touchGestureActive) {
             touchGestureLastX = uiX;
             touchGestureLastY = uiY;
@@ -1175,11 +1360,20 @@ void handleTouch(TPoint point, TEvent event) {
                 }
             }
         }
+        touchWorkflowPriority = false;
         return;
     }
     if (event != TEvent::Tap) return;
+    touchWorkflowPriority = false;
     Serial.printf("[TOUCH] TAP raw=(%u,%u) mapped=(%d,%d) ui=(%d,%d)\n",
                   point.x, point.y, x, y, uiX, uiY);
+
+    // The Home icon action was already accepted on TouchStart. Do not let the
+    // FT6336's later LiftUp/Tap event activate a control on the destination page.
+    if (suppressMainIconReleaseTap) {
+        suppressMainIconReleaseTap = false;
+        return;
+    }
 
     // A touch interrupt raised during Voice playback is dedicated to stopping
     // audio and returning Wire to FT6336. Consume that same physical tap before
@@ -1601,6 +1795,12 @@ void processTouchAction() {
     const PageId nextPage = touchAction.page;
     touchAction.pending = false;
 
+    if (openingLoadVisible && nextPage != openingLoadPage) {
+        showTopbarLoading(false);
+        openingLoadVisible = false;
+        openingLoadPage = PageId::Main;
+    }
+
     if (currentPage == PageId::Clock && nextPage != PageId::Clock) {
         clockWeatherRequested = false;
     }
@@ -1618,11 +1818,6 @@ void processTouchAction() {
     }
 
     Serial.printf("[UI] Opening %s page\n", pageName(nextPage));
-    if (nextPage == PageId::Main) {
-        // Every Home return cleans and redraws only the content area. The
-        // global topbar at y=0..31 remains physically and logically untouched.
-        wipeContentAreaWhite();
-    }
     if (nextPage == PageId::Settings) SettingsPage::showSettings();
     if (nextPage == PageId::Clock) prepareClockPage();
     if (nextPage == PageId::Book) {
@@ -1648,18 +1843,36 @@ void processTouchAction() {
         WordPage::setVoice(SettingsPage::voiceName());
         WordPage::open();
     }
-    rendererFor(nextPage)(transitionFrame);
+    const bool fastHomeTransition = nextPage == PageId::Main;
+    if (fastHomeTransition) {
+        // Always establish a known physical and software state before drawing
+        // Home. Reusing the previous page as the old image in a follow-up
+        // waveform can make the panel briefly show Main and then settle back to
+        // Calendar/Clock/Settings even though currentPage is already Main.
+        wipeContentAreaWhite(false);
+        std::memcpy(transitionFrame, mainPageFrame, XingtaiEpd::FRAME_BYTES);
+    } else {
+        rendererFor(nextPage)(transitionFrame);
+    }
 
     // Keep the current top-bar pixels untouched and refresh only the function
     // page area below the 32-pixel bar.
     constexpr uint16_t topBarHeight = 32;
     constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
     std::memcpy(transitionFrame, frame, static_cast<size_t>(topBarHeight) * rowBytes);
+    // For Home, frame now represents the physical white pre-drive. For every
+    // other page it represents the currently displayed page.
     epaper.displayPartial(frame, transitionFrame, 0, topBarHeight,
-                          XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT - topBarHeight);
+                          XingtaiEpd::WIDTH,
+                          XingtaiEpd::HEIGHT - topBarHeight);
     std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
     epaper.sleep();
     currentPage = nextPage;
+    if (nextPage == PageId::Book || nextPage == PageId::Voice ||
+        nextPage == PageId::Music || nextPage == PageId::Poem ||
+        nextPage == PageId::Word) {
+        startOpeningLibraryLoad(nextPage);
+    }
     Serial.printf("[UI] %s page ready\n", pageName(currentPage));
 }
 
@@ -1753,7 +1966,8 @@ void setup() {
     // has been observed in the normal event loop.
     lastWifiConnected = false;
     MainPage::setWifiConnected(false);
-    MainPage::render(transitionFrame);
+    MainPage::render(mainPageFrame);
+    std::memcpy(transitionFrame, mainPageFrame, XingtaiEpd::FRAME_BYTES);
     Serial.println("[BOOT] Transitioning to main page...");
     epaper.displayPartial(frame, transitionFrame, 0, 0,
                           XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT);
@@ -1781,12 +1995,21 @@ void loop() {
     SdCard::processSerialCommand();
     serviceTouchInterruptBeforeI2c();
     touch.loop();
+    processTouchAction();
+    processOpeningLibraryLoads();
+
+    // A touch interrupt promotes input handling above every nonessential
+    // foreground workflow. While a finger gesture is active, do not advance
+    // saves, playback UI, animation, marquee, network indicators, or clock refreshes.
+    if (touchWorkflowPriority || touchGestureActive) {
+        delay(1);
+        return;
+    }
     // If the controller emitted no final Tap event, still restore the stopped
     // Voice row after the interrupt-driven audio shutdown.
     if (currentPage == PageId::Voice) refreshVoiceDirtyRows();
     if (currentPage == PageId::Music) refreshMusicDirtyRows();
     if (currentPage == PageId::Poem) refreshPoemDirtyRows();
-    processTouchAction();
     BookPage::processPendingSave();
     VoicePage::processPendingSave();
     PoemPage::processPendingSave();

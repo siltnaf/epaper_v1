@@ -62,6 +62,19 @@ uint16_t readerPageTotal = 1;
 bool pendingSave = false;
 bool readerContentRefreshRequested = false;
 bool libraryContentRefreshRequested = false;
+volatile bool libraryLoadRunning = false;
+volatile bool libraryLoadCompleted = false;
+volatile bool libraryAwaitingContent = false;
+
+struct OptionalLoadingScope {
+    explicit OptionalLoadingScope(bool enabled) : enabled(enabled) {
+        if (enabled) UiLoadingIndicator::show();
+    }
+    ~OptionalLoadingScope() {
+        if (enabled) UiLoadingIndicator::hide();
+    }
+    bool enabled;
+};
 
 void pixel(uint8_t *frame, int x, int y) {
     if (x < 0 || x >= XingtaiEpd::WIDTH || y < 0 || y >= XingtaiEpd::HEIGHT) return;
@@ -440,8 +453,8 @@ String endpointBase() {
     return base + "/api/books";
 }
 
-bool httpGet(const String &url, String &payload) {
-    UiLoadingIndicator::Scope loadingIndicator;
+bool httpGet(const String &url, String &payload, bool showLoading = true) {
+    OptionalLoadingScope loadingIndicator(showLoading);
     Serial.printf("[BOOK API] request method=GET url=%s wifi_status=%d ip=%s gateway=%s dns=%s heap=%u\n",
                   url.c_str(), static_cast<int>(WiFi.status()),
                   WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str(),
@@ -546,14 +559,14 @@ int matchingBrace(const String &json, int start) {
     return -1;
 }
 
-bool loadLibrary() {
+bool loadLibrary(bool showLoading = true) {
     bookCount = 0;
     String payload;
     bool remoteLoaded = false;
     if (std::strlen(contentBaseUrl) > 7) {
         const String url = endpointBase() + "?page=" + String(libraryPage) +
                            "&perPage=" + String(ITEMS_PER_PAGE);
-        remoteLoaded = httpGet(url, payload);
+        remoteLoaded = httpGet(url, payload, showLoading);
     }
     if (!remoteLoaded) {
         // The remote library is optional once books have been cached. Build a
@@ -642,6 +655,16 @@ bool loadLibrary() {
     return true;
 }
 
+void libraryLoadTask(void *) {
+    // The main UI owns the persistent topbar LOADING state for the opening
+    // request, so the worker must not invoke the display-backed indicator.
+    loadLibrary(false);
+    libraryAwaitingContent = false;
+    libraryLoadRunning = false;
+    libraryLoadCompleted = true;
+    vTaskDelete(nullptr);
+}
+
 bool loadBook(const BookItem &book) {
     if (loadBookFromSd(book)) return true;
 
@@ -711,6 +734,7 @@ void renderLibrary(uint8_t *frame) {
     drawCentered(frame, 61, pager);
 
     if (bookCount == 0) {
+        if (libraryAwaitingContent) return;
         drawCentered(frame, 190, statusText);
         drawCentered(frame, 215, UiLocalization::isChinese() ? "网络设置" : "CHECK WIFI AND URL");
         return;
@@ -799,7 +823,30 @@ void openLibrary() {
     libraryPage = 1;
     selectedLibraryIndex = -1;
     std::strcpy(statusText, UiLocalization::isChinese() ? "正在获取内容" : "LOADING BOOKS");
-    loadLibrary();
+    bookCount = 0;
+    bookTotal = 0;
+    libraryLoadCompleted = false;
+    libraryAwaitingContent = true;
+}
+
+bool startLibraryLoad() {
+    if (libraryLoadRunning) return false;
+    libraryLoadRunning = true;
+    libraryLoadCompleted = false;
+    if (xTaskCreate(libraryLoadTask, "book-library", 8192, nullptr, 1, nullptr) != pdPASS) {
+        libraryLoadRunning = false;
+        libraryAwaitingContent = false;
+        std::strcpy(statusText, "BOOK TASK FAILED");
+        libraryLoadCompleted = true;
+        return false;
+    }
+    return true;
+}
+
+bool takeLibraryLoadCompleted() {
+    if (!libraryLoadCompleted) return false;
+    libraryLoadCompleted = false;
+    return true;
 }
 
 void processPendingSave() {

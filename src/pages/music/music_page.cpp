@@ -53,6 +53,19 @@ bool musicPlaying = false;
 bool pendingAudioStart = false;
 uint8_t marqueeBitmap[MARQUEE_ROW_BYTES * MARQUEE_HEIGHT] = {};
 bool marqueeReady = false;
+volatile bool libraryLoadRunning = false;
+volatile bool libraryLoadCompleted = false;
+volatile bool libraryAwaitingContent = false;
+
+struct OptionalLoadingScope {
+    explicit OptionalLoadingScope(bool enabled) : enabled(enabled) {
+        if (enabled) UiLoadingIndicator::show();
+    }
+    ~OptionalLoadingScope() {
+        if (enabled) UiLoadingIndicator::hide();
+    }
+    bool enabled;
+};
 uint16_t marqueeOffset = 0;
 uint32_t nextMarqueeMs = 0;
 int8_t dirtyRowA = -1;
@@ -275,8 +288,8 @@ String endpointBase() {
     return base + "/api/kid-songs";
 }
 
-bool httpGet(const String &url, String &payload) {
-    UiLoadingIndicator::Scope loadingIndicator;
+bool httpGet(const String &url, String &payload, bool showLoading = true) {
+    OptionalLoadingScope loadingIndicator(showLoading);
     Serial.printf("[MUSIC API] request method=GET url=%s wifi_status=%d ip=%s heap=%u\n",
                   url.c_str(), static_cast<int>(WiFi.status()),
                   WiFi.localIP().toString().c_str(), static_cast<unsigned>(ESP.getFreeHeap()));
@@ -519,7 +532,7 @@ bool loadSavedSongs() {
     return true;
 }
 
-bool loadLibrary() {
+bool loadLibrary(bool showLoading = true) {
     OpusPlayer::stop();
     musicPlaying = false;
     pendingAudioStart = false;
@@ -534,7 +547,7 @@ bool loadLibrary() {
     String payload;
     const String url = endpointBase() + "?page=" + String(libraryPage) +
                        "&perPage=" + String(ITEMS_PER_PAGE);
-    if (!httpGet(url, payload)) return loadSavedSongs();
+    if (!httpGet(url, payload, showLoading)) return loadSavedSongs();
 
     Serial.printf("[MUSIC] Library payload preview: %.180s\n", payload.c_str());
     JsonDocument document;
@@ -565,6 +578,14 @@ bool loadLibrary() {
     return true;
 }
 
+void libraryLoadTask(void *) {
+    loadLibrary(false);
+    libraryAwaitingContent = false;
+    libraryLoadRunning = false;
+    libraryLoadCompleted = true;
+    vTaskDelete(nullptr);
+}
+
 int libraryPageCount() {
     return songTotal > 0 ? (songTotal + ITEMS_PER_PAGE - 1) / ITEMS_PER_PAGE : 1;
 }
@@ -590,6 +611,7 @@ void renderLibrary(uint8_t *frame) {
     UiLocalization::drawCentered(frame, 61, pager);
 
     if (songCount == 0) {
+        if (libraryAwaitingContent) return;
         UiLocalization::drawCentered(frame, 190, statusText);
         UiLocalization::drawCentered(frame, 215,
             UiLocalization::isChinese() ? "检查网络设置" : "CHECK WIFI AND URL");
@@ -643,7 +665,30 @@ void open() {
     libraryPage = 1;
     selectedIndex = -1;
     std::strcpy(statusText, UiLocalization::isChinese() ? "正在获取歌曲" : "LOADING SONGS");
-    loadLibrary();
+    songCount = 0;
+    songTotal = 0;
+    libraryAwaitingContent = true;
+    libraryLoadCompleted = false;
+}
+
+bool startLibraryLoad() {
+    if (libraryLoadRunning) return false;
+    libraryLoadRunning = true;
+    libraryLoadCompleted = false;
+    if (xTaskCreate(libraryLoadTask, "music-library", 8192, nullptr, 1, nullptr) != pdPASS) {
+        libraryLoadRunning = false;
+        libraryAwaitingContent = false;
+        std::strcpy(statusText, "MUSIC TASK FAILED");
+        libraryLoadCompleted = true;
+        return false;
+    }
+    return true;
+}
+
+bool takeLibraryLoadCompleted() {
+    if (!libraryLoadCompleted) return false;
+    libraryLoadCompleted = false;
+    return true;
 }
 
 bool handleTap(int16_t x, int16_t y) {
