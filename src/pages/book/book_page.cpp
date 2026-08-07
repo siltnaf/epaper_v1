@@ -60,6 +60,9 @@ int readerPage = 0;
 uint32_t readerPageOffsets[MAX_READER_PAGES + 1] = {};
 uint16_t readerPageTotal = 1;
 bool pendingSave = false;
+int8_t pendingBookOpenIndex = -1;
+BookPage::ReaderControl readerControlPress = BookPage::ReaderControl::None;
+bool pendingReaderBack = false;
 bool readerContentRefreshRequested = false;
 bool libraryContentRefreshRequested = false;
 volatile bool libraryLoadRunning = false;
@@ -666,7 +669,17 @@ void libraryLoadTask(void *) {
 }
 
 bool loadBook(const BookItem &book) {
-    if (loadBookFromSd(book)) return true;
+    // A saved/local book must never fall through to the network. The list marks
+    // it from the same /book/<id> SD cache used by loadBookFromSd().
+    if (book.saved) {
+        if (loadBookFromSd(book)) return true;
+        std::strcpy(statusText, UiLocalization::isChinese()
+                                      ? "本地书籍读取失败"
+                                      : "LOCAL BOOK READ FAILED");
+        Serial.printf("[BOOK SD] Refusing web fallback for saved id=%ld\n",
+                      static_cast<long>(book.id));
+        return false;
+    }
 
     String payload;
     bool loaded = false;
@@ -866,6 +879,10 @@ void processPendingSave() {
     }
 }
 
+bool isReader() {
+    return view == View::Reader;
+}
+
 bool handleTap(int16_t x, int16_t y) {
     if (view == View::Library) {
         if (pointInRect(x, y, 4, PAGER_TOP, PAGER_BUTTON_WIDTH, PAGER_HEIGHT) &&
@@ -904,7 +921,8 @@ bool handleTap(int16_t x, int16_t y) {
             const int top = LIST_TOP + index * (ROW_HEIGHT + ROW_GAP);
             if (pointInRect(x, y, 12, top, 216, ROW_HEIGHT)) {
                 selectedLibraryIndex = static_cast<int8_t>(index);
-                loadBook(books[index]);
+                pendingBookOpenIndex = static_cast<int8_t>(index);
+                libraryContentRefreshRequested = true;
                 return true;
             }
         }
@@ -912,22 +930,55 @@ bool handleTap(int16_t x, int16_t y) {
     }
 
     if (pointInRect(x, y, 8, 38, 50, 26)) {
-        view = View::Library;
-        readerContentRefreshRequested = false;
-        libraryContentRefreshRequested = false;
+        readerControlPress = ReaderControl::Back;
+        pendingReaderBack = true;
         return true;
     }
     if (pointInRect(x, y, 8, 386, 34, 24) && readerPage > 0) {
+        readerControlPress = ReaderControl::Previous;
         --readerPage;
         readerContentRefreshRequested = true;
         return true;
     }
     if (pointInRect(x, y, 198, 386, 34, 24) && readerPage + 1 < readerPageCount()) {
+        readerControlPress = ReaderControl::Next;
         ++readerPage;
         readerContentRefreshRequested = true;
         return true;
     }
     return false;
+}
+
+ReaderControl takeReaderControlPress() {
+    const ReaderControl pressed = readerControlPress;
+    readerControlPress = ReaderControl::None;
+    return pressed;
+}
+
+bool processPendingReaderBack() {
+    if (!pendingReaderBack) return false;
+    pendingReaderBack = false;
+    view = View::Library;
+    readerContentRefreshRequested = false;
+    libraryContentRefreshRequested = false;
+    return true;
+}
+
+void renderReaderControlPressed(uint8_t *frame, ReaderControl control) {
+    renderReader(frame);
+    switch (control) {
+    case ReaderControl::Back:
+        boldRect(frame, 8, 38, 50, 26);
+        break;
+    case ReaderControl::Previous:
+        boldRect(frame, 8, 386, 34, 24);
+        break;
+    case ReaderControl::Next:
+        boldRect(frame, 198, 386, 34, 24);
+        break;
+    default:
+        break;
+    }
 }
 
 bool handleSwipe(int16_t deltaX, int16_t deltaY) {
@@ -988,6 +1039,21 @@ bool takeLibraryContentRefreshRequest() {
     const bool requested = libraryContentRefreshRequested;
     libraryContentRefreshRequested = false;
     return requested;
+}
+
+bool pendingBookOpenRow(int16_t &top) {
+    if (pendingBookOpenIndex < 0 || pendingBookOpenIndex >= bookCount) return false;
+    top = static_cast<int16_t>(LIST_TOP + pendingBookOpenIndex * (ROW_HEIGHT + ROW_GAP));
+    return true;
+}
+
+bool processPendingBookOpen() {
+    if (pendingBookOpenIndex < 0 || pendingBookOpenIndex >= bookCount) return false;
+
+    const uint8_t index = static_cast<uint8_t>(pendingBookOpenIndex);
+    pendingBookOpenIndex = -1;
+    loadBook(books[index]);
+    return true;
 }
 
 void render(uint8_t *frame) {

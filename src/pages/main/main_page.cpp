@@ -33,6 +33,13 @@ void vline(uint8_t *frame, int x, int y, int height) {
     for (int i = 0; i < height; ++i) pixel(frame, x, y + i);
 }
 
+void solidFrame(uint8_t *frame, int x, int y, int width, int height) {
+    hline(frame, x, y, width);
+    hline(frame, x, y + height - 1, width);
+    vline(frame, x, y, height);
+    vline(frame, x + width - 1, y, height);
+}
+
 void roundedFrame(uint8_t *frame, int x, int y, int width, int height) {
     // A six-pixel radius gives the monochrome waveform enough connected pixels
     // around each bend. The previous sparse four-pixel corner could appear
@@ -59,10 +66,11 @@ void roundedFrame(uint8_t *frame, int x, int y, int width, int height, bool bold
     roundedFrame(frame, x, y, width, height);
     if (!bold) return;
 
-    // Four nested outlines create a clearly visible pressed state on the
-    // monochrome panel, even when the partial waveform renders fine lines softly.
-    for (int inset = 1; inset <= 3; ++inset) {
-        roundedFrame(frame, x + inset, y + inset, width - inset * 2, height - inset * 2);
+    // The pressed outline must remain connected through every corner. Use
+    // solid rectangular runs here; sparse rounded corners can break up during
+    // a partial waveform refresh.
+    for (int inset = 0; inset <= 2; ++inset) {
+        solidFrame(frame, x + inset, y + inset, width - inset * 2, height - inset * 2);
     }
 }
 

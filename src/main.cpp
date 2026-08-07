@@ -118,6 +118,9 @@ int16_t touchGestureStartX = 0;
 int16_t touchGestureStartY = 0;
 int16_t touchGestureLastX = 0;
 int16_t touchGestureLastY = 0;
+constexpr uint32_t BOOK_READER_MAINTENANCE_INTERVAL_MS = 20000;
+uint32_t bookReaderMaintenanceStartedMs = 0;
+bool bookReaderMaintenanceArmed = false;
 volatile bool touchInterruptPending = false;
 volatile bool touchWorkflowPriority = false;
 PageId openingLoadPage = PageId::Main;
@@ -696,15 +699,23 @@ void refreshCurrentPage() {
     rendererFor(currentPage)(transitionFrame);
     constexpr size_t topBarBytes = static_cast<size_t>(32) * (XingtaiEpd::WIDTH / 8);
     std::memcpy(transitionFrame, frame, topBarBytes);
+    const bool enteringBookReader = currentPage == PageId::Book && BookPage::isReader();
     if (currentPage == PageId::Book || currentPage == PageId::Voice ||
         currentPage == PageId::Music || currentPage == PageId::Poem ||
         currentPage == PageId::Word) {
         // Drive the old SD-backed content area white before drawing its next
         // list/detail/page state, reducing ghosted text and borders.
-        wipeContentAreaWhite();
+        wipeContentAreaWhite(enteringBookReader ? false : true);
     }
-    epaper.displayPartial(frame, transitionFrame, 0, 32,
-                          XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT - 32);
+    if (enteringBookReader) {
+        // The reader replaces the library only below the fixed top bar. Wipe
+        // that region first, then draw the reader without touching the bar.
+        epaper.displayPartial(frame, transitionFrame, 0, 32,
+                              XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT - 32);
+    } else {
+        epaper.displayPartial(frame, transitionFrame, 0, 32,
+                              XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT - 32);
+    }
     std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
     epaper.sleep();
 }
@@ -748,6 +759,60 @@ void refreshBookReaderContent() {
                           counterWidth, counterHeight);
     std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
     epaper.sleep();
+}
+
+void refreshBookReaderControlPressed(BookPage::ReaderControl control) {
+    BookPage::renderReaderControlPressed(transitionFrame, control);
+    switch (control) {
+    case BookPage::ReaderControl::Back:
+        epaper.displayPartial(frame, transitionFrame, 8, 38, 50, 26);
+        break;
+    case BookPage::ReaderControl::Previous:
+        epaper.displayPartial(frame, transitionFrame, 8, 386, 34, 24);
+        break;
+    case BookPage::ReaderControl::Next:
+        epaper.displayPartial(frame, transitionFrame, 198, 386, 34, 24);
+        break;
+    default:
+        return;
+    }
+    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+    epaper.sleep();
+}
+
+void refreshBookReaderMaintenance() {
+    constexpr uint16_t contentX = 10;
+    constexpr uint16_t contentY = 82;
+    constexpr uint16_t contentWidth = 220;
+    constexpr uint16_t contentHeight = 296;
+
+    BookPage::render(transitionFrame);
+    epaper.displayPartial(frame, whiteFrame, contentX, contentY,
+                          contentWidth, contentHeight);
+    epaper.displayPartialFollowUp(whiteFrame, transitionFrame, contentX, contentY,
+                                  contentWidth, contentHeight);
+    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+    epaper.sleep();
+    Serial.printf("[BOOK] Reader text maintenance refreshed page after %lu ms\n",
+                  static_cast<unsigned long>(BOOK_READER_MAINTENANCE_INTERVAL_MS));
+}
+
+void processBookReaderMaintenance() {
+    if (currentPage != PageId::Book || !BookPage::isReader()) {
+        bookReaderMaintenanceArmed = false;
+        return;
+    }
+
+    const uint32_t nowMs = millis();
+    if (!bookReaderMaintenanceArmed) {
+        bookReaderMaintenanceStartedMs = nowMs;
+        bookReaderMaintenanceArmed = true;
+        return;
+    }
+    if (nowMs - bookReaderMaintenanceStartedMs < BOOK_READER_MAINTENANCE_INTERVAL_MS) return;
+
+    refreshBookReaderMaintenance();
+    bookReaderMaintenanceStartedMs = millis();
 }
 
 void refreshBookLibraryContent() {
@@ -1350,10 +1415,26 @@ void handleTouch(TPoint point, TEvent event) {
                         refreshPoemDisplay();
                     } else if (currentPage == PageId::Book &&
                                BookPage::takeReaderContentRefreshRequest()) {
+                        const BookPage::ReaderControl control =
+                            BookPage::takeReaderControlPress();
+                        if (control != BookPage::ReaderControl::None) {
+                            refreshBookReaderControlPressed(control);
+                        }
                         refreshBookReaderContent();
                     } else if (currentPage == PageId::Book &&
                                BookPage::takeLibraryContentRefreshRequest()) {
-                        refreshBookLibraryContent();
+                        int16_t selectedRowTop = 0;
+                        if (BookPage::pendingBookOpenRow(selectedRowTop)) {
+                            BookPage::render(transitionFrame);
+                            epaper.displayPartial(frame, transitionFrame, 12,
+                                                  selectedRowTop, 216, 30);
+                            std::memcpy(frame, transitionFrame,
+                                        XingtaiEpd::FRAME_BYTES);
+                            epaper.sleep();
+                        } else {
+                            refreshBookLibraryContent();
+                        }
+                        if (BookPage::processPendingBookOpen()) refreshCurrentPage();
                     } else {
                         refreshCurrentPage();
                     }
@@ -1620,8 +1701,26 @@ void handleTouch(TPoint point, TEvent event) {
 
     if (currentPage == PageId::Book) {
         if (BookPage::handleTap(uiX, uiY)) {
-            if (BookPage::takeReaderContentRefreshRequest()) refreshBookReaderContent();
-            else if (BookPage::takeLibraryContentRefreshRequest()) refreshBookLibraryContent();
+            const BookPage::ReaderControl control = BookPage::takeReaderControlPress();
+            if (control != BookPage::ReaderControl::None) {
+                refreshBookReaderControlPressed(control);
+            }
+            if (BookPage::processPendingReaderBack()) refreshCurrentPage();
+            else if (BookPage::takeReaderContentRefreshRequest()) refreshBookReaderContent();
+            else if (BookPage::takeLibraryContentRefreshRequest()) {
+                int16_t selectedRowTop = 0;
+                if (BookPage::pendingBookOpenRow(selectedRowTop)) {
+                    BookPage::render(transitionFrame);
+                    epaper.displayPartial(frame, transitionFrame, 12,
+                                          selectedRowTop, 216, 30);
+                    std::memcpy(frame, transitionFrame,
+                                XingtaiEpd::FRAME_BYTES);
+                    epaper.sleep();
+                } else {
+                    refreshBookLibraryContent();
+                }
+                if (BookPage::processPendingBookOpen()) refreshCurrentPage();
+            }
             else refreshCurrentPage();
         }
         return;
@@ -1844,12 +1943,13 @@ void processTouchAction() {
         WordPage::open();
     }
     const bool fastHomeTransition = nextPage == PageId::Main;
+    const bool cleanBookReaderExit = fastHomeTransition &&
+                                     currentPage == PageId::Book &&
+                                     BookPage::isReader();
     if (fastHomeTransition) {
-        // Always establish a known physical and software state before drawing
-        // Home. Reusing the previous page as the old image in a follow-up
-        // waveform can make the panel briefly show Main and then settle back to
-        // Calendar/Clock/Settings even though currentPage is already Main.
-        wipeContentAreaWhite(false);
+        // A reader maintenance cycle uses several high-contrast partial
+        // waveforms. Use a full refresh when leaving that view so its residual
+        // charge cannot carry into Home.
         std::memcpy(transitionFrame, mainPageFrame, XingtaiEpd::FRAME_BYTES);
     } else {
         rendererFor(nextPage)(transitionFrame);
@@ -1862,9 +1962,13 @@ void processTouchAction() {
     std::memcpy(transitionFrame, frame, static_cast<size_t>(topBarHeight) * rowBytes);
     // For Home, frame now represents the physical white pre-drive. For every
     // other page it represents the currently displayed page.
-    epaper.displayPartial(frame, transitionFrame, 0, topBarHeight,
-                          XingtaiEpd::WIDTH,
-                          XingtaiEpd::HEIGHT - topBarHeight);
+    if (cleanBookReaderExit) {
+        epaper.display(transitionFrame);
+    } else {
+        epaper.displayPartial(frame, transitionFrame, 0, topBarHeight,
+                              XingtaiEpd::WIDTH,
+                              XingtaiEpd::HEIGHT - topBarHeight);
+    }
     std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
     epaper.sleep();
     currentPage = nextPage;
@@ -2025,6 +2129,7 @@ void loop() {
     if (currentPage == PageId::Word && WordPage::processAnimation()) {
         refreshWordStrokeWindow(false);
     }
+    processBookReaderMaintenance();
     int16_t marqueeTop = 0;
     if (VoicePage::advanceMarquee(marqueeTop) && currentPage == PageId::Voice) {
         VoicePage::renderMarquee(transitionFrame, frame);
