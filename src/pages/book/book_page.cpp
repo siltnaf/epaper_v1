@@ -60,6 +60,8 @@ int readerPage = 0;
 uint32_t readerPageOffsets[MAX_READER_PAGES + 1] = {};
 uint16_t readerPageTotal = 1;
 bool pendingSave = false;
+bool readerContentRefreshRequested = false;
+bool libraryContentRefreshRequested = false;
 
 void pixel(uint8_t *frame, int x, int y) {
     if (x < 0 || x >= XingtaiEpd::WIDTH || y < 0 || y >= XingtaiEpd::HEIGHT) return;
@@ -792,6 +794,8 @@ void setContentUrl(const char *url) {
 
 void openLibrary() {
     view = View::Library;
+    readerContentRefreshRequested = false;
+    libraryContentRefreshRequested = false;
     libraryPage = 1;
     selectedLibraryIndex = -1;
     std::strcpy(statusText, UiLocalization::isChinese() ? "正在获取内容" : "LOADING BOOKS");
@@ -822,6 +826,7 @@ bool handleTap(int16_t x, int16_t y) {
             selectedLibraryIndex = -1;
             libraryPage = 1;
             loadLibrary();
+            libraryContentRefreshRequested = true;
             return true;
         }
         if (pointInRect(x, y, 42, PAGER_TOP, PAGER_BUTTON_WIDTH, PAGER_HEIGHT) &&
@@ -829,6 +834,7 @@ bool handleTap(int16_t x, int16_t y) {
             selectedLibraryIndex = -1;
             --libraryPage;
             loadLibrary();
+            libraryContentRefreshRequested = true;
             return true;
         }
         if (pointInRect(x, y, 164, PAGER_TOP, PAGER_BUTTON_WIDTH, PAGER_HEIGHT) &&
@@ -836,6 +842,7 @@ bool handleTap(int16_t x, int16_t y) {
             selectedLibraryIndex = -1;
             ++libraryPage;
             loadLibrary();
+            libraryContentRefreshRequested = true;
             return true;
         }
         if (pointInRect(x, y, 202, PAGER_TOP, PAGER_BUTTON_WIDTH, PAGER_HEIGHT) &&
@@ -843,6 +850,7 @@ bool handleTap(int16_t x, int16_t y) {
             selectedLibraryIndex = -1;
             libraryPage = libraryPageCount();
             loadLibrary();
+            libraryContentRefreshRequested = true;
             return true;
         }
         for (uint8_t index = 0; index < bookCount; ++index) {
@@ -858,14 +866,18 @@ bool handleTap(int16_t x, int16_t y) {
 
     if (pointInRect(x, y, 8, 38, 50, 26)) {
         view = View::Library;
+        readerContentRefreshRequested = false;
+        libraryContentRefreshRequested = false;
         return true;
     }
     if (pointInRect(x, y, 8, 386, 34, 24) && readerPage > 0) {
         --readerPage;
+        readerContentRefreshRequested = true;
         return true;
     }
     if (pointInRect(x, y, 198, 386, 34, 24) && readerPage + 1 < readerPageCount()) {
         ++readerPage;
+        readerContentRefreshRequested = true;
         return true;
     }
     return false;
@@ -885,6 +897,7 @@ bool handleSwipe(int16_t deltaX, int16_t deltaY) {
             selectedLibraryIndex = -1;
             ++libraryPage;
             loadLibrary();
+            libraryContentRefreshRequested = true;
             Serial.printf("[BOOK SWIPE] Library next page=%ld axis=%s\n",
                           static_cast<long>(libraryPage), horizontal ? "horizontal" : "vertical");
             return true;
@@ -893,6 +906,7 @@ bool handleSwipe(int16_t deltaX, int16_t deltaY) {
             selectedLibraryIndex = -1;
             --libraryPage;
             loadLibrary();
+            libraryContentRefreshRequested = true;
             Serial.printf("[BOOK SWIPE] Library previous page=%ld axis=%s\n",
                           static_cast<long>(libraryPage), horizontal ? "horizontal" : "vertical");
             return true;
@@ -902,17 +916,31 @@ bool handleSwipe(int16_t deltaX, int16_t deltaY) {
 
     if (next && readerPage + 1 < readerPageCount()) {
         ++readerPage;
+        readerContentRefreshRequested = true;
         Serial.printf("[BOOK SWIPE] Reader next page=%d/%d axis=%s\n",
                       readerPage + 1, readerPageCount(), horizontal ? "horizontal" : "vertical");
         return true;
     }
     if (!next && readerPage > 0) {
         --readerPage;
+        readerContentRefreshRequested = true;
         Serial.printf("[BOOK SWIPE] Reader previous page=%d/%d axis=%s\n",
                       readerPage + 1, readerPageCount(), horizontal ? "horizontal" : "vertical");
         return true;
     }
     return false;
+}
+
+bool takeReaderContentRefreshRequest() {
+    const bool requested = readerContentRefreshRequested;
+    readerContentRefreshRequested = false;
+    return requested;
+}
+
+bool takeLibraryContentRefreshRequest() {
+    const bool requested = libraryContentRefreshRequested;
+    libraryContentRefreshRequested = false;
+    return requested;
 }
 
 void render(uint8_t *frame) {

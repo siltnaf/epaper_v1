@@ -122,6 +122,8 @@ bool suppressNextAudioTap = false;
 
 void recoverSharedI2c();
 void refreshCurrentPage();
+void refreshBookReaderContent();
+void refreshBookLibraryContent();
 void wipeContentAreaWhite();
 void refreshVoiceDirtyRows();
 void refreshMusicDirtyRows();
@@ -714,6 +716,45 @@ void refreshCurrentRegion(uint16_t x, uint16_t y, uint16_t width, uint16_t heigh
     epaper.sleep();
 }
 
+void refreshBookReaderContent() {
+    constexpr uint16_t contentX = 10;
+    constexpr uint16_t contentY = 82;
+    constexpr uint16_t contentWidth = 220;
+    constexpr uint16_t contentHeight = 296;
+    // The centered counter occupies the gap between the fixed arrow buttons.
+    constexpr uint16_t counterX = 50;
+    constexpr uint16_t counterY = 390;
+    constexpr uint16_t counterWidth = 140;
+    constexpr uint16_t counterHeight = 18;
+    BookPage::render(transitionFrame);
+    epaper.displayPartial(frame, transitionFrame, contentX, contentY,
+                          contentWidth, contentHeight);
+    epaper.displayPartial(frame, transitionFrame, counterX, counterY,
+                          counterWidth, counterHeight);
+    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+    epaper.sleep();
+}
+
+void refreshBookLibraryContent() {
+    // Preserve BOOKLIST and the four fixed navigation buttons. Refresh only
+    // the changing page counter and the rows below the pager.
+    constexpr uint16_t counterX = 78;
+    constexpr uint16_t counterY = 54;
+    constexpr uint16_t counterWidth = 84;
+    constexpr uint16_t counterHeight = 20;
+    constexpr uint16_t listX = 12;
+    constexpr uint16_t listY = 82;
+    constexpr uint16_t listWidth = 216;
+    constexpr uint16_t listHeight = 318;
+    BookPage::render(transitionFrame);
+    epaper.displayPartial(frame, transitionFrame, counterX, counterY,
+                          counterWidth, counterHeight);
+    epaper.displayPartial(frame, transitionFrame, listX, listY,
+                          listWidth, listHeight);
+    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+    epaper.sleep();
+}
+
 void refreshPoemDisplay() {
     constexpr uint16_t popupX = 12;
     constexpr uint16_t popupY = 82;
@@ -1122,6 +1163,12 @@ void handleTouch(TPoint point, TEvent event) {
                 if (changed) {
                     if (poemPopupOpen || (currentPage == PageId::Poem && PoemPage::isPopupOpen())) {
                         refreshPoemDisplay();
+                    } else if (currentPage == PageId::Book &&
+                               BookPage::takeReaderContentRefreshRequest()) {
+                        refreshBookReaderContent();
+                    } else if (currentPage == PageId::Book &&
+                               BookPage::takeLibraryContentRefreshRequest()) {
+                        refreshBookLibraryContent();
                     } else {
                         refreshCurrentPage();
                     }
@@ -1378,7 +1425,11 @@ void handleTouch(TPoint point, TEvent event) {
     }
 
     if (currentPage == PageId::Book) {
-        if (BookPage::handleTap(uiX, uiY)) refreshCurrentPage();
+        if (BookPage::handleTap(uiX, uiY)) {
+            if (BookPage::takeReaderContentRefreshRequest()) refreshBookReaderContent();
+            else if (BookPage::takeLibraryContentRefreshRequest()) refreshBookLibraryContent();
+            else refreshCurrentPage();
+        }
         return;
     }
 
