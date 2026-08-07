@@ -145,6 +145,8 @@ void startMainIconFeedback(PageId page);
 void showHomePressedOutline();
 void restoreHomeIcon();
 void clearFrameRegion(uint8_t *buffer, int left, int top, int width, int height);
+void copyFrameRegion(uint8_t *destination, const uint8_t *source,
+                     int left, int top, int width, int height);
 void showTopbarLoading(bool visible);
 void processOpeningLibraryLoads();
 void startOpeningLibraryLoad(PageId page);
@@ -753,6 +755,10 @@ void refreshBookReaderContent() {
     constexpr uint16_t counterWidth = 140;
     constexpr uint16_t counterHeight = 18;
     BookPage::render(transitionFrame);
+    epaper.displayPartial(frame, whiteFrame, contentX, contentY,
+                          contentWidth, contentHeight);
+    clearFrameRegion(frame, contentX, contentY, contentWidth, contentHeight);
+    epaper.sleep();
     epaper.displayPartial(frame, transitionFrame, contentX, contentY,
                           contentWidth, contentHeight);
     epaper.displayPartial(frame, transitionFrame, counterX, counterY,
@@ -763,20 +769,25 @@ void refreshBookReaderContent() {
 
 void refreshBookReaderControlPressed(BookPage::ReaderControl control) {
     BookPage::renderReaderControlPressed(transitionFrame, control);
+    uint16_t left = 0;
+    uint16_t top = 0;
+    uint16_t width = 0;
+    uint16_t height = 0;
     switch (control) {
     case BookPage::ReaderControl::Back:
-        epaper.displayPartial(frame, transitionFrame, 8, 38, 50, 26);
+        left = 8; top = 38; width = 50; height = 26;
         break;
     case BookPage::ReaderControl::Previous:
-        epaper.displayPartial(frame, transitionFrame, 8, 386, 34, 24);
+        left = 8; top = 386; width = 34; height = 24;
         break;
     case BookPage::ReaderControl::Next:
-        epaper.displayPartial(frame, transitionFrame, 198, 386, 34, 24);
+        left = 198; top = 386; width = 34; height = 24;
         break;
     default:
         return;
     }
-    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+    epaper.displayPartial(frame, transitionFrame, left, top, width, height);
+    copyFrameRegion(frame, transitionFrame, left, top, width, height);
     epaper.sleep();
 }
 
@@ -1004,6 +1015,20 @@ void clearFrameRegion(uint8_t *buffer, int left, int top, int width, int height)
             buffer[static_cast<size_t>(y) * (XingtaiEpd::WIDTH / 8) + x / 8] &=
                 static_cast<uint8_t>(~(0x80U >> (x % 8)));
         }
+    }
+}
+
+void copyFrameRegion(uint8_t *destination, const uint8_t *source,
+                     int left, int top, int width, int height) {
+    const int firstByte = max(0, left) / 8;
+    const int lastByte = min<int>(XingtaiEpd::WIDTH - 1, left + width - 1) / 8;
+    const int firstRow = max(0, top);
+    const int lastRow = min<int>(XingtaiEpd::HEIGHT - 1, top + height - 1);
+    constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
+    for (int y = firstRow; y <= lastRow; ++y) {
+        std::memcpy(destination + static_cast<size_t>(y) * rowBytes + firstByte,
+                    source + static_cast<size_t>(y) * rowBytes + firstByte,
+                    static_cast<size_t>(lastByte - firstByte + 1));
     }
 }
 
@@ -1346,6 +1371,10 @@ void handleTouch(TPoint point, TEvent event) {
     const int16_t uiY = XingtaiEpd::HEIGHT - 1 - y;
 
     if (event == TEvent::TouchStart) {
+        // A long e-paper feedback refresh can make the FT6336 reject the prior
+        // release as a Tap. Once a new physical touch starts, any old release
+        // suppression is necessarily stale and must not consume this gesture.
+        if (suppressMainIconReleaseTap) suppressMainIconReleaseTap = false;
         if (currentPage != PageId::Main && isHomeIcon(uiX, uiY)) {
             touchGestureActive = false;
             homeTouchActive = true;
@@ -1943,13 +1972,10 @@ void processTouchAction() {
         WordPage::open();
     }
     const bool fastHomeTransition = nextPage == PageId::Main;
-    const bool cleanBookReaderExit = fastHomeTransition &&
-                                     currentPage == PageId::Book &&
-                                     BookPage::isReader();
     if (fastHomeTransition) {
-        // A reader maintenance cycle uses several high-contrast partial
-        // waveforms. Use a full refresh when leaving that view so its residual
-        // charge cannot carry into Home.
+        // Clear only the function area below the fixed top bar before drawing
+        // the cached Home menu with the partial waveform.
+        wipeContentAreaWhite(false);
         std::memcpy(transitionFrame, mainPageFrame, XingtaiEpd::FRAME_BYTES);
     } else {
         rendererFor(nextPage)(transitionFrame);
@@ -1962,13 +1988,9 @@ void processTouchAction() {
     std::memcpy(transitionFrame, frame, static_cast<size_t>(topBarHeight) * rowBytes);
     // For Home, frame now represents the physical white pre-drive. For every
     // other page it represents the currently displayed page.
-    if (cleanBookReaderExit) {
-        epaper.display(transitionFrame);
-    } else {
-        epaper.displayPartial(frame, transitionFrame, 0, topBarHeight,
-                              XingtaiEpd::WIDTH,
-                              XingtaiEpd::HEIGHT - topBarHeight);
-    }
+    epaper.displayPartial(frame, transitionFrame, 0, topBarHeight,
+                          XingtaiEpd::WIDTH,
+                          XingtaiEpd::HEIGHT - topBarHeight);
     std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
     epaper.sleep();
     currentPage = nextPage;

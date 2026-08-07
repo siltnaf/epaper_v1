@@ -934,10 +934,14 @@ bool handleTap(int16_t x, int16_t y) {
         pendingReaderBack = true;
         return true;
     }
-    if (pointInRect(x, y, 8, 386, 34, 24) && readerPage > 0) {
+    if (pointInRect(x, y, 8, 386, 34, 24)) {
         readerControlPress = ReaderControl::Previous;
-        --readerPage;
-        readerContentRefreshRequested = true;
+        if (readerPage > 0) {
+            --readerPage;
+            readerContentRefreshRequested = true;
+        } else {
+            pendingReaderBack = true;
+        }
         return true;
     }
     if (pointInRect(x, y, 198, 386, 34, 24) && readerPage + 1 < readerPageCount()) {
