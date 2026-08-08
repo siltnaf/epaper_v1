@@ -49,7 +49,7 @@ constexpr int AUDIO_DIN = 41;
 constexpr int AUDIO_MCLK = 42;
 
 // ML307R modem
-constexpr int MODEM_RX = 43; // ESP RX, modem TX
-constexpr int MODEM_TX = 44; // ESP TX, modem RX
+constexpr int MODEM_RX = 44; // ESP RX, modem TX
+constexpr int MODEM_TX = 43; // ESP TX, modem RX
 constexpr int MODEM_PWR = 11;
 }

@@ -18,8 +18,14 @@ enum class FunctionIcon : uint8_t {
     Recording,
 };
 
+enum class NetworkMode : uint8_t {
+    None,
+    Wifi,
+    Cellular4G,
+};
+
 void render(uint8_t *frame);
 void render(uint8_t *frame, FunctionIcon selectedIcon);
-void setWifiConnected(bool connected);
+void setNetworkMode(NetworkMode mode);
 
 }

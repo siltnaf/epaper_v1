@@ -19,6 +19,7 @@ void renderReaderControlPressed(uint8_t *frame, ReaderControl control);
 bool takeReaderContentRefreshRequest();
 bool takeLibraryContentRefreshRequest();
 bool pendingBookOpenRow(int16_t &top);
+bool preparePendingBookOpen();
 bool processPendingBookOpen();
 void processPendingSave();
 void render(uint8_t *frame);

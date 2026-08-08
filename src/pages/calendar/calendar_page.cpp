@@ -37,6 +37,14 @@ void rect(uint8_t *frame, int x, int y, int width, int height) {
     }
 }
 
+void horizontalLine(uint8_t *frame, int x, int y, int width) {
+    for (int offset = 0; offset < width; ++offset) pixel(frame, x + offset, y);
+}
+
+void verticalLine(uint8_t *frame, int x, int y, int height) {
+    for (int offset = 0; offset < height; ++offset) pixel(frame, x, y + offset);
+}
+
 void fillRect(uint8_t *frame, int x, int y, int width, int height) {
     for (int row = 0; row < height; ++row)
         for (int column = 0; column < width; ++column) pixel(frame, x + column, y + row);
@@ -197,9 +205,16 @@ void render(uint8_t *frame) {
     constexpr int top = 86;
     constexpr int cellWidth = 32;
     constexpr int cellHeight = 52;
-    for (int row = 0; row < 6; ++row)
-        for (int column = 0; column < 7; ++column)
-            rect(frame, left + column * cellWidth, top + row * cellHeight, cellWidth, cellHeight);
+    constexpr int columns = 7;
+    constexpr int rows = 6;
+    const int gridWidth = columns * cellWidth;
+    const int gridHeight = rows * cellHeight;
+    for (int column = 0; column <= columns; ++column) {
+        verticalLine(frame, left + column * cellWidth, top, gridHeight + 1);
+    }
+    for (int row = 0; row <= rows; ++row) {
+        horizontalLine(frame, left, top + row * cellHeight, gridWidth + 1);
+    }
 
     struct tm first = {};
     first.tm_year = viewedYear - 1900;

@@ -9,6 +9,7 @@
 #include <WiFiClientSecure.h>
 
 #include "devices/epd_xingtai/epd_xingtai.h"
+#include "devices/ml307/ml307.h"
 #include "devices/sd_card/sd_card.h"
 #include "font/xiaozhi_font.h"
 #include "ui/loading_indicator.h"
@@ -463,8 +464,9 @@ bool httpGet(const String &url, String &payload, bool showLoading = true) {
                   WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str(),
                   WiFi.dnsIP().toString().c_str(), static_cast<unsigned>(ESP.getFreeHeap()));
     if (WiFi.status() != WL_CONNECTED) {
-        std::strcpy(statusText, UiLocalization::isChinese() ? "网络未连接" : "WIFI NOT CONNECTED");
-        Serial.println("[BOOK] WiFi is not connected");
+        if (cellularModem.httpGet(url.c_str(), payload)) return true;
+        std::strcpy(statusText, UiLocalization::isChinese() ? "网络未连接" : "NETWORK NOT CONNECTED");
+        Serial.println("[BOOK] WiFi and ML307 are not connected");
         return false;
     }
 
@@ -1051,13 +1053,33 @@ bool pendingBookOpenRow(int16_t &top) {
     return true;
 }
 
+bool preparePendingBookOpen() {
+    if (pendingBookOpenIndex < 0 || pendingBookOpenIndex >= bookCount) return false;
+
+    const BookItem &book = books[static_cast<uint8_t>(pendingBookOpenIndex)];
+    selectedBookId = book.id;
+    copyUtf8(selectedTitle, sizeof(selectedTitle), book.title, "BOOK");
+    selectedAuthor[0] = '\0';
+    selectedCategory[0] = '\0';
+    selectedContent = "";
+    readerPage = 0;
+    readerPageTotal = 1;
+    readerPageOffsets[0] = 0;
+    readerPageOffsets[1] = 0;
+    pendingSave = false;
+    pendingReaderBack = false;
+    readerControlPress = ReaderControl::None;
+    readerContentRefreshRequested = false;
+    view = View::Reader;
+    return true;
+}
+
 bool processPendingBookOpen() {
     if (pendingBookOpenIndex < 0 || pendingBookOpenIndex >= bookCount) return false;
 
     const uint8_t index = static_cast<uint8_t>(pendingBookOpenIndex);
     pendingBookOpenIndex = -1;
-    loadBook(books[index]);
-    return true;
+    return loadBook(books[index]);
 }
 
 void render(uint8_t *frame) {

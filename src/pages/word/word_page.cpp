@@ -13,6 +13,7 @@
 
 #include "devices/audio/opus_player.h"
 #include "devices/epd_xingtai/epd_xingtai.h"
+#include "devices/ml307/ml307.h"
 #include "devices/sd_card/sd_card.h"
 #include "font/xiaozhi_font.h"
 #include "ui/loading_indicator.h"
@@ -282,7 +283,7 @@ String absoluteUrl(const char *value) {
 
 bool httpGetText(const String &url, String &payload, bool showLoading = true) {
     OptionalLoadingScope loading(showLoading);
-    if (WiFi.status() != WL_CONNECTED) return false;
+    if (WiFi.status() != WL_CONNECTED) return cellularModem.httpGet(url.c_str(), payload);
     HTTPClient http;
     http.setConnectTimeout(7000);
     http.setTimeout(12000);

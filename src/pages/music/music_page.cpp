@@ -12,6 +12,7 @@
 
 #include "devices/epd_xingtai/epd_xingtai.h"
 #include "devices/audio/opus_player.h"
+#include "devices/ml307/ml307.h"
 #include "devices/sd_card/sd_card.h"
 #include "font/xiaozhi_font.h"
 #include "ui/loading_indicator.h"
@@ -294,6 +295,7 @@ bool httpGet(const String &url, String &payload, bool showLoading = true) {
                   url.c_str(), static_cast<int>(WiFi.status()),
                   WiFi.localIP().toString().c_str(), static_cast<unsigned>(ESP.getFreeHeap()));
     if (WiFi.status() != WL_CONNECTED) {
+        if (cellularModem.httpGet(url.c_str(), payload)) return true;
         std::strcpy(statusText, UiLocalization::isChinese() ? "网络未连接" : "WIFI NOT CONNECTED");
         return false;
     }

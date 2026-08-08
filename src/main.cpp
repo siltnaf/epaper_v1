@@ -12,6 +12,7 @@
 #include "devices/epd_xingtai/epd_xingtai.h"
 #include "devices/es8311/es8311.h"
 #include "devices/ft6336/FT6X36.h"
+#include "devices/ml307/ml307.h"
 #include "devices/sd_card/sd_card.h"
 #include "font/xiaozhi_font.h"
 #include "pages/asundar/asundar_page.h"
@@ -86,9 +87,7 @@ bool initialEs8311Present = false;
 uint8_t initialEs8311Address = 0;
 bool initialFt6x36Present = false;
 SettingsPage::State settingsState = {true, true, 60, 0};
-bool lastWifiConnected = false;
-bool cellularPowerApplied = false;
-volatile bool cellularConnected = false;
+MainPage::NetworkMode lastNetworkMode = MainPage::NetworkMode::None;
 volatile bool cellularProbeRunning = false;
 uint32_t wifiPriorityStartedMs = 0;
 uint32_t lastWifiReconnectAttemptMs = 0;
@@ -96,7 +95,6 @@ constexpr uint32_t WIFI_PRIORITY_TIMEOUT_MS = 15000;
 constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 15000;
 constexpr uint32_t CELLULAR_DISCONNECTED_POLL_MS = 10000;
 constexpr uint32_t CELLULAR_CONNECTED_POLL_MS = 30000;
-HardwareSerial cellularSerial(1);
 char savedWifiSsid[33] = {};
 char savedWifiPassword[64] = {};
 char scannedWifiNetworks[6][33] = {};
@@ -118,15 +116,14 @@ int16_t touchGestureStartX = 0;
 int16_t touchGestureStartY = 0;
 int16_t touchGestureLastX = 0;
 int16_t touchGestureLastY = 0;
-constexpr uint32_t BOOK_READER_MAINTENANCE_INTERVAL_MS = 20000;
-uint32_t bookReaderMaintenanceStartedMs = 0;
-bool bookReaderMaintenanceArmed = false;
 volatile bool touchInterruptPending = false;
 volatile bool touchWorkflowPriority = false;
 PageId openingLoadPage = PageId::Main;
 bool openingLoadVisible = false;
 bool suppressNextAudioTap = false;
 bool suppressMainIconReleaseTap = false;
+bool suppressDriverTap = false;
+bool dispatchingSyntheticTap = false;
 bool homeOutlinePressed = false;
 bool homeTouchActive = false;
 
@@ -188,84 +185,25 @@ void serviceTouchInterruptBeforeI2c() {
                   digitalRead(BoardPins::TOUCH_INT));
 }
 
-String readCellularResponse(uint32_t timeoutMs, const char *tokenA, const char *tokenB) {
-    String response;
-    const uint32_t started = millis();
-    while (millis() - started < timeoutMs) {
-        while (cellularSerial.available() > 0) {
-            response += static_cast<char>(cellularSerial.read());
-            if ((tokenA && response.indexOf(tokenA) >= 0) ||
-                (tokenB && response.indexOf(tokenB) >= 0)) {
-                return response;
-            }
-        }
-        vTaskDelay(pdMS_TO_TICKS(5));
-    }
-    return response;
-}
-
-bool sendCellularCommand(const char *command, uint32_t timeoutMs, String &response) {
-    while (cellularSerial.available() > 0) cellularSerial.read();
-    Serial.printf("[ML307] >> %s\n", command);
-    cellularSerial.print(command);
-    cellularSerial.print("\r\n");
-    response = readCellularResponse(timeoutMs, "OK", "ERROR");
-    response.replace("\r", "");
-    response.replace("\n", " ");
-    Serial.printf("[ML307] << %s\n", response.c_str());
-    return response.indexOf("OK") >= 0 && response.indexOf("ERROR") < 0;
-}
-
-bool probeCellularConnection() {
-    if (!settingsState.cellularEnabled || !cellularPowerApplied ||
-        WiFi.status() == WL_CONNECTED) {
-        return false;
-    }
-
-    String response;
-    if (!sendCellularCommand("AT", 2000, response)) return false;
-    sendCellularCommand("ATE0", 1000, response);
-    sendCellularCommand("AT+CPIN?", 2000, response);
-    sendCellularCommand("AT+CSQ", 2000, response);
-    response = "";
-    sendCellularCommand("AT+MIPCALL?", 3000, response);
-    bool ready = response.indexOf("+MIPCALL:") >= 0 &&
-                 (response.indexOf(",1") >= 0 || response.indexOf(": 1") >= 0);
-    if (!ready && WiFi.status() != WL_CONNECTED && cellularPowerApplied) {
-        sendCellularCommand("AT+MIPCALL=1", 8000, response);
-        response = "";
-        sendCellularCommand("AT+MIPCALL?", 3000, response);
-        ready = response.indexOf("+MIPCALL:") >= 0 &&
-                (response.indexOf(",1") >= 0 || response.indexOf(": 1") >= 0);
-    }
-    return ready;
-}
-
 void cellularPollingTask(void *) {
     cellularProbeRunning = true;
-    cellularSerial.begin(115200, SERIAL_8N1, BoardPins::MODEM_RX, BoardPins::MODEM_TX);
-    cellularSerial.setTimeout(200);
-    Serial.printf("[ML307] Poller started baud=115200 RX=%d TX=%d\n",
-                  BoardPins::MODEM_RX, BoardPins::MODEM_TX);
+    cellularModem.begin();
+    Serial.println("[ML307] Connection poller started");
     while (true) {
-        if (!settingsState.cellularEnabled || !cellularPowerApplied ||
+        if (!settingsState.cellularEnabled || !cellularModem.isPowered() ||
             WiFi.status() == WL_CONNECTED) {
-            if (cellularConnected) {
-                cellularConnected = false;
-                Serial.println("[NETWORK] 4G no longer active");
-            }
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
 
-        const bool wasConnected = cellularConnected;
-        cellularConnected = probeCellularConnection();
-        if (wasConnected != cellularConnected) {
-            Serial.printf("[NETWORK] 4G %s\n", cellularConnected ? "connected" : "disconnected");
-        } else if (!cellularConnected) {
+        const bool wasConnected = cellularModem.isConnected();
+        const bool connected = cellularModem.probeConnection();
+        if (wasConnected != connected) {
+            Serial.printf("[NETWORK] 4G %s\n", connected ? "connected" : "disconnected");
+        } else if (!connected) {
             Serial.println("[NETWORK] Neither WiFi nor 4G connected; polling continues");
         }
-        vTaskDelay(pdMS_TO_TICKS(cellularConnected
+        vTaskDelay(pdMS_TO_TICKS(connected
                                     ? CELLULAR_CONNECTED_POLL_MS
                                     : CELLULAR_DISCONNECTED_POLL_MS));
     }
@@ -463,10 +401,7 @@ void applyWifiSetting(bool waitForConnection = false) {
 
 void applyCellularSetting() {
     const bool shouldPower = settingsState.cellularEnabled && !settingsState.wifiEnabled;
-    pinMode(BoardPins::MODEM_PWR, OUTPUT);
-    digitalWrite(BoardPins::MODEM_PWR, shouldPower ? HIGH : LOW);
-    cellularPowerApplied = shouldPower;
-    if (!shouldPower) cellularConnected = false;
+    cellularModem.setPowered(shouldPower);
     Serial.printf("[NETWORK] 4G modem power %s%s\n",
                   shouldPower ? "enabled" : "disabled",
                   settingsState.cellularEnabled && settingsState.wifiEnabled
@@ -475,30 +410,26 @@ void applyCellularSetting() {
 
 void updateNetworkPriority() {
     const bool wifiConnected = WiFi.status() == WL_CONNECTED;
-    const bool anyConnected = wifiConnected || cellularConnected;
 
     if (!settingsState.cellularEnabled) {
-        if (cellularPowerApplied) {
-            digitalWrite(BoardPins::MODEM_PWR, LOW);
-            cellularPowerApplied = false;
+        if (cellularModem.isPowered()) {
+            cellularModem.setPowered(false);
             Serial.println("[NETWORK] 4G modem power disabled by setting");
         }
         return;
     }
 
     if (!settingsState.wifiEnabled) {
-        if (!cellularPowerApplied) {
-            digitalWrite(BoardPins::MODEM_PWR, HIGH);
-            cellularPowerApplied = true;
+        if (!cellularModem.isPowered()) {
+            cellularModem.setPowered(true);
             Serial.println("[NETWORK] WiFi is off; 4G modem powered immediately");
         }
         return;
     }
 
     if (wifiConnected) {
-        if (cellularPowerApplied) {
-            digitalWrite(BoardPins::MODEM_PWR, LOW);
-            cellularPowerApplied = false;
+        if (cellularModem.isPowered()) {
+            cellularModem.setPowered(false);
             Serial.println("[NETWORK] WiFi connected; 4G modem powered down");
         }
         return;
@@ -511,7 +442,7 @@ void updateNetworkPriority() {
         millis() - lastWifiReconnectAttemptMs >= WIFI_RECONNECT_INTERVAL_MS) {
         lastWifiReconnectAttemptMs = millis();
         Serial.printf("[NETWORK] Polling WiFi connection for %s%s\n", savedWifiSsid,
-                      cellularConnected ? " while 4G remains active" : "");
+                      cellularModem.isConnected() ? " while 4G remains active" : "");
         WiFi.disconnect(false, false);
         WiFi.begin(savedWifiSsid, savedWifiPassword);
     }
@@ -519,9 +450,8 @@ void updateNetworkPriority() {
     const bool noSavedWifi = savedWifiSsid[0] == '\0';
     const bool wifiTimedOut = wifiPriorityStartedMs != 0 &&
         millis() - wifiPriorityStartedMs >= WIFI_PRIORITY_TIMEOUT_MS;
-    if ((noSavedWifi || wifiTimedOut) && !cellularPowerApplied) {
-        digitalWrite(BoardPins::MODEM_PWR, HIGH);
-        cellularPowerApplied = true;
+    if ((noSavedWifi || wifiTimedOut) && !cellularModem.isPowered()) {
+        cellularModem.setPowered(true);
         Serial.printf("[NETWORK] WiFi unavailable after priority check; 4G modem powered%s\n",
                       noSavedWifi ? " (no saved WiFi)" : " after 15s timeout");
     }
@@ -767,6 +697,22 @@ void refreshBookReaderContent() {
     epaper.sleep();
 }
 
+void releaseBookReaderControl(BookPage::ReaderControl control) {
+    if (control != BookPage::ReaderControl::Previous &&
+        control != BookPage::ReaderControl::Next) {
+        return;
+    }
+
+    BookPage::render(transitionFrame);
+    const uint16_t left = control == BookPage::ReaderControl::Previous ? 8 : 198;
+    constexpr uint16_t top = 386;
+    constexpr uint16_t width = 34;
+    constexpr uint16_t height = 24;
+    epaper.displayPartial(frame, transitionFrame, left, top, width, height);
+    copyFrameRegion(frame, transitionFrame, left, top, width, height);
+    epaper.sleep();
+}
+
 void refreshBookReaderControlPressed(BookPage::ReaderControl control) {
     BookPage::renderReaderControlPressed(transitionFrame, control);
     uint16_t left = 0;
@@ -789,41 +735,6 @@ void refreshBookReaderControlPressed(BookPage::ReaderControl control) {
     epaper.displayPartial(frame, transitionFrame, left, top, width, height);
     copyFrameRegion(frame, transitionFrame, left, top, width, height);
     epaper.sleep();
-}
-
-void refreshBookReaderMaintenance() {
-    constexpr uint16_t contentX = 10;
-    constexpr uint16_t contentY = 82;
-    constexpr uint16_t contentWidth = 220;
-    constexpr uint16_t contentHeight = 296;
-
-    BookPage::render(transitionFrame);
-    epaper.displayPartial(frame, whiteFrame, contentX, contentY,
-                          contentWidth, contentHeight);
-    epaper.displayPartialFollowUp(whiteFrame, transitionFrame, contentX, contentY,
-                                  contentWidth, contentHeight);
-    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
-    epaper.sleep();
-    Serial.printf("[BOOK] Reader text maintenance refreshed page after %lu ms\n",
-                  static_cast<unsigned long>(BOOK_READER_MAINTENANCE_INTERVAL_MS));
-}
-
-void processBookReaderMaintenance() {
-    if (currentPage != PageId::Book || !BookPage::isReader()) {
-        bookReaderMaintenanceArmed = false;
-        return;
-    }
-
-    const uint32_t nowMs = millis();
-    if (!bookReaderMaintenanceArmed) {
-        bookReaderMaintenanceStartedMs = nowMs;
-        bookReaderMaintenanceArmed = true;
-        return;
-    }
-    if (nowMs - bookReaderMaintenanceStartedMs < BOOK_READER_MAINTENANCE_INTERVAL_MS) return;
-
-    refreshBookReaderMaintenance();
-    bookReaderMaintenanceStartedMs = millis();
 }
 
 void refreshBookLibraryContent() {
@@ -1043,27 +954,34 @@ void showHomePressedOutline() {
         buffer[static_cast<size_t>(y) * (XingtaiEpd::WIDTH / 8) + x / 8] |=
             static_cast<uint8_t>(0x80U >> (x % 8));
     };
-    auto drawRect = [&](int inset) {
+    auto drawRoundedFrame = [&](int inset) {
         const int x1 = left + inset;
         const int y1 = top + inset;
         const int x2 = left + width - 1 - inset;
         const int y2 = top + height - 1 - inset;
-        for (int x = x1 + 2; x <= x2 - 2; ++x) {
+        constexpr int radius = 6;
+        for (int x = x1 + radius; x <= x2 - radius; ++x) {
             setPixel(transitionFrame, x, y1);
             setPixel(transitionFrame, x, y2);
         }
-        for (int y = y1 + 2; y <= y2 - 2; ++y) {
+        for (int y = y1 + radius; y <= y2 - radius; ++y) {
             setPixel(transitionFrame, x1, y);
             setPixel(transitionFrame, x2, y);
         }
-        setPixel(transitionFrame, x1 + 1, y1 + 1);
-        setPixel(transitionFrame, x2 - 1, y1 + 1);
-        setPixel(transitionFrame, x1 + 1, y2 - 1);
-        setPixel(transitionFrame, x2 - 1, y2 - 1);
+        constexpr uint8_t cornerX[] = {5, 4, 3, 2, 1, 1, 0};
+        constexpr uint8_t cornerY[] = {0, 1, 1, 2, 3, 4, 5};
+        for (size_t index = 0; index < sizeof(cornerX); ++index) {
+            const int dx = cornerX[index];
+            const int dy = cornerY[index];
+            setPixel(transitionFrame, x1 + dx, y1 + dy);
+            setPixel(transitionFrame, x2 - dx, y1 + dy);
+            setPixel(transitionFrame, x1 + dx, y2 - dy);
+            setPixel(transitionFrame, x2 - dx, y2 - dy);
+        }
     };
-    drawRect(0);
-    drawRect(1);
-    drawRect(2);
+    drawRoundedFrame(0);
+    drawRoundedFrame(1);
+    drawRoundedFrame(2);
     epaper.displayPartial(frame, transitionFrame, left, top, width, height);
     std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
     epaper.sleep();
@@ -1117,15 +1035,19 @@ void showTopbarLoading(bool visible) {
     epaper.sleep();
 }
 
-void refreshWifiTopbar(bool connected) {
-    MainPage::setWifiConnected(connected);
+void refreshNetworkTopbar(MainPage::NetworkMode mode) {
+    MainPage::setNetworkMode(mode);
     // Keep the persistent Home framebuffer ready for instant navigation.
     MainPage::render(mainPageFrame);
     std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
     clearFrameRegion(transitionFrame, 178, 0, 28, 32);
-    if (connected) Topbar::drawWifi(transitionFrame, 181, 2);
+    if (mode == MainPage::NetworkMode::Wifi) {
+        Topbar::drawWifi(transitionFrame, 181, 2);
+    } else if (mode == MainPage::NetworkMode::Cellular4G) {
+        Topbar::draw4G(transitionFrame, 184, 2);
+    }
     epaper.displayPartial(frame, transitionFrame, 178, 0, 28, 32);
-    if (!connected) {
+    if (mode == MainPage::NetworkMode::None) {
         // Reapply the black-to-white waveform once to scrub residual pigment
         // without touching the adjacent battery icon.
         epaper.displayPartial(frame, transitionFrame, 178, 0, 28, 32);
@@ -1134,12 +1056,18 @@ void refreshWifiTopbar(bool connected) {
     epaper.sleep();
 }
 
-void updateWifiTopbar() {
-    const bool connected = WiFi.status() == WL_CONNECTED;
-    if (connected == lastWifiConnected) return;
-    lastWifiConnected = connected;
-    Serial.printf("[TOPBAR] WiFi %s\n", connected ? "connected" : "disconnected");
-    refreshWifiTopbar(connected);
+void updateNetworkTopbar() {
+    const MainPage::NetworkMode mode = WiFi.status() == WL_CONNECTED
+        ? MainPage::NetworkMode::Wifi
+        : cellularModem.isConnected()
+            ? MainPage::NetworkMode::Cellular4G
+            : MainPage::NetworkMode::None;
+    if (mode == lastNetworkMode) return;
+    lastNetworkMode = mode;
+    const char *label = mode == MainPage::NetworkMode::Wifi ? "WiFi"
+        : mode == MainPage::NetworkMode::Cellular4G ? "4G" : "offline";
+    Serial.printf("[TOPBAR] Network icon=%s\n", label);
+    refreshNetworkTopbar(mode);
 }
 
 void updateClockPage() {
@@ -1420,11 +1348,12 @@ void handleTouch(TPoint point, TEvent event) {
             const int16_t deltaY = touchGestureLastY - touchGestureStartY;
             touchGestureActive = false;
             const bool poemPopupOpen = currentPage == PageId::Poem && PoemPage::isPopupOpen();
-            if ((poemPopupOpen || currentPage == PageId::Book ||
+            const bool isSwipe = (poemPopupOpen || currentPage == PageId::Book ||
                  currentPage == PageId::Voice || currentPage == PageId::Music ||
                  currentPage == PageId::Poem || currentPage == PageId::Word) &&
                 touchGestureStartY >= 32 &&
-                (abs(deltaX) >= 35 || abs(deltaY) >= 35)) {
+                 (abs(deltaX) >= 35 || abs(deltaY) >= 35);
+            if (isSwipe) {
                 Serial.printf("[TOUCH] SWIPE start=(%d,%d) end=(%d,%d) delta=(%d,%d)\n",
                               touchGestureStartX, touchGestureStartY,
                               touchGestureLastX, touchGestureLastY, deltaX, deltaY);
@@ -1450,6 +1379,7 @@ void handleTouch(TPoint point, TEvent event) {
                             refreshBookReaderControlPressed(control);
                         }
                         refreshBookReaderContent();
+                        releaseBookReaderControl(control);
                     } else if (currentPage == PageId::Book &&
                                BookPage::takeLibraryContentRefreshRequest()) {
                         int16_t selectedRowTop = 0;
@@ -1463,11 +1393,24 @@ void handleTouch(TPoint point, TEvent event) {
                         } else {
                             refreshBookLibraryContent();
                         }
-                        if (BookPage::processPendingBookOpen()) refreshCurrentPage();
+                        if (BookPage::preparePendingBookOpen()) {
+                            refreshCurrentPage();
+                            if (BookPage::processPendingBookOpen()) {
+                                refreshBookReaderContent();
+                            }
+                        }
                     } else {
                         refreshCurrentPage();
                     }
                 }
+            } else if (!homeTouchActive) {
+                // E-paper feedback can outlast the FT6336 Tap timing window.
+                // Dispatch a stationary release now; consume the driver's
+                // follow-up Tap if that event is emitted as well.
+                suppressDriverTap = true;
+                dispatchingSyntheticTap = true;
+                handleTouch(point, TEvent::Tap);
+                dispatchingSyntheticTap = false;
             }
         }
         touchWorkflowPriority = false;
@@ -1475,6 +1418,10 @@ void handleTouch(TPoint point, TEvent event) {
     }
     if (event != TEvent::Tap) return;
     touchWorkflowPriority = false;
+    if (suppressDriverTap && !dispatchingSyntheticTap) {
+        suppressDriverTap = false;
+        return;
+    }
     Serial.printf("[TOUCH] TAP raw=(%u,%u) mapped=(%d,%d) ui=(%d,%d)\n",
                   point.x, point.y, x, y, uiX, uiY);
 
@@ -1734,9 +1681,16 @@ void handleTouch(TPoint point, TEvent event) {
             if (control != BookPage::ReaderControl::None) {
                 refreshBookReaderControlPressed(control);
             }
-            if (BookPage::processPendingReaderBack()) refreshCurrentPage();
-            else if (BookPage::takeReaderContentRefreshRequest()) refreshBookReaderContent();
-            else if (BookPage::takeLibraryContentRefreshRequest()) {
+            if (BookPage::processPendingReaderBack()) {
+                refreshCurrentPage();
+            } else if (control == BookPage::ReaderControl::Previous ||
+                       control == BookPage::ReaderControl::Next) {
+                BookPage::takeReaderContentRefreshRequest();
+                refreshBookReaderContent();
+                releaseBookReaderControl(control);
+            } else if (BookPage::takeReaderContentRefreshRequest()) {
+                refreshBookReaderContent();
+            } else if (BookPage::takeLibraryContentRefreshRequest()) {
                 int16_t selectedRowTop = 0;
                 if (BookPage::pendingBookOpenRow(selectedRowTop)) {
                     BookPage::render(transitionFrame);
@@ -1748,7 +1702,12 @@ void handleTouch(TPoint point, TEvent event) {
                 } else {
                     refreshBookLibraryContent();
                 }
-                if (BookPage::processPendingBookOpen()) refreshCurrentPage();
+                if (BookPage::preparePendingBookOpen()) {
+                    refreshCurrentPage();
+                    if (BookPage::processPendingBookOpen()) {
+                        refreshBookReaderContent();
+                    }
+                }
             }
             else refreshCurrentPage();
         }
@@ -2004,6 +1963,9 @@ void processTouchAction() {
 
 }
 
+Ml307 cellularModem(Serial0, BoardPins::MODEM_RX, BoardPins::MODEM_TX,
+                    BoardPins::MODEM_PWR);
+
 void setup() {
     pinMode(BoardPins::WAKE, INPUT_PULLUP);
     const bool calibrationRequested = digitalRead(BoardPins::WAKE) == LOW;
@@ -2090,8 +2052,8 @@ void setup() {
     // Always establish a clean initial top bar. The runtime state monitor adds
     // Wi-Fi only after the Home frame is physically present and connectivity
     // has been observed in the normal event loop.
-    lastWifiConnected = false;
-    MainPage::setWifiConnected(false);
+    lastNetworkMode = MainPage::NetworkMode::None;
+    MainPage::setNetworkMode(MainPage::NetworkMode::None);
     MainPage::render(mainPageFrame);
     std::memcpy(transitionFrame, mainPageFrame, XingtaiEpd::FRAME_BYTES);
     Serial.println("[BOOT] Transitioning to main page...");
@@ -2151,7 +2113,6 @@ void loop() {
     if (currentPage == PageId::Word && WordPage::processAnimation()) {
         refreshWordStrokeWindow(false);
     }
-    processBookReaderMaintenance();
     int16_t marqueeTop = 0;
     if (VoicePage::advanceMarquee(marqueeTop) && currentPage == PageId::Voice) {
         VoicePage::renderMarquee(transitionFrame, frame);
@@ -2172,7 +2133,7 @@ void loop() {
         epaper.sleep();
     }
     updateNetworkPriority();
-    updateWifiTopbar();
+    updateNetworkTopbar();
     updateClockPage();
     delay(5);
 }

@@ -10,6 +10,7 @@
 
 #include "devices/audio/opus_player.h"
 #include "devices/epd_xingtai/epd_xingtai.h"
+#include "devices/ml307/ml307.h"
 #include "devices/es8311/es8311.h"
 #include "devices/sd_card/sd_card.h"
 #include "font/xiaozhi_font.h"
@@ -542,6 +543,7 @@ bool httpGet(const String &url, String &payload, uint32_t timeoutMs = 20000,
                   WiFi.localIP().toString().c_str(), WiFi.gatewayIP().toString().c_str(),
                   WiFi.dnsIP().toString().c_str(), static_cast<unsigned>(ESP.getFreeHeap()));
     if (WiFi.status() != WL_CONNECTED) {
+        if (cellularModem.httpGet(url.c_str(), payload, timeoutMs)) return true;
         std::strcpy(statusText, UiLocalization::isChinese() ? "网络未连接" : "WIFI NOT CONNECTED");
         Serial.println("[POEM] WiFi is not connected");
         return false;

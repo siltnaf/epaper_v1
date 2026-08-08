@@ -18,7 +18,7 @@
 
 namespace {
 
-bool wifiConnected = false;
+MainPage::NetworkMode networkMode = MainPage::NetworkMode::None;
 
 void pixel(uint8_t *frame, int x, int y) {
     if (x < 0 || x >= XingtaiEpd::WIDTH || y < 0 || y >= XingtaiEpd::HEIGHT) return;
@@ -33,13 +33,6 @@ void vline(uint8_t *frame, int x, int y, int height) {
     for (int i = 0; i < height; ++i) pixel(frame, x, y + i);
 }
 
-void solidFrame(uint8_t *frame, int x, int y, int width, int height) {
-    hline(frame, x, y, width);
-    hline(frame, x, y + height - 1, width);
-    vline(frame, x, y, height);
-    vline(frame, x + width - 1, y, height);
-}
-
 void roundedFrame(uint8_t *frame, int x, int y, int width, int height) {
     // A six-pixel radius gives the monochrome waveform enough connected pixels
     // around each bend. The previous sparse four-pixel corner could appear
@@ -50,8 +43,8 @@ void roundedFrame(uint8_t *frame, int x, int y, int width, int height) {
     vline(frame, x, y + radius, height - radius * 2);
     vline(frame, x + width - 1, y + radius, height - radius * 2);
 
-    constexpr uint8_t cornerX[] = {4, 3, 2, 1, 1};
-    constexpr uint8_t cornerY[] = {1, 1, 2, 3, 4};
+    constexpr uint8_t cornerX[] = {5, 4, 3, 2, 1, 1, 0};
+    constexpr uint8_t cornerY[] = {0, 1, 1, 2, 3, 4, 5};
     for (size_t index = 0; index < sizeof(cornerX); ++index) {
         const int dx = cornerX[index];
         const int dy = cornerY[index];
@@ -66,19 +59,23 @@ void roundedFrame(uint8_t *frame, int x, int y, int width, int height, bool bold
     roundedFrame(frame, x, y, width, height);
     if (!bold) return;
 
-    // The pressed outline must remain connected through every corner. Use
-    // solid rectangular runs here; sparse rounded corners can break up during
-    // a partial waveform refresh.
+    // Multiple connected rounded outlines create the pressed state. Each inset
+    // uses the same continuous corner path, avoiding the square appearance and
+    // the sparse corner gaps seen with the earlier outline.
     for (int inset = 0; inset <= 2; ++inset) {
-        solidFrame(frame, x + inset, y + inset, width - inset * 2, height - inset * 2);
+        roundedFrame(frame, x + inset, y + inset,
+                     width - inset * 2, height - inset * 2);
     }
 }
 
 void statusBar(uint8_t *frame) {
     // Keep the status area clean: no separator/bounding rule is drawn.
     Topbar::drawHome(frame, 4, 2);
-    // Wi-Fi belongs immediately to the left of the battery indicator.
-    if (wifiConnected) Topbar::drawWifi(frame, 181, 2);
+    if (networkMode == MainPage::NetworkMode::Wifi) {
+        Topbar::drawWifi(frame, 181, 2);
+    } else if (networkMode == MainPage::NetworkMode::Cellular4G) {
+        Topbar::draw4G(frame, 184, 2);
+    }
     Topbar::drawBattery(frame, 209, 2);
 }
 
@@ -108,8 +105,8 @@ void icon(uint8_t *frame, int x, int y, const uint8_t *bitmap, bool selected) {
 
 namespace MainPage {
 
-void setWifiConnected(bool connected) {
-    wifiConnected = connected;
+void setNetworkMode(NetworkMode mode) {
+    networkMode = mode;
 }
 
 void render(uint8_t *frame) {
