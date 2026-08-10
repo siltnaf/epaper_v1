@@ -17,7 +17,7 @@ void Ml307::begin() {
     delay(150);
     while (serial_.available() > 0) serial_.read();
     started_ = true;
-    Serial.printf("[ML307] UART started baud=%lu RX=GPIO%d TX=GPIO%d PWR=GPIO%d\n",
+    Serial.printf("[ML307] UART0 started baud=%lu RX=GPIO%d TX=GPIO%d PWR=GPIO%d\n",
                   static_cast<unsigned long>(baud_), rxPin_, txPin_, powerPin_);
 }
 
@@ -27,7 +27,12 @@ void Ml307::setPowered(bool powered) {
 
     digitalWrite(powerPin_, powered ? HIGH : LOW);
     powered_ = powered;
-    if (!powered) connected_ = false;
+    if (powered) {
+        poweredAtMs_ = millis();
+    } else {
+        poweredAtMs_ = 0;
+        connected_ = false;
+    }
     Serial.printf("[ML307] power=%s\n", powered ? "ON" : "OFF");
 }
 
@@ -35,6 +40,15 @@ bool Ml307::probeConnection() {
     if (!powered_) {
         connected_ = false;
         return false;
+    }
+
+    constexpr uint32_t MODEM_BOOT_SETTLE_MS = 5000;
+    const uint32_t poweredForMs = millis() - poweredAtMs_;
+    if (poweredForMs < MODEM_BOOT_SETTLE_MS) {
+        const uint32_t remainingMs = MODEM_BOOT_SETTLE_MS - poweredForMs;
+        Serial.printf("[ML307] Waiting %lu ms for modem startup\n",
+                      static_cast<unsigned long>(remainingMs));
+        vTaskDelay(pdMS_TO_TICKS(remainingMs));
     }
 
     String response;
@@ -45,19 +59,18 @@ bool Ml307::probeConnection() {
     }
 
     sendCommand("ATE0", 1000, response);
-    if (!sendCommand("AT+CPIN?", 3000, response)) {
-        connected_ = false;
-        Serial.println("[ML307] SIM query failed");
-        return false;
-    }
-    Serial.printf("[ML307] SIM=%s\n", simIsReady(response) ? "READY" : "NOT READY");
-    if (!simIsReady(response)) {
+    if (!waitForSimReady()) {
         connected_ = false;
         return false;
     }
 
     if (sendCommand("AT+CSQ", 3000, response)) {
         Serial.printf("[ML307] signal=%s\n", response.c_str());
+    }
+
+    if (!waitForNetworkRegistration()) {
+        connected_ = false;
+        return false;
     }
 
     response = "";
@@ -73,6 +86,63 @@ bool Ml307::probeConnection() {
     connected_ = ready;
     Serial.printf("[ML307] modem=AT OK network=%s\n", ready ? "READY" : "NOT READY");
     return ready;
+}
+
+bool Ml307::waitForSimReady() {
+    String response;
+    for (int attempt = 1; attempt <= 10 && powered_; ++attempt) {
+        const bool commandOk = sendCommand("AT+CPIN?", 3000, response);
+        if (simIsReady(response)) {
+            Serial.println("[ML307] SIM=READY");
+            return true;
+        }
+
+        if (response.indexOf("+CME ERROR: 10") >= 0 ||
+            response.indexOf("SIM not inserted") >= 0) {
+            Serial.println("[ML307] SIM not inserted or not detected");
+            return false;
+        }
+
+        String status = response;
+        status.replace("\r", "");
+        status.replace("\n", " ");
+        status.trim();
+        Serial.printf("[ML307] SIM not ready attempt=%d/10 response=%s%s\n",
+                      attempt, status.length() ? status.c_str() : "<timeout>",
+                      commandOk ? "" : " (command failed)");
+        if (attempt < 10) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+    return false;
+}
+
+bool Ml307::waitForNetworkRegistration() {
+    String response;
+    if (!sendCommand("AT+CEREG=2", 3000, response)) {
+        Serial.println("[ML307] Could not enable LTE registration reports");
+        return false;
+    }
+
+    for (int attempt = 1; attempt <= 15 && powered_; ++attempt) {
+        if (!sendCommand("AT+CEREG?", 3000, response)) {
+            Serial.printf("[ML307] LTE registration query failed attempt=%d/15\n", attempt);
+        } else {
+            const int state = registrationState(response, "+CEREG:");
+            Serial.printf("[ML307] LTE registration=%d (%s) attempt=%d/15\n",
+                          state, registrationStateName(state), attempt);
+            if (state == 1 || state == 5) {
+                sendCommand("AT+COPS?", 3000, response);
+                return true;
+            }
+            if (state == 3) {
+                Serial.println("[ML307] Network registration denied by operator");
+                return false;
+            }
+        }
+        if (attempt < 15) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    Serial.println("[ML307] Timed out waiting for SIM network registration");
+    return false;
 }
 
 bool Ml307::isPowered() const {
@@ -193,6 +263,7 @@ bool Ml307::sendCommand(const char *command, uint32_t timeoutMs, String &respons
     Serial.printf("[ML307] >> %s\n", command);
     serial_.print(command);
     serial_.print("\r\n");
+    serial_.flush();
     response = readResponse(timeoutMs, "OK", "ERROR");
 
     String monitorResponse = response;
@@ -204,12 +275,52 @@ bool Ml307::sendCommand(const char *command, uint32_t timeoutMs, String &respons
 }
 
 bool Ml307::mipCallIsActive(const String &response) {
-    return response.indexOf("+MIPCALL:") >= 0 &&
-           (response.indexOf(",1") >= 0 || response.indexOf(": 1") >= 0);
+    const int marker = response.indexOf("+MIPCALL:");
+    if (marker < 0) return false;
+    const int colon = response.indexOf(':', marker);
+    const int firstComma = response.indexOf(',', colon + 1);
+    if (colon < 0 || firstComma < 0) return false;
+    const int secondComma = response.indexOf(',', firstComma + 1);
+    const int lineEnd = response.indexOf('\n', firstComma + 1);
+    String state = response.substring(firstComma + 1,
+        secondComma >= 0 ? secondComma : lineEnd >= 0 ? lineEnd : response.length());
+    state.trim();
+    return state == "1";
 }
 
 bool Ml307::simIsReady(const String &response) {
-    return response.indexOf("READY") >= 0;
+    return response.indexOf("+CPIN: READY") >= 0;
+}
+
+int Ml307::registrationState(const String &response, const char *prefix) {
+    const int marker = response.indexOf(prefix);
+    if (marker < 0) return -1;
+    const int colon = response.indexOf(':', marker);
+    if (colon < 0) return -1;
+    const int lineEnd = response.indexOf('\n', colon + 1);
+    String fields = response.substring(colon + 1, lineEnd >= 0 ? lineEnd : response.length());
+    fields.trim();
+    const int comma = fields.indexOf(',');
+    if (comma >= 0) {
+        fields = fields.substring(comma + 1);
+        const int nextComma = fields.indexOf(',');
+        if (nextComma >= 0) fields = fields.substring(0, nextComma);
+    }
+    fields.trim();
+    if (fields.length() != 1 || fields[0] < '0' || fields[0] > '9') return -1;
+    return fields[0] - '0';
+}
+
+const char *Ml307::registrationStateName(int state) {
+    switch (state) {
+    case 0: return "not registered";
+    case 1: return "home network";
+    case 2: return "searching";
+    case 3: return "denied";
+    case 4: return "unknown";
+    case 5: return "roaming";
+    default: return "invalid response";
+    }
 }
 
 void Ml307::appendHex(String &out, const char *data, size_t length) {

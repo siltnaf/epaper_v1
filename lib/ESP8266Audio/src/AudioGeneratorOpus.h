@@ -34,6 +34,7 @@ class AudioGeneratorOpus : public AudioGenerator
     virtual bool loop() override;
     virtual bool stop() override;
     virtual bool isRunning() override;
+    int getLastError() const { return lastError; }
 
   protected:
     // Opus callbacks, need static functions to bounce into C++ from C
@@ -64,6 +65,7 @@ class AudioGeneratorOpus : public AudioGenerator
     int16_t *buff;
     uint32_t buffPtr;
     uint32_t buffLen;
+    int lastError;
 };
 
 #endif

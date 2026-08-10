@@ -39,9 +39,15 @@ constexpr int I2C_SCL = 12;
 constexpr int I2C_SDA = 13;
 
 // Audio
+// R23 was removed; wire the ES8311-side/lower R23 pad (AUDIO_CE) to GPIO34.
+// Driving CE high selects the codec's 7-bit I2C address 0x19.
+constexpr int AUDIO_CE = 34;
 constexpr int PA_EN = 35;
 constexpr int TOUCH_INT = 36;
 constexpr int TOUCH_PWR = 37;
+// These net names are from the ES8311 side, not the ESP32 side:
+// AUDIO_DOUT is ES8311 ASDOUT -> ESP32 I2S RX/DIN (recording).
+// AUDIO_DIN is ESP32 I2S TX/DOUT -> ES8311 DSDIN (playback).
 constexpr int AUDIO_DOUT = 38;
 constexpr int AUDIO_LRCLK = 39;
 constexpr int AUDIO_SCLK = 40;

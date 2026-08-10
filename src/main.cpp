@@ -36,7 +36,8 @@ FT6X36 touch(&Wire, BoardPins::TOUCH_INT);
 Es8311 audio(
     Wire,
     {BoardPins::AUDIO_MCLK, BoardPins::AUDIO_SCLK, BoardPins::AUDIO_LRCLK,
-     BoardPins::AUDIO_DOUT, BoardPins::AUDIO_DIN, BoardPins::PA_EN, -1});
+     BoardPins::AUDIO_DIN, BoardPins::AUDIO_DOUT, BoardPins::AUDIO_CE,
+     BoardPins::PA_EN, -1});
 
 namespace {
 
@@ -89,6 +90,8 @@ bool initialFt6x36Present = false;
 SettingsPage::State settingsState = {true, true, 60, 0};
 MainPage::NetworkMode lastNetworkMode = MainPage::NetworkMode::None;
 volatile bool cellularProbeRunning = false;
+TaskHandle_t audioTestTaskHandle = nullptr;
+volatile bool audioTestStopRequested = false;
 uint32_t wifiPriorityStartedMs = 0;
 uint32_t lastWifiReconnectAttemptMs = 0;
 constexpr uint32_t WIFI_PRIORITY_TIMEOUT_MS = 15000;
@@ -129,6 +132,7 @@ bool homeTouchActive = false;
 
 void recoverSharedI2c();
 void refreshCurrentPage();
+void refreshCurrentRegion(uint16_t x, uint16_t y, uint16_t width, uint16_t height);
 void refreshBookReaderContent();
 void refreshBookLibraryContent();
 void wipeContentAreaWhite(bool sleepAfter = true);
@@ -463,7 +467,67 @@ void applyAudioSetting() {
     Serial.printf("[SETTINGS] Audio volume %u%%\n", settingsState.volumePercent);
 }
 
+void audioTestTask(void *) {
+    constexpr uint32_t sampleRate = Es8311::DEFAULT_SAMPLE_RATE;
+    constexpr uint32_t frequency = 880;
+    constexpr size_t frameCount = 256;
+    constexpr float amplitude = 12000.0f;
+    int16_t samples[frameCount * 2] = {};
+    float phase = 0.0f;
+    const float phaseStep = 2.0f * PI * frequency / sampleRate;
+
+    pinMode(BoardPins::PA_EN, OUTPUT);
+    digitalWrite(BoardPins::PA_EN, HIGH);
+    audio.setSpeakerEnabled(true);
+    vTaskDelay(pdMS_TO_TICKS(60));
+    Serial.printf("[AUDIO TEST] Continuous beep started PA_EN=%d level=%d\n",
+                  BoardPins::PA_EN, digitalRead(BoardPins::PA_EN));
+
+    while (!audioTestStopRequested) {
+        for (size_t frame = 0; frame < frameCount; ++frame) {
+            const int16_t sample = static_cast<int16_t>(sinf(phase) * amplitude);
+            samples[frame * 2] = sample;
+            samples[frame * 2 + 1] = sample;
+            phase += phaseStep;
+            if (phase >= 2.0f * PI) phase -= 2.0f * PI;
+        }
+        if (audio.write(samples, frameCount * 2, 500) != frameCount * 2) {
+            Serial.println("[AUDIO TEST] Continuous PCM write failed");
+            break;
+        }
+    }
+
+    std::memset(samples, 0, sizeof(samples));
+    audio.write(samples, frameCount * 2, 500);
+    audio.setSpeakerEnabled(false);
+    digitalWrite(BoardPins::PA_EN, LOW);
+    Serial.printf("[AUDIO TEST] Continuous beep stopped PA_EN=%d level=%d\n",
+                  BoardPins::PA_EN, digitalRead(BoardPins::PA_EN));
+    // The beep may end through the normal toggle or an error exit; either way
+    // the settings page must drop the bold highlight on the test button.
+    SettingsPage::setAudioTestActive(false);
+    audioTestTaskHandle = nullptr;
+    vTaskDelete(nullptr);
+}
+
 void playAudioTestBeep() {
+    if (audioTestTaskHandle) {
+        audioTestStopRequested = true;
+        const uint32_t started = millis();
+        while (audioTestTaskHandle && millis() - started < 1500) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        Serial.println(audioTestTaskHandle
+                           ? "[AUDIO TEST] Stop timed out"
+                           : "[AUDIO TEST] Continuous beep toggled off");
+        // The beep task clears the active flag on exit; repaint the settings
+        // test-button row so the label is no longer bold.
+        if (!audioTestTaskHandle && currentPage == PageId::Settings) {
+            refreshCurrentRegion(16, 58 + 7 * 44, 208, 40);
+        }
+        return;
+    }
+
     if (!audio.isInitialized() || settingsState.volumePercent == 0) {
         Serial.println("[AUDIO TEST] Codec unavailable or volume is muted");
         return;
@@ -471,26 +535,20 @@ void playAudioTestBeep() {
 
     OpusPlayer::stop();
     audio.setOutputVolume(settingsState.volumePercent);
-    audio.setSpeakerEnabled(true);
-    constexpr uint32_t sampleRate = Es8311::DEFAULT_SAMPLE_RATE;
-    constexpr uint32_t frequency = 880;
-    constexpr size_t sampleCount = sampleRate / 4;
-    constexpr size_t chunkSamples = 256;
-    int16_t samples[chunkSamples] = {};
-    for (size_t offset = 0; offset < sampleCount; offset += chunkSamples) {
-        const size_t count = min(chunkSamples, sampleCount - offset);
-        for (size_t i = 0; i < count; ++i) {
-            const float phase = 2.0f * PI * frequency * (offset + i) / sampleRate;
-            samples[i] = static_cast<int16_t>(sinf(phase) * 9000.0f);
-        }
-        if (audio.write(samples, count, 500) != count) {
-            Serial.println("[AUDIO TEST] Short PCM write");
-            break;
-        }
+    audioTestStopRequested = false;
+    if (xTaskCreatePinnedToCore(audioTestTask, "audio-test", 4096, nullptr, 2,
+                                &audioTestTaskHandle, 0) != pdPASS) {
+        audioTestTaskHandle = nullptr;
+        Serial.println("[AUDIO TEST] Could not create continuous beep task");
+        return;
     }
-    std::memset(samples, 0, sizeof(samples));
-    audio.write(samples, chunkSamples, 500);
-    Serial.printf("[AUDIO TEST] Beep played at %u%% volume\n", settingsState.volumePercent);
+    SettingsPage::setAudioTestActive(true);
+    if (currentPage == PageId::Settings) {
+        // Bold the settings test button while the beep is playing.
+        refreshCurrentRegion(16, 58 + 7 * 44, 208, 40);
+    }
+    Serial.printf("[AUDIO TEST] Continuous beep toggled on at %u%% volume\n",
+                  settingsState.volumePercent);
 }
 
 void loadSettings() {
@@ -1801,6 +1859,14 @@ void powerTouch() {
 }
 
 void beginSharedI2c() {
+    // R23 is removed, so assert the externally wired ES8311 CE before any I2C
+    // transaction. CE high selects the only codec address used here: 0x19.
+    pinMode(BoardPins::AUDIO_CE, OUTPUT);
+    audio.setChipEnabled(true);
+    delay(10);
+    Serial.printf("[AUDIO] ES8311 CE GPIO=%d level=%d address=0x%02X\n",
+                  BoardPins::AUDIO_CE, digitalRead(BoardPins::AUDIO_CE),
+                  Es8311::DEFAULT_ADDRESS);
     Wire.begin(BoardPins::I2C_SDA, BoardPins::I2C_SCL, 100000);
     Wire.setTimeOut(50);
     Serial.printf("[I2C] Shared bus SDA=%d SCL=%d clock=%lu Hz\n",
@@ -1811,11 +1877,10 @@ void beginSharedI2c() {
         Wire.beginTransmission(address);
         if (Wire.endTransmission() == 0) {
             Serial.printf("[I2C] Device found at 0x%02X%s%s\n", address,
-                          (address == Es8311::DEFAULT_ADDRESS || address == Es8311::ALTERNATE_ADDRESS)
-                              ? " (ES8311)" : "",
+                          address == Es8311::DEFAULT_ADDRESS ? " (ES8311)" : "",
                           address == FT6X36_ADDR ? " (FT6X36)" : "");
             ++count;
-            if (address == Es8311::DEFAULT_ADDRESS || address == Es8311::ALTERNATE_ADDRESS) {
+            if (address == Es8311::DEFAULT_ADDRESS) {
                 initialEs8311Present = true;
                 initialEs8311Address = address;
             }
@@ -1856,11 +1921,28 @@ bool beginAudio() {
         audio.setMicrophoneGain(30);
     }
     Serial.printf("[AUDIO] ES8311 address=0x%02X online=%s initialized=%s sample_rate=%lu "
-                  "MCLK=%d SCLK=%d LRCLK=%d DOUT=%d DIN=%d PA=%d\n",
+                  "MCLK=%d SCLK=%d LRCLK=%d ESP_TX=%d ESP_RX=%d PA=%d\n",
                   audio.address(), audio.isOnline() ? "yes" : "no",
                   initialized ? "yes" : "no", audio.sampleRate(),
                   BoardPins::AUDIO_MCLK, BoardPins::AUDIO_SCLK, BoardPins::AUDIO_LRCLK,
-                  BoardPins::AUDIO_DOUT, BoardPins::AUDIO_DIN, BoardPins::PA_EN);
+                  BoardPins::AUDIO_DIN, BoardPins::AUDIO_DOUT, BoardPins::PA_EN);
+    if (initialized) {
+        // Verify the codec init took effect: all clocks enabled (reg01=0x3F),
+        // DAC powered (reg12=0x00), output driver enabled (reg13=0x10).
+        uint8_t codecVersion = 0;
+        uint8_t reg01 = 0;
+        uint8_t reg12 = 0;
+        uint8_t reg13 = 0;
+        uint8_t dacVolume = 0;
+        audio.readRegister(0xFF, codecVersion);
+        audio.readRegister(0x01, reg01);
+        audio.readRegister(0x12, reg12);
+        audio.readRegister(0x13, reg13);
+        audio.readRegister(0x32, dacVolume);
+        Serial.printf("[AUDIO] Codec ver=0x%02X reg01=0x%02X reg12=0x%02X reg13=0x%02X "
+                      "dacVol=0x%02X\n",
+                      codecVersion, reg01, reg12, reg13, dacVolume);
+    }
     return initialized;
 }
 
@@ -1963,6 +2045,7 @@ void processTouchAction() {
 
 }
 
+// GPIO43/GPIO44 are the board's UART0 route to the ML307.
 Ml307 cellularModem(Serial0, BoardPins::MODEM_RX, BoardPins::MODEM_TX,
                     BoardPins::MODEM_PWR);
 

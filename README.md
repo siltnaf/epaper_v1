@@ -88,10 +88,14 @@ short and the e-paper refresh does not run in the driver's event dispatch.
 
 The ES8311 codec driver is implemented locally in
 `include/devices/es8311/es8311.h` and `src/devices/es8311/es8311.cpp`. It uses
-the same SDA GPIO13/SCL GPIO12 I2C bus as the FT6336. The driver auto-detects
-the two ES8311 7-bit addresses, `0x18` and `0x19`; this PCB responds at `0x19`.
+the same SDA GPIO13/SCL GPIO12 I2C bus as the FT6336. The ES8311's CE pin
+selects its 7-bit I2C address (CE low → `0x18`, CE high → `0x19`). With R23
+removed, wire the ES8311-side/lower R23 pad (`AUDIO_CE`) to GPIO34; firmware
+drives GPIO34 high before the first codec probe and uses address `0x19` only.
+Do not connect GPIO34 to the upper R23 pad, because that pad is `CODEC3.3V`.
 The ESP32-S3 is the I2S master at 16 kHz/16-bit with MCLK GPIO42, BCLK GPIO40,
-LRCLK GPIO39, codec input GPIO38, codec output GPIO41, and amplifier enable
+LRCLK GPIO39, ESP32 playback TX GPIO41 (`AUDIO_DIN`/ES8311 `DSDIN`), ESP32
+recording RX GPIO38 (`AUDIO_DOUT`/ES8311 `ASDOUT`), and amplifier enable
 GPIO35. Startup scans the shared bus before initializing either device and
 prints all responding addresses to the serial monitor.
 
@@ -105,7 +109,7 @@ enable net is `CODEC_PWR`. That net has a 100 kΩ pull-down but is not connected
 to an ESP32 GPIO in the supplied schematic or pin spreadsheet. The driver
 supports an optional `Pins::powerEnable` GPIO, but on the current PCB
 `CODEC_PWR` must first be electrically tied high (or routed to a GPIO) before
-the codec can acknowledge address `0x18`.
+the codec can acknowledge address `0x19`.
 
 ## Project structure
 

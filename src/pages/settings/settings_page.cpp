@@ -10,6 +10,7 @@ namespace {
 
 SettingsPage::State state = {true, true, 60, 0};
 bool sdMounted = false;
+bool audioTestActive = false;
 
 enum class View : uint8_t { Settings, Scanning, Networks, Password, Sd, ContentUrl, Voices };
 enum class Keyboard : uint8_t { Lowercase, Uppercase, Symbols };
@@ -230,10 +231,19 @@ void clippedText(uint8_t *frame, int x, int y, const char *value, int maxCharact
     text(frame, x, y, clipped, scale);
 }
 
-void button(uint8_t *frame, int x, int y, int width, int height, const char *label) {
+void button(uint8_t *frame, int x, int y, int width, int height, const char *label,
+            bool bold = false) {
     rect(frame, x, y, width, height);
-    text(frame, x + (width - textWidth(label, 1)) / 2, y + (height - BasicFont::ENGLISH_HEIGHT) / 2,
-         label, 1);
+    if (bold) {
+        // A second inset outline thickens the frame so the running test stands
+        // out on the monochrome panel, matching the active/pressed look used by
+        // the home icons.
+        rect(frame, x + 1, y + 1, width - 2, height - 2);
+    }
+    const int labelX = x + (width - textWidth(label, 1)) / 2;
+    const int labelY = y + (height - BasicFont::ENGLISH_HEIGHT) / 2;
+    if (bold) text(frame, labelX + 1, labelY, label, 1);  // offset pass fakes bold
+    text(frame, labelX, labelY, label, 1);
 }
 
 void renderSettings(uint8_t *frame) {
@@ -285,7 +295,7 @@ void renderSettings(uint8_t *frame) {
 
     rect(frame, 16, rowY(7), 208, rowHeight);
     text(frame, 28, rowY(7) + 13, cn ? "声音测试" : "AUDIO TEST", cn ? 1 : 2);
-    button(frame, 164, rowY(7) + 4, 52, 32, cn ? "测试" : "TEST");
+    button(frame, 164, rowY(7) + 4, 52, 32, cn ? "测试" : "TEST", audioTestActive);
 }
 
 void renderVoices(uint8_t *frame) {
@@ -511,6 +521,8 @@ uint8_t voiceIndexAt(int16_t x, int16_t y) {
 }
 
 void setSdMounted(bool mounted) { sdMounted = mounted; }
+
+void setAudioTestActive(bool active) { audioTestActive = active; }
 
 void showSdPage(const char names[][33], const bool directories[], uint8_t count) {
     sdCount = count > 8 ? 8 : count;

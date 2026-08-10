@@ -46,6 +46,7 @@ enum class Action : uint8_t {
 void render(uint8_t *frame);
 void setState(const State &state);
 void setSdMounted(bool mounted);
+void setAudioTestActive(bool active);
 void showSdPage(const char names[][33], const bool directories[], uint8_t count);
 void setFormatPending(bool pending);
 void showSettings();

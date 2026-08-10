@@ -18,8 +18,12 @@ public:
 private:
     String readResponse(uint32_t timeoutMs, const char *tokenA, const char *tokenB);
     bool sendCommand(const char *command, uint32_t timeoutMs, String &response);
+    bool waitForSimReady();
+    bool waitForNetworkRegistration();
     static bool mipCallIsActive(const String &response);
     static bool simIsReady(const String &response);
+    static int registrationState(const String &response, const char *prefix);
+    static const char *registrationStateName(int state);
     static void appendHex(String &out, const char *data, size_t length);
     static int hexValue(char value);
     static bool extractContentHex(const String &line, String &hex);
@@ -32,6 +36,7 @@ private:
     volatile bool powered_ = false;
     volatile bool connected_ = false;
     bool started_ = false;
+    uint32_t poweredAtMs_ = 0;
 };
 
 extern Ml307 cellularModem;

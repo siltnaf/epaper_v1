@@ -6,8 +6,8 @@
 
 class Es8311 {
 public:
-    static constexpr uint8_t DEFAULT_ADDRESS = 0x18; // 7-bit I2C address
-    static constexpr uint8_t ALTERNATE_ADDRESS = 0x19;
+    // CE pin pulled high on this board selects the 0x19 7-bit I2C address.
+    static constexpr uint8_t DEFAULT_ADDRESS = 0x19;
     static constexpr uint32_t DEFAULT_SAMPLE_RATE = 16000;
 
     struct Pins {
@@ -16,6 +16,7 @@ public:
         int lrclk;
         int dout;
         int din;
+        int chipEnable;
         int paEnable;
         int powerEnable;
     };
@@ -35,6 +36,7 @@ public:
     bool setOutputVolume(uint8_t percent);
     bool setMicrophoneGain(uint8_t gainDb);
     void setSpeakerEnabled(bool enabled);
+    void setChipEnabled(bool enabled);
     void setPowerEnabled(bool enabled);
 
     size_t write(const int16_t *samples, size_t sampleCount, uint32_t timeoutMs = 1000);

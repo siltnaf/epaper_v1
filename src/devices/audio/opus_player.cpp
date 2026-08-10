@@ -4,6 +4,7 @@
 #include <AudioGeneratorOpus.h>
 #include <AudioOutput.h>
 #include <SD_MMC.h>
+#include <esp_heap_caps.h>
 
 #include "board_pins.h"
 #include "devices/es8311/es8311.h"
@@ -135,6 +136,10 @@ void playbackTask(void *) {
     vTaskDelay(pdMS_TO_TICKS(60));
     Serial.printf("[AUDIO PA] NS4150B enabled PA_EN=%d level=%d\n",
                   BoardPins::PA_EN, digitalRead(BoardPins::PA_EN));
+    Serial.printf("[OPUS] Heap before open free=%u largest=%u stack_free=%u\n",
+                  static_cast<unsigned>(ESP.getFreeHeap()),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
+                  static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
 
     source = new AudioFileSourceFS(SD_MMC, requestedPath);
     decoder = new AudioGeneratorOpus();
@@ -145,7 +150,14 @@ void playbackTask(void *) {
         started = decoder->begin(source, output);
     }
     if (!started) {
-        Serial.printf("[OPUS] Decoder begin failed path=%s\n", requestedPath);
+        Serial.printf("[OPUS] Decoder begin failed path=%s bytes=%u open=%s error=%d "
+                      "heap_free=%u largest=%u stack_free=%u\n",
+                      requestedPath, source ? source->getSize() : 0,
+                      source && source->isOpen() ? "yes" : "no",
+                      decoder ? decoder->getLastError() : 0,
+                      static_cast<unsigned>(ESP.getFreeHeap()),
+                      static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
+                      static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
     } else {
         Serial.printf("[OPUS] Playback started path=%s bytes=%u source=48000Hz output=16000Hz stack=%u\n",
                       requestedPath, source->getSize(),
@@ -191,7 +203,10 @@ bool play(const char *path) {
     requestedPath[sizeof(requestedPath) - 1] = '\0';
     stopRequested = false;
     playbackActive = true;
-    if (xTaskCreatePinnedToCore(playbackTask, "opus-playback", 32768, nullptr, 2,
+    // A 32 KiB task stack consumed about half the available internal heap before
+    // opusfile could allocate its decoder state. Opus decoding uses less than
+    // this 16 KiB stack; the high-water mark is logged for live verification.
+    if (xTaskCreatePinnedToCore(playbackTask, "opus-playback", 16384, nullptr, 2,
                                 &playbackTaskHandle, 0) != pdPASS) {
         playbackActive = false;
         playbackTaskHandle = nullptr;

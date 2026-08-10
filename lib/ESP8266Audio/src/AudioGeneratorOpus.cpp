@@ -27,6 +27,7 @@ AudioGeneratorOpus::AudioGeneratorOpus()
   buffPtr = 0;
   buffLen = 0;
   running = false;
+  lastError = 0;
 }
 
 AudioGeneratorOpus::~AudioGeneratorOpus()
@@ -41,8 +42,12 @@ AudioGeneratorOpus::~AudioGeneratorOpus()
 
 bool AudioGeneratorOpus::begin(AudioFileSource *source, AudioOutput *output)
 {
+  lastError = 0;
   buff = (int16_t*)malloc(OPUS_BUFF * sizeof(int16_t));
-  if (!buff) return false;
+  if (!buff) {
+    lastError = OP_EFAULT;
+    return false;
+  }
 
   if (!source) return false;
   file = source;
@@ -50,7 +55,9 @@ bool AudioGeneratorOpus::begin(AudioFileSource *source, AudioOutput *output)
   this->output = output;
   if (!file->isOpen()) return false; // Error
 
-  of = op_open_callbacks((void*)this, &cb, nullptr, 0, nullptr);
+  int openError = 0;
+  of = op_open_callbacks((void*)this, &cb, nullptr, 0, &openError);
+  lastError = openError;
   if (!of) return false;
 
   prev_li = -1;
@@ -123,12 +130,21 @@ bool AudioGeneratorOpus::isRunning()
 int AudioGeneratorOpus::read_cb(unsigned char *_ptr, int _nbytes) {
   if (_nbytes == 0) return 0;
   _nbytes = file->read(_ptr, _nbytes);
-  if (_nbytes == 0) return -1;
+  // opusfile uses 0 for normal EOF; negative values mean an I/O error.
+  if (_nbytes == 0) return 0;
   return _nbytes;
 }
 
 int AudioGeneratorOpus::seek_cb(opus_int64 _offset, int _whence) {
-  if (!file->seek((int32_t)_offset, _whence)) return -1;
+  // AudioFileSourceFS ultimately uses Arduino File::seek(uint32_t,...), so
+  // forwarding a negative SEEK_CUR/SEEK_END offset wraps to a huge unsigned
+  // value. Resolve every request to a checked absolute offset instead.
+  opus_int64 target = _offset;
+  if (_whence == SEEK_CUR) target += file->getPos();
+  else if (_whence == SEEK_END) target += file->getSize();
+  else if (_whence != SEEK_SET) return -1;
+  if (target < 0 || target > file->getSize() || target > INT32_MAX) return -1;
+  if (!file->seek(static_cast<int32_t>(target), SEEK_SET)) return -1;
   return 0;
 }
 

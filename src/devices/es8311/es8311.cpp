@@ -33,7 +33,7 @@ constexpr uint8_t REG_ADC_18 = 0x18;
 constexpr uint8_t REG_ADC_19 = 0x19;
 constexpr uint8_t REG_ADC_1A = 0x1A;
 constexpr uint8_t REG_ADC_1B = 0x1B;
-constexpr uint8_t REG_ADC_VOLUME = 0x1C;
+constexpr uint8_t REG_ADC_1C = 0x1C;
 constexpr uint8_t REG_DAC_31 = 0x31;
 constexpr uint8_t REG_DAC_VOLUME = 0x32;
 constexpr uint8_t REG_DAC_33 = 0x33;
@@ -56,6 +56,12 @@ bool Es8311::begin(uint32_t sampleRate) {
     end();
     _sampleRate = sampleRate;
 
+    if (_pins.chipEnable >= 0) {
+        pinMode(_pins.chipEnable, OUTPUT);
+        // CE high selects the board's intended 7-bit I2C address, 0x19.
+        setChipEnabled(true);
+        delay(10);
+    }
     if (_pins.powerEnable >= 0) {
         pinMode(_pins.powerEnable, OUTPUT);
         setPowerEnabled(true);
@@ -65,10 +71,6 @@ bool Es8311::begin(uint32_t sampleRate) {
     setSpeakerEnabled(false);
 
     _online = probe(_address);
-    if (!_online && _address == DEFAULT_ADDRESS && probe(ALTERNATE_ADDRESS)) {
-        _address = ALTERNATE_ADDRESS;
-        _online = true;
-    }
     if (!_online) return false;
     if (!configureI2s()) return false;
     if (!configureCodec()) {
@@ -137,31 +139,55 @@ bool Es8311::configureI2s() {
 }
 
 bool Es8311::configureCodec() {
-    // Slave-mode, 16-bit standard I2S, MCLK = sample rate * 256. This is the
-    // common ES8311 full-duplex initialization sequence used by ESP32 boards.
-    if (!writeRegister(REG_RESET, 0x3F)) return false;
-    delay(10);
+    // Slave-mode, 16-bit standard I2S, MCLK = sample rate * 256. The register
+    // sequence below follows the Espressif esp-bsp/esp-adf es8311 driver init
+    // (reference project d:/project/epaper_s3/reference6/esp-bsp/components/es8311),
+    // the proven full-duplex configuration used on ESP32-S3 boards. In
+    // particular 0x12=0x00 powers up the DAC and 0x13=0x10 enables the output
+    // to the headphone/line driver; without these the codec stays silent.
+    if (!writeRegister(REG_RESET, 0x1F)) return false; // reset digital/csm/clk mgr
+    delay(20);
     if (!writeRegister(REG_RESET, 0x00)) return false;
     delay(10);
+    if (!writeRegister(REG_RESET, 0x80)) return false; // power-on command
 
     const RegisterValue sequence[] = {
-        {REG_CLK_MANAGER_01, 0x30}, {REG_CLK_MANAGER_02, 0x00},
-        {REG_CLK_MANAGER_03, 0x10}, {REG_CLK_MANAGER_04, 0x10},
-        {REG_CLK_MANAGER_05, 0x00}, {REG_CLK_MANAGER_06, 0x03},
-        {REG_CLK_MANAGER_07, 0x00}, {REG_CLK_MANAGER_08, 0xFF},
-        {REG_SDP_IN, 0x0C},         {REG_SDP_OUT, 0x0C},
-        {REG_SYSTEM_0B, 0x00},      {REG_SYSTEM_0C, 0x00},
-        {REG_SYSTEM_0D, 0x01},      {REG_SYSTEM_0E, 0x02},
-        {REG_SYSTEM_0F, 0x00},      {REG_SYSTEM_10, 0x1F},
-        {REG_SYSTEM_11, 0x7F},      {REG_SYSTEM_12, 0x28},
-        {REG_SYSTEM_13, 0x00},      {REG_SYSTEM_14, 0x00},
-        {REG_ADC_15, 0x40},         {REG_ADC_16, 0x1F},
-        {REG_ADC_17, 0xBF},         {REG_ADC_18, 0x03},
-        {REG_ADC_19, 0x00},         {REG_ADC_1A, 0x33},
-        {REG_ADC_1B, 0x0A},         {REG_ADC_VOLUME, 0xBF},
-        {REG_DAC_31, 0x00},         {REG_DAC_VOLUME, 0xBF},
-        {REG_DAC_33, 0x10},         {REG_DAC_34, 0x10},
-        {REG_DAC_35, 0x00},         {REG_DAC_37, 0x08},
+        {REG_CLK_MANAGER_01, 0x3F}, // enable all codec clocks
+        {REG_CLK_MANAGER_02, 0x00}, // MCLK from MCLK pin, 256*fs, pre-divider 1
+        {REG_CLK_MANAGER_03, 0x10}, // ADC single-speed mode + OSR
+        // Espressif's proven 4.096 MHz MCLK / 16 kHz coefficient uses DAC OSR
+        // 0x20 (epaper_test/components/esp_codec_dev/device/es8311/es8311.c).
+        {REG_CLK_MANAGER_04, 0x20},
+        {REG_CLK_MANAGER_05, 0x00}, // ADC/DAC clock divider
+        {REG_CLK_MANAGER_06, 0x03}, // BCLK divider (4.096 MHz -> 512 kHz @16k)
+        {REG_CLK_MANAGER_07, 0x00}, // LRCK divider high
+        {REG_CLK_MANAGER_08, 0xFF}, // LRCK divider low
+        {REG_SDP_IN, 0x0C},         // I2S format, 16-bit
+        {REG_SDP_OUT, 0x0C},
+        {REG_SYSTEM_0B, 0x00},
+        {REG_SYSTEM_0C, 0x00},
+        {REG_SYSTEM_0D, 0x01},      // power up analog circuitry
+        {REG_SYSTEM_0E, 0x02},      // enable analog PGA + ADC modulator
+        {REG_SYSTEM_0F, 0x00},
+        {REG_SYSTEM_10, 0x1F},
+        {REG_SYSTEM_11, 0x7F},
+        {REG_SYSTEM_12, 0x00},      // power up DAC
+        {REG_SYSTEM_13, 0x10},      // enable output to HP/line driver
+        {REG_SYSTEM_14, 0x1A},      // analog MIC, max PGA gain
+        {REG_ADC_15, 0x40},
+        {REG_ADC_16, 0x1F},
+        {REG_ADC_17, 0xBF},         // ADC volume
+        {REG_ADC_18, 0x03},
+        {REG_ADC_19, 0x00},
+        {REG_ADC_1A, 0x33},
+        {REG_ADC_1B, 0x0A},
+        {REG_ADC_1C, 0x6A},         // ADC EQ bypass, cancel DC offset in digital domain
+        {REG_DAC_31, 0x00},         // DAC unmute
+        {REG_DAC_VOLUME, 0xBF},     // DAC volume (overridden by setOutputVolume)
+        {REG_DAC_33, 0x10},
+        {REG_DAC_34, 0x10},
+        {REG_DAC_35, 0x00},
+        {REG_DAC_37, 0x08},         // bypass DAC equalizer
     };
     return writeSequence(sequence, sizeof(sequence) / sizeof(sequence[0]));
 }
@@ -182,6 +208,11 @@ bool Es8311::setMicrophoneGain(uint8_t gainDb) {
 void Es8311::setSpeakerEnabled(bool enabled) {
     if (_pins.paEnable < 0) return;
     digitalWrite(_pins.paEnable, enabled ? HIGH : LOW);
+}
+
+void Es8311::setChipEnabled(bool enabled) {
+    if (_pins.chipEnable < 0) return;
+    digitalWrite(_pins.chipEnable, enabled ? HIGH : LOW);
 }
 
 void Es8311::setPowerEnabled(bool enabled) {
