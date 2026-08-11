@@ -112,6 +112,21 @@ void boldRect(uint8_t *frame, int x, int y, int width, int height) {
     if (width > 2 && height > 2) rect(frame, x + 1, y + 1, width - 2, height - 2);
 }
 
+void invertRect(uint8_t *frame, int x, int y, int width, int height) {
+    if (!frame || width <= 0 || height <= 0) return;
+    const int left = max(0, x);
+    const int top = max(0, y);
+    const int right = min<int>(XingtaiEpd::WIDTH, x + width);
+    const int bottom = min<int>(XingtaiEpd::HEIGHT, y + height);
+    constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
+    for (int pixelY = top; pixelY < bottom; ++pixelY) {
+        uint8_t *row = frame + static_cast<size_t>(pixelY) * rowBytes;
+        for (int pixelX = left; pixelX < right; ++pixelX) {
+            row[pixelX / 8] ^= 0x80U >> (pixelX % 8);
+        }
+    }
+}
+
 bool pointInRect(int16_t x, int16_t y, int left, int top, int width, int height) {
     return x >= left && x < left + width && y >= top && y < top + height;
 }
@@ -357,6 +372,7 @@ bool saveBookToSd(int32_t bookId, const char *title, const char *author,
 
 bool loadBookFromSd(const BookItem &book) {
     if (!SdCard::isMounted() || book.id <= 0) return false;
+    const uint32_t loadStarted = millis();
     char directory[40] = {};
     snprintf(directory, sizeof(directory), "%s/%ld", BOOK_SD_FOLDER, static_cast<long>(book.id));
     char metaPath[64] = {};
@@ -378,15 +394,22 @@ bool loadBookFromSd(const BookItem &book) {
     copyUtf8(selectedTitle, sizeof(selectedTitle), title.c_str(), book.title);
     copyUtf8(selectedAuthor, sizeof(selectedAuthor), author.c_str(), "");
     copyUtf8(selectedCategory, sizeof(selectedCategory), category.c_str(), "");
+    const uint32_t contentReadStarted = millis();
     selectedContent = contentFile.readString();
     contentFile.close();
+    const uint32_t contentReadMs = millis() - contentReadStarted;
     if (selectedContent.isEmpty()) return false;
     selectedBookId = book.id;
     readerPage = 0;
+    const uint32_t paginationStarted = millis();
     updateReaderPagination();
+    const uint32_t paginationMs = millis() - paginationStarted;
     view = View::Reader;
-    Serial.printf("[BOOK SD] Loaded id=%ld bytes=%u from %s\n",
-                  static_cast<long>(book.id), selectedContent.length(), directory);
+    Serial.printf("[BOOK SD] Loaded id=%ld bytes=%u read=%lums paginate=%lums total=%lums from %s\n",
+                  static_cast<long>(book.id), selectedContent.length(),
+                  static_cast<unsigned long>(contentReadMs),
+                  static_cast<unsigned long>(paginationMs),
+                  static_cast<unsigned long>(millis() - loadStarted), directory);
     return true;
 }
 
@@ -565,6 +588,7 @@ int matchingBrace(const String &json, int start) {
 }
 
 bool loadLibrary(bool showLoading = true) {
+    OptionalLoadingScope loadingIndicator(showLoading);
     bookCount = 0;
     String payload;
     bool remoteLoaded = false;
@@ -671,6 +695,7 @@ void libraryLoadTask(void *) {
 }
 
 bool loadBook(const BookItem &book) {
+    UiLoadingIndicator::Scope loadingIndicator;
     // A saved/local book must never fall through to the network. The list marks
     // it from the same /book/<id> SD cache used by loadBookFromSd().
     if (book.saved) {
@@ -756,14 +781,14 @@ void renderLibrary(uint8_t *frame) {
     }
     for (uint8_t index = 0; index < bookCount; ++index) {
         const int top = LIST_TOP + index * (ROW_HEIGHT + ROW_GAP);
-        if (index == selectedLibraryIndex) boldRect(frame, 12, top, 216, ROW_HEIGHT);
-        else rect(frame, 12, top, 216, ROW_HEIGHT);
+        rect(frame, 12, top, 216, ROW_HEIGHT);
         char number[8] = {};
         snprintf(number, sizeof(number), "%u", static_cast<unsigned>((libraryPage - 1) * ITEMS_PER_PAGE + index + 1));
         UiLocalization::drawText(frame, 18, top + 9, number, 1);
         drawUtf8Title(frame, 34, top + 1, 171, ROW_HEIGHT - 2, books[index].title);
         if (books[index].saved) drawCheckmark(frame, 215, top + ROW_HEIGHT / 2);
         else drawArrow(frame, 215, top + ROW_HEIGHT / 2, true);
+        if (index == selectedLibraryIndex) invertRect(frame, 12, top, 216, ROW_HEIGHT);
     }
 }
 
@@ -931,25 +956,39 @@ bool handleTap(int16_t x, int16_t y) {
         return false;
     }
 
-    if (pointInRect(x, y, 8, 38, 50, 26)) {
+    // Keep the visible Return button unchanged while making its touch target
+    // easier to hit around the top-left edge of the reader.
+    if (pointInRect(x, y, 0, 32, 70, 40)) {
         readerControlPress = ReaderControl::Back;
         pendingReaderBack = true;
         return true;
     }
-    if (pointInRect(x, y, 8, 386, 34, 24)) {
+    // Use a larger invisible target around the small bottom-edge button. The
+    // visible 34x24 frame is retained, but taps near it are easier to register.
+    if (pointInRect(x, y, 0, 374, 60, 42)) {
         readerControlPress = ReaderControl::Previous;
         if (readerPage > 0) {
             --readerPage;
             readerContentRefreshRequested = true;
+            Serial.printf("[BOOK] Reader previous page=%d/%d\n",
+                          readerPage + 1, readerPageCount());
         } else {
-            pendingReaderBack = true;
+            Serial.printf("[BOOK] Reader already at first page 1/%d\n",
+                          readerPageCount());
         }
         return true;
     }
-    if (pointInRect(x, y, 198, 386, 34, 24) && readerPage + 1 < readerPageCount()) {
+    if (pointInRect(x, y, 180, 374, 60, 42)) {
         readerControlPress = ReaderControl::Next;
-        ++readerPage;
-        readerContentRefreshRequested = true;
+        if (readerPage + 1 < readerPageCount()) {
+            ++readerPage;
+            readerContentRefreshRequested = true;
+            Serial.printf("[BOOK] Reader next page=%d/%d\n",
+                          readerPage + 1, readerPageCount());
+        } else {
+            Serial.printf("[BOOK] Reader already at last page %d/%d\n",
+                          readerPage + 1, readerPageCount());
+        }
         return true;
     }
     return false;
@@ -965,8 +1004,15 @@ bool processPendingReaderBack() {
     if (!pendingReaderBack) return false;
     pendingReaderBack = false;
     view = View::Library;
+    selectedLibraryIndex = -1;
+    pendingBookOpenIndex = -1;
+    readerControlPress = ReaderControl::None;
     readerContentRefreshRequested = false;
     libraryContentRefreshRequested = false;
+    selectedContent = "";
+    readerPage = 0;
+    Serial.printf("[BOOK] Return to booklist page=%ld items=%u\n",
+                  static_cast<long>(libraryPage), bookCount);
     return true;
 }
 
@@ -974,13 +1020,13 @@ void renderReaderControlPressed(uint8_t *frame, ReaderControl control) {
     renderReader(frame);
     switch (control) {
     case ReaderControl::Back:
-        boldRect(frame, 8, 38, 50, 26);
+        invertRect(frame, 8, 38, 50, 26);
         break;
     case ReaderControl::Previous:
-        boldRect(frame, 8, 386, 34, 24);
+        invertRect(frame, 8, 386, 34, 24);
         break;
     case ReaderControl::Next:
-        boldRect(frame, 198, 386, 34, 24);
+        invertRect(frame, 198, 386, 34, 24);
         break;
     default:
         break;
@@ -1051,6 +1097,11 @@ bool pendingBookOpenRow(int16_t &top) {
     if (pendingBookOpenIndex < 0 || pendingBookOpenIndex >= bookCount) return false;
     top = static_cast<int16_t>(LIST_TOP + pendingBookOpenIndex * (ROW_HEIGHT + ROW_GAP));
     return true;
+}
+
+bool pendingBookOpenIsLocal() {
+    return pendingBookOpenIndex >= 0 && pendingBookOpenIndex < bookCount &&
+           books[static_cast<uint8_t>(pendingBookOpenIndex)].saved;
 }
 
 bool preparePendingBookOpen() {

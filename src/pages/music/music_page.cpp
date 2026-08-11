@@ -107,6 +107,17 @@ void boldRect(uint8_t *frame, int x, int y, int width, int height) {
     if (width > 2 && height > 2) rect(frame, x + 1, y + 1, width - 2, height - 2);
 }
 
+void invertRect(uint8_t *frame, int x, int y, int width, int height) {
+    if (!frame || width <= 0 || height <= 0) return;
+    constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
+    for (int pixelY = y; pixelY < y + height; ++pixelY) {
+        uint8_t *row = frame + static_cast<size_t>(pixelY) * rowBytes;
+        for (int pixelX = x; pixelX < x + width; ++pixelX) {
+            row[pixelX / 8] ^= 0x80U >> (pixelX % 8);
+        }
+    }
+}
+
 bool pointInRect(int16_t x, int16_t y, int left, int top, int width, int height) {
     return x >= left && x < left + width && y >= top && y < top + height;
 }
@@ -347,15 +358,7 @@ bool cachedSongPath(int32_t songId, char *path, size_t pathSize) {
     if (!path || pathSize == 0 || songId <= 0 || !SdCard::isMounted()) return false;
     snprintf(path, pathSize, "%s/%ld/song.opus", MUSIC_SD_FOLDER,
              static_cast<long>(songId));
-    if (!SD_MMC.exists(path)) return false;
-    File file = SD_MMC.open(path, FILE_READ);
-    uint8_t header[4] = {};
-    const size_t bytes = file ? file.read(header, sizeof(header)) : 0;
-    const size_t size = file ? file.size() : 0;
-    if (file) file.close();
-    if (bytes == sizeof(header) && size >= 1024 && std::memcmp(header, "OggS", 4) == 0) {
-        return true;
-    }
+    if (SdCard::isValidOggOpus(path)) return true;
     SD_MMC.remove(path);
     return false;
 }
@@ -371,61 +374,14 @@ bool ensureSongDirectory(int32_t songId, char *directory, size_t directorySize) 
 bool downloadSong(const String &url, const char *path) {
     if (!path || WiFi.status() != WL_CONNECTED || !SdCard::isMounted()) return false;
     UiLoadingIndicator::Scope loadingIndicator;
-    HTTPClient http;
-    http.setConnectTimeout(10000);
-    http.setTimeout(65000);
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    http.setReuse(false);
-    WiFiClient plainClient;
-    WiFiClientSecure secureClient;
-    secureClient.setInsecure();
-    const bool began = url.startsWith("https://")
-        ? http.begin(secureClient, url) : http.begin(plainClient, url);
-    if (!began) return false;
-    http.addHeader("Connection", "close");
-    const int code = http.GET();
-    if (code < 200 || code >= 300) {
-        Serial.printf("[MUSIC AUDIO] HTTP %d url=%s\n", code, url.c_str());
-        http.end();
+    if (!SdCard::downloadFile(url.c_str(), path, 1024) || !SdCard::isValidOggOpus(path)) {
+        SD_MMC.remove(path);
+        Serial.printf("[MUSIC AUDIO] Invalid or incomplete Ogg Opus download path=%s\n", path);
         return false;
     }
-
-    char temporaryPath[144] = {};
-    snprintf(temporaryPath, sizeof(temporaryPath), "%s.part", path);
-    SD_MMC.remove(temporaryPath);
-    File output = SD_MMC.open(temporaryPath, FILE_WRITE);
-    if (!output) { http.end(); return false; }
-    WiFiClient *stream = http.getStreamPtr();
-    uint8_t buffer[2048] = {};
-    size_t total = 0;
-    uint32_t lastDataMs = millis();
-    while (http.connected() || stream->available()) {
-        const size_t available = stream->available();
-        if (available > 0) {
-            const size_t requested = min(available, sizeof(buffer));
-            const int received = stream->readBytes(buffer, requested);
-            if (received <= 0 || output.write(buffer, received) != static_cast<size_t>(received)) {
-                output.close();
-                http.end();
-                SD_MMC.remove(temporaryPath);
-                return false;
-            }
-            total += received;
-            lastDataMs = millis();
-        } else {
-            if (millis() - lastDataMs > 15000) break;
-            delay(2);
-        }
-    }
-    output.flush();
-    output.close();
-    http.end();
-    if (total < 1024) { SD_MMC.remove(temporaryPath); return false; }
-    SD_MMC.remove(path);
-    if (!SD_MMC.rename(temporaryPath, path)) {
-        SD_MMC.remove(temporaryPath);
-        return false;
-    }
+    File file = SD_MMC.open(path, FILE_READ);
+    const size_t total = file ? file.size() : 0;
+    if (file) file.close();
     Serial.printf("[MUSIC AUDIO] download complete bytes=%u path=%s\n", total, path);
     return true;
 }
@@ -477,6 +433,7 @@ bool ensureSongOpus(uint8_t index, char *path, size_t pathSize) {
 
 bool startSongAudio() {
     if (activeSongIndex < 0 || activeSongIndex >= static_cast<int8_t>(songCount)) return false;
+    UiLoadingIndicator::Scope loadingIndicator;
     char path[128] = {};
     if (!ensureSongOpus(static_cast<uint8_t>(activeSongIndex), path, sizeof(path))) return false;
     musicPlaying = OpusPlayer::play(path);
@@ -535,6 +492,7 @@ bool loadSavedSongs() {
 }
 
 bool loadLibrary(bool showLoading = true) {
+    OptionalLoadingScope loadingIndicator(showLoading);
     OpusPlayer::stop();
     musicPlaying = false;
     pendingAudioStart = false;
@@ -621,8 +579,7 @@ void renderLibrary(uint8_t *frame) {
     }
     for (uint8_t index = 0; index < songCount; ++index) {
         const int top = LIST_TOP + index * (ROW_HEIGHT + ROW_GAP);
-        if (index == activeSongIndex || index == selectedIndex) boldRect(frame, 12, top, 216, ROW_HEIGHT);
-        else rect(frame, 12, top, 216, ROW_HEIGHT);
+        rect(frame, 12, top, 216, ROW_HEIGHT);
         char number[8] = {};
         snprintf(number, sizeof(number), "%u",
                  static_cast<unsigned>((libraryPage - 1) * ITEMS_PER_PAGE + index + 1));
@@ -633,6 +590,9 @@ void renderLibrary(uint8_t *frame) {
             if (!marqueeReady) captureMarquee(frame, top);
         } else if (songs[index].saved) drawCheckmark(frame, 215, top + ROW_HEIGHT / 2);
         else drawArrow(frame, 215, top + ROW_HEIGHT / 2, true);
+        if (index == activeSongIndex || index == selectedIndex) {
+            invertRect(frame, 12, top, 216, ROW_HEIGHT);
+        }
     }
 }
 
@@ -751,8 +711,16 @@ bool isAudioActive() {
 }
 
 void stopAudioFromTouchInterrupt() {
+    const int8_t interruptedIndex = activeSongIndex;
     markDirtyRow(activeSongIndex);
-    stopAudio();
+    pendingAudioStart = false;
+    OpusPlayer::stop();
+    musicPlaying = false;
+    // Keep the interrupted row identity until handleTap() receives coordinates.
+    activeSongIndex = interruptedIndex;
+    selectedIndex = interruptedIndex;
+    marqueeReady = false;
+    marqueeOffset = 0;
 }
 
 void stopAudio() {
@@ -788,13 +756,21 @@ void renderMarquee(uint8_t *destination, const uint8_t *currentFrame) {
     std::memcpy(destination, currentFrame, XingtaiEpd::FRAME_BYTES);
     if (activeSongIndex < 0 || !marqueeReady) return;
     const int top = LIST_TOP + activeSongIndex * (ROW_HEIGHT + ROW_GAP);
-    clearFrameArea(destination, MARQUEE_X, top + MARQUEE_Y_OFFSET,
-                   MARQUEE_WIDTH, MARQUEE_HEIGHT);
+    for (int y = top + MARQUEE_Y_OFFSET;
+         y < top + MARQUEE_Y_OFFSET + MARQUEE_HEIGHT; ++y) {
+        for (int x = MARQUEE_X; x < MARQUEE_X + MARQUEE_WIDTH; ++x) {
+            destination[static_cast<size_t>(y) * (XingtaiEpd::WIDTH / 8) + x / 8] |=
+                0x80U >> (x % 8);
+        }
+    }
     for (int y = 0; y < MARQUEE_HEIGHT; ++y) {
         for (int x = 0; x < MARQUEE_WIDTH; ++x) {
             const int sourceX = (x + marqueeOffset) % MARQUEE_WIDTH;
             if (marqueePixel(sourceX, y)) {
-                pixel(destination, MARQUEE_X + x, top + MARQUEE_Y_OFFSET + y);
+                const int drawX = MARQUEE_X + x;
+                const int drawY = top + MARQUEE_Y_OFFSET + y;
+                destination[static_cast<size_t>(drawY) * (XingtaiEpd::WIDTH / 8) + drawX / 8] &=
+                    static_cast<uint8_t>(~(0x80U >> (drawX % 8)));
             }
         }
     }

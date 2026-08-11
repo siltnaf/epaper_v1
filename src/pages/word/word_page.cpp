@@ -521,6 +521,7 @@ bool loadOfflinePage() {
 }
 
 bool loadPage(bool showLoading = true) {
+    OptionalLoadingScope loadingIndicator(showLoading);
     itemCount = 0;
     selectedIndex = -1;
     totalItems = 0;
@@ -694,6 +695,7 @@ bool parseStrokeData(const String &payload) {
 }
 
 bool loadStrokeData(WordItem &item) {
+    UiLoadingIndicator::Scope loadingIndicator;
     strokeCount = 0;
     const char *cursor = item.word;
     uint32_t codepoint = 0;
@@ -754,6 +756,7 @@ void safeVoiceName(char *output, size_t size) {
 
 bool playPronunciation() {
     if (selectedIndex < 0 || selectedIndex >= itemCount || !SdCard::isMounted()) return false;
+    UiLoadingIndicator::Scope loadingIndicator;
     const WordItem &item = items[selectedIndex];
     char voice[32] = {};
     safeVoiceName(voice, sizeof(voice));
@@ -936,6 +939,8 @@ bool takeLibraryLoadCompleted() {
     libraryLoadCompleted = false;
     return true;
 }
+
+bool isDetail() { return selectedIndex >= 0; }
 
 bool handleTap(int16_t x, int16_t y) {
     if (animationActive) animationActive = false;

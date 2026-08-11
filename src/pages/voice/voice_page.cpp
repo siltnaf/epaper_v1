@@ -125,6 +125,17 @@ void boldRect(uint8_t *frame, int x, int y, int width, int height) {
     if (width > 2 && height > 2) rect(frame, x + 1, y + 1, width - 2, height - 2);
 }
 
+void invertRect(uint8_t *frame, int x, int y, int width, int height) {
+    if (!frame || width <= 0 || height <= 0) return;
+    constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
+    for (int pixelY = y; pixelY < y + height; ++pixelY) {
+        uint8_t *row = frame + static_cast<size_t>(pixelY) * rowBytes;
+        for (int pixelX = x; pixelX < x + width; ++pixelX) {
+            row[pixelX / 8] ^= 0x80U >> (pixelX % 8);
+        }
+    }
+}
+
 bool pointInRect(int16_t x, int16_t y, int left, int top, int width, int height) {
     return x >= left && x < left + width && y >= top && y < top + height;
 }
@@ -617,15 +628,7 @@ bool cachedOpusPath(int32_t storyId, char *path, size_t pathSize) {
     safeVoiceName(voice, sizeof(voice));
     snprintf(path, pathSize, "%s/%ld/tts_%s.opus", STORY_SD_FOLDER,
              static_cast<long>(storyId), voice);
-    if (!SD_MMC.exists(path)) return false;
-    File file = SD_MMC.open(path, FILE_READ);
-    uint8_t header[4] = {};
-    const size_t bytes = file ? file.read(header, sizeof(header)) : 0;
-    const size_t size = file ? file.size() : 0;
-    if (file) file.close();
-    if (bytes == sizeof(header) && size >= 1024 && std::memcmp(header, "OggS", 4) == 0) {
-        return true;
-    }
+    if (SdCard::isValidOggOpus(path)) return true;
     SD_MMC.remove(path);
     return false;
 }
@@ -633,71 +636,14 @@ bool cachedOpusPath(int32_t storyId, char *path, size_t pathSize) {
 bool downloadFile(const String &url, const char *path) {
     if (!path || !SdCard::isMounted() || WiFi.status() != WL_CONNECTED) return false;
     UiLoadingIndicator::Scope loadingIndicator;
-    HTTPClient http;
-    http.setConnectTimeout(10000);
-    // Arduino HTTPClient stores this timeout as uint16_t. Keep the socket read
-    // timeout at its valid maximum; the outer transfer loop still allows the
-    // complete TTS download to run for as long as data continues arriving.
-    http.setTimeout(65000);
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    http.setReuse(false);
-    WiFiClient plainClient;
-    WiFiClientSecure secureClient;
-    secureClient.setInsecure();
-    const bool began = url.startsWith("https://")
-        ? http.begin(secureClient, url)
-        : http.begin(plainClient, url);
-    if (!began) return false;
-    http.addHeader("Connection", "close");
-    const int code = http.GET();
-    if (code < 200 || code >= 300) {
-        Serial.printf("[STORY TTS] Opus HTTP %d url=%s\n", code, url.c_str());
-        http.end();
+    if (!SdCard::downloadFile(url.c_str(), path, 1024) || !SdCard::isValidOggOpus(path)) {
+        SD_MMC.remove(path);
+        Serial.printf("[STORY TTS] Invalid or incomplete Ogg Opus download path=%s\n", path);
         return false;
     }
-
-    char temporaryPath[112] = {};
-    snprintf(temporaryPath, sizeof(temporaryPath), "%s.part", path);
-    SD_MMC.remove(temporaryPath);
-    File output = SD_MMC.open(temporaryPath, FILE_WRITE);
-    if (!output) {
-        http.end();
-        return false;
-    }
-    WiFiClient *stream = http.getStreamPtr();
-    uint8_t buffer[2048] = {};
-    size_t total = 0;
-    uint32_t lastDataMs = millis();
-    while (http.connected() || stream->available()) {
-        const size_t available = stream->available();
-        if (available > 0) {
-            const size_t requested = min(available, sizeof(buffer));
-            const int received = stream->readBytes(buffer, requested);
-            if (received <= 0 || output.write(buffer, received) != static_cast<size_t>(received)) {
-                output.close();
-                http.end();
-                SD_MMC.remove(temporaryPath);
-                return false;
-            }
-            total += received;
-            lastDataMs = millis();
-        } else {
-            if (millis() - lastDataMs > 15000) break;
-            delay(2);
-        }
-    }
-    output.flush();
-    output.close();
-    http.end();
-    if (total < 1024) {
-        SD_MMC.remove(temporaryPath);
-        return false;
-    }
-    SD_MMC.remove(path);
-    if (!SD_MMC.rename(temporaryPath, path)) {
-        SD_MMC.remove(temporaryPath);
-        return false;
-    }
+    File file = SD_MMC.open(path, FILE_READ);
+    const size_t total = file ? file.size() : 0;
+    if (file) file.close();
     Serial.printf("[STORY TTS] Opus download complete bytes=%u path=%s\n", total, path);
     return true;
 }
@@ -745,6 +691,7 @@ bool ensureStoryOpus(char *path, size_t pathSize) {
 }
 
 bool startStoryAudio() {
+    UiLoadingIndicator::Scope loadingIndicator;
     char path[96] = {};
     if (!ensureStoryOpus(path, sizeof(path))) {
         storyPlaying = false;
@@ -816,6 +763,7 @@ int matchingBrace(const String &json, int start) {
 }
 
 bool loadLibrary(bool showLoading = true) {
+    OptionalLoadingScope loadingIndicator(showLoading);
     storyCount = 0;
     String payload;
     bool remoteLoaded = false;
@@ -920,6 +868,7 @@ void libraryLoadTask(void *) {
 }
 
 bool loadStory(const StoryItem &story) {
+    UiLoadingIndicator::Scope loadingIndicator;
     if (loadStoryFromSd(story)) return true;
 
     String payload;
@@ -995,8 +944,7 @@ void renderLibrary(uint8_t *frame) {
     }
     for (uint8_t index = 0; index < storyCount; ++index) {
         const int top = LIST_TOP + index * (ROW_HEIGHT + ROW_GAP);
-        if (index == activeStoryIndex) boldRect(frame, 12, top, 216, ROW_HEIGHT);
-        else rect(frame, 12, top, 216, ROW_HEIGHT);
+        rect(frame, 12, top, 216, ROW_HEIGHT);
         char number[8] = {};
         snprintf(number, sizeof(number), "%u", static_cast<unsigned>((libraryPage - 1) * ITEMS_PER_PAGE + index + 1));
         UiLocalization::drawText(frame, 18, top + 9, number, 1);
@@ -1006,6 +954,7 @@ void renderLibrary(uint8_t *frame) {
             if (!marqueeReady) captureMarquee(frame, top);
         } else if (stories[index].saved) drawCheckmark(frame, 215, top + ROW_HEIGHT / 2);
         else drawArrow(frame, 215, top + ROW_HEIGHT / 2, true);
+        if (index == activeStoryIndex) invertRect(frame, 12, top, 216, ROW_HEIGHT);
     }
 }
 
@@ -1170,8 +1119,16 @@ bool isAudioActive() {
 }
 
 void stopAudioFromTouchInterrupt() {
+    const int8_t interruptedIndex = activeStoryIndex;
     markDirtyRow(activeStoryIndex);
-    stopAudio();
+    pendingAudioStart = false;
+    OpusPlayer::stop();
+    storyPlaying = false;
+    // Preserve the row until the coordinate-bearing Tap is routed. handleTap()
+    // can then keep the same row stopped or immediately switch to another row.
+    activeStoryIndex = interruptedIndex;
+    marqueeReady = false;
+    marqueeOffset = 0;
     std::strcpy(audioStatus, UiLocalization::isChinese() ? "已停止" : "STOPPED");
 }
 
@@ -1198,11 +1155,28 @@ void renderMarquee(uint8_t *destination, const uint8_t *currentFrame) {
     std::memcpy(destination, currentFrame, XingtaiEpd::FRAME_BYTES);
     if (activeStoryIndex < 0 || !marqueeReady) return;
     const int top = LIST_TOP + activeStoryIndex * (ROW_HEIGHT + ROW_GAP);
-    clearFrameArea(destination, MARQUEE_X, top + 1, MARQUEE_WIDTH, MARQUEE_HEIGHT);
+    if (activeStoryIndex >= 0) {
+        for (int y = top + 1; y < top + 1 + MARQUEE_HEIGHT; ++y) {
+            for (int x = MARQUEE_X; x < MARQUEE_X + MARQUEE_WIDTH; ++x) {
+                destination[static_cast<size_t>(y) * (XingtaiEpd::WIDTH / 8) + x / 8] |=
+                    0x80U >> (x % 8);
+            }
+        }
+    } else {
+        clearFrameArea(destination, MARQUEE_X, top + 1, MARQUEE_WIDTH, MARQUEE_HEIGHT);
+    }
     for (int y = 0; y < MARQUEE_HEIGHT; ++y) {
         for (int x = 0; x < MARQUEE_WIDTH; ++x) {
             const int sourceX = (x + marqueeOffset) % MARQUEE_WIDTH;
-            if (marqueePixel(sourceX, y)) pixel(destination, MARQUEE_X + x, top + 1 + y);
+            if (marqueePixel(sourceX, y)) {
+                if (activeStoryIndex >= 0) {
+                    destination[static_cast<size_t>(top + 1 + y) *
+                               (XingtaiEpd::WIDTH / 8) + (MARQUEE_X + x) / 8] &=
+                        static_cast<uint8_t>(~(0x80U >> ((MARQUEE_X + x) % 8)));
+                } else {
+                    pixel(destination, MARQUEE_X + x, top + 1 + y);
+                }
+            }
         }
     }
 }

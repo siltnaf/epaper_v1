@@ -10,6 +10,7 @@
 #include <cstring>
 
 #include "board_pins.h"
+#include "ui/loading_indicator.h"
 
 namespace SdCard {
 
@@ -17,8 +18,30 @@ bool isMounted() {
     return SD_MMC.cardType() != CARD_NONE;
 }
 
+bool isValidOggOpus(const char *path, uint32_t minimumBytes) {
+    if (!path || !isMounted() || !SD_MMC.exists(path)) return false;
+    File file = SD_MMC.open(path, FILE_READ);
+    uint8_t header[128] = {};
+    const size_t bytes = file ? file.read(header, sizeof(header)) : 0;
+    const uint32_t size = file ? static_cast<uint32_t>(file.size()) : 0;
+    if (file) file.close();
+
+    // Validate the first complete Ogg BOS page, not merely the leading "OggS".
+    // The old manual HTTP copy could drop bytes 14..22 while preserving OggS
+    // and OpusHead, allowing a structurally corrupt cache to pass a 4-byte test.
+    if (size < minimumBytes || bytes < 47 || std::memcmp(header, "OggS", 4) != 0 ||
+        header[4] != 0 || (header[5] & 0x02) == 0) {
+        return false;
+    }
+    const uint8_t segmentCount = header[26];
+    if (segmentCount == 0 || static_cast<size_t>(27 + segmentCount + 8) > bytes) return false;
+    const size_t packetOffset = 27 + segmentCount;
+    return std::memcmp(header + packetOffset, "OpusHead", 8) == 0;
+}
+
 bool downloadFile(const char *url, const char *path, uint32_t minimumBytes) {
     if (!url || !path || !isMounted() || WiFi.status() != WL_CONNECTED) return false;
+    UiLoadingIndicator::Scope loadingIndicator;
 
     const String destination(path);
     const int slash = destination.lastIndexOf('/');
@@ -40,10 +63,12 @@ bool downloadFile(const char *url, const char *path, uint32_t minimumBytes) {
 
     HTTPClient http;
     http.setConnectTimeout(10000);
-    http.setTimeout(45000);
+    // HTTPClient stores this as uint16_t; use the valid maximum for individual
+    // socket reads while the transfer loop enforces its own idle/total limits.
+    http.setTimeout(65000);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     http.setReuse(false);
-    http.setUserAgent("ESP32-ePaper-XiaozhiFont/1.0");
+    http.setUserAgent("ESP32-ePaper-Asset/1.0");
     WiFiClient plainClient;
     WiFiClientSecure secureClient;
     secureClient.setInsecure();
@@ -59,8 +84,71 @@ bool downloadFile(const char *url, const char *path, uint32_t minimumBytes) {
     Serial.printf("[SD] Downloading %s to %s\n", url, destination.c_str());
     const int responseCode = http.GET();
     int written = -1;
+    int expectedBytes = -1;
+    bool transferComplete = false;
+    const uint32_t transferStartedMs = millis();
     if (responseCode >= 200 && responseCode < 300) {
-        written = http.writeToStream(&output);
+        expectedBytes = http.getSize();
+        WiFiClient *stream = http.getStreamPtr();
+        uint8_t buffer[2048] = {};
+        written = 0;
+        uint32_t lastDataMs = millis();
+        uint32_t nextProgressMs = lastDataMs + 5000;
+        constexpr uint32_t idleTimeoutMs = 20000;
+        constexpr uint32_t totalTimeoutMs = 180000;
+
+        while ((expectedBytes < 0 && (http.connected() || stream->available())) ||
+               (expectedBytes >= 0 && written < expectedBytes)) {
+            const uint32_t now = millis();
+            if (now - transferStartedMs >= totalTimeoutMs) {
+                Serial.printf("[SD] Download total timeout at %d/%d bytes\n",
+                              written, expectedBytes);
+                break;
+            }
+            const int available = stream->available();
+            if (available > 0) {
+                const size_t requested = min<size_t>(static_cast<size_t>(available),
+                                                     sizeof(buffer));
+                const int received = stream->read(buffer, requested);
+                if (received <= 0 ||
+                    output.write(buffer, static_cast<size_t>(received)) !=
+                        static_cast<size_t>(received)) {
+                    Serial.printf("[SD] Download stream/write error received=%d written=%d\n",
+                                  received, written);
+                    break;
+                }
+                written += received;
+                lastDataMs = millis();
+            } else {
+                if (!http.connected()) {
+                    Serial.printf("[SD] Download connection closed at %d/%d bytes\n",
+                                  written, expectedBytes);
+                    break;
+                }
+                if (now - lastDataMs >= idleTimeoutMs) {
+                    Serial.printf("[SD] Download idle timeout at %d/%d bytes after %lums\n",
+                                  written, expectedBytes,
+                                  static_cast<unsigned long>(now - lastDataMs));
+                    break;
+                }
+                delay(2);
+            }
+
+            const uint32_t progressNow = millis();
+            if (static_cast<int32_t>(progressNow - nextProgressMs) >= 0) {
+                const uint32_t elapsed = progressNow - transferStartedMs;
+                const uint32_t bytesPerSecond = elapsed > 0
+                    ? static_cast<uint32_t>((static_cast<uint64_t>(written) * 1000ULL) / elapsed)
+                    : 0;
+                Serial.printf("[SD] Download progress %d/%d bytes (%lu B/s)\n",
+                              written, expectedBytes,
+                              static_cast<unsigned long>(bytesPerSecond));
+                nextProgressMs = progressNow + 5000;
+            }
+            delay(1);
+        }
+        transferComplete = written >= static_cast<int>(minimumBytes) &&
+                           (expectedBytes < 0 || written == expectedBytes);
     }
     output.flush();
     output.close();
@@ -69,9 +157,12 @@ bool downloadFile(const char *url, const char *path, uint32_t minimumBytes) {
     File downloaded = SD_MMC.open(temporary, FILE_READ);
     const uint32_t actualBytes = downloaded ? static_cast<uint32_t>(downloaded.size()) : 0;
     if (downloaded) downloaded.close();
-    if (responseCode < 200 || responseCode >= 300 || written < 0 || actualBytes < minimumBytes) {
-        Serial.printf("[SD] Download failed http=%d written=%d size=%lu\n",
-                      responseCode, written, static_cast<unsigned long>(actualBytes));
+    if (responseCode < 200 || responseCode >= 300 || !transferComplete ||
+        actualBytes < minimumBytes) {
+        Serial.printf("[SD] Download failed http=%d written=%d expected=%d size=%lu elapsed=%lums\n",
+                      responseCode, written, expectedBytes,
+                      static_cast<unsigned long>(actualBytes),
+                      static_cast<unsigned long>(millis() - transferStartedMs));
         SD_MMC.remove(temporary);
         return false;
     }

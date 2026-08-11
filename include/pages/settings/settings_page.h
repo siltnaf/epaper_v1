@@ -40,6 +40,7 @@ enum class Action : uint8_t {
     UrlSpace,
     UrlChangeKeyboard,
     UrlSave,
+    UrlClear,
     UrlCancel,
 };
 

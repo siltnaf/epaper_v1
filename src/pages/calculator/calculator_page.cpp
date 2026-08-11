@@ -31,6 +31,7 @@ char expression[48] = "0";
 double storedValue = 0.0;
 char pendingOperator = 0;
 bool newInput = true;
+int8_t pressedButtonIndex = -1;
 
 void pixel(uint8_t *frame, int x, int y) {
     if (x < 0 || x >= XingtaiEpd::WIDTH || y < 0 || y >= XingtaiEpd::HEIGHT) return;
@@ -54,6 +55,21 @@ void rect(uint8_t *frame, int x, int y, int width, int height) {
 
 void fillRect(uint8_t *frame, int x, int y, int width, int height) {
     for (int row = 0; row < height; ++row) hline(frame, x, y + row, width);
+}
+
+void invertRect(uint8_t *frame, int x, int y, int width, int height) {
+    if (!frame || width <= 0 || height <= 0) return;
+    const int left = max(0, x);
+    const int top = max(0, y);
+    const int right = min<int>(XingtaiEpd::WIDTH, x + width);
+    const int bottom = min<int>(XingtaiEpd::HEIGHT, y + height);
+    constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
+    for (int pixelY = top; pixelY < bottom; ++pixelY) {
+        uint8_t *row = frame + static_cast<size_t>(pixelY) * rowBytes;
+        for (int pixelX = left; pixelX < right; ++pixelX) {
+            row[pixelX / 8] ^= 0x80U >> (pixelX % 8);
+        }
+    }
 }
 
 const uint8_t *glyph(char character) {
@@ -255,12 +271,38 @@ void render(uint8_t *frame) {
 }
 
 bool handleTap(int16_t x, int16_t y) {
-    for (const Button &button : BUTTONS) {
+    for (size_t index = 0; index < sizeof(BUTTONS) / sizeof(BUTTONS[0]); ++index) {
+        const Button &button = BUTTONS[index];
         if (!inRect(x, y, button)) continue;
+        pressedButtonIndex = static_cast<int8_t>(index);
         handleButton(button.label);
         return true;
     }
     return false;
+}
+
+bool takePressedKeyBounds(int16_t &x, int16_t &y, int16_t &width, int16_t &height) {
+    if (pressedButtonIndex < 0 ||
+        pressedButtonIndex >= static_cast<int8_t>(sizeof(BUTTONS) / sizeof(BUTTONS[0]))) {
+        return false;
+    }
+    const Button &button = BUTTONS[static_cast<size_t>(pressedButtonIndex)];
+    x = button.x;
+    y = button.y;
+    width = button.width;
+    height = button.height;
+    return true;
+}
+
+void renderPressedKey(uint8_t *frame) {
+    render(frame);
+    if (pressedButtonIndex < 0 ||
+        pressedButtonIndex >= static_cast<int8_t>(sizeof(BUTTONS) / sizeof(BUTTONS[0]))) {
+        return;
+    }
+    const Button &button = BUTTONS[static_cast<size_t>(pressedButtonIndex)];
+    invertRect(frame, button.x, button.y, button.width, button.height);
+    pressedButtonIndex = -1;
 }
 
 }

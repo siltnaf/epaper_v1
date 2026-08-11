@@ -27,6 +27,7 @@
 #include "pages/recording/recording_page.h"
 #include "pages/settings/settings_page.h"
 #include "pages/topbar/topbar_assets.h"
+#include "pages/topbar/topbar_bitmap.h"
 #include "pages/voice/voice_page.h"
 #include "ui/loading_indicator.h"
 #include "ui/localization.h"
@@ -120,6 +121,7 @@ int16_t touchGestureStartY = 0;
 int16_t touchGestureLastX = 0;
 int16_t touchGestureLastY = 0;
 volatile bool touchInterruptPending = false;
+volatile uint32_t touchInterruptTick = 0;
 volatile bool touchWorkflowPriority = false;
 PageId openingLoadPage = PageId::Main;
 bool openingLoadVisible = false;
@@ -129,12 +131,19 @@ bool suppressDriverTap = false;
 bool dispatchingSyntheticTap = false;
 bool homeOutlinePressed = false;
 bool homeTouchActive = false;
+bool priorityControlFeedbackShown = false;
+int16_t priorityControlLeft = 0;
+int16_t priorityControlTop = 0;
+int16_t priorityControlWidth = 0;
+int16_t priorityControlHeight = 0;
 
 void recoverSharedI2c();
 void refreshCurrentPage();
 void refreshCurrentRegion(uint16_t x, uint16_t y, uint16_t width, uint16_t height);
 void refreshBookReaderContent();
 void refreshBookLibraryContent();
+bool refreshPendingBookOpenPressed();
+void openLocalBookReaderFast();
 void wipeContentAreaWhite(bool sleepAfter = true);
 void refreshVoiceDirtyRows();
 void refreshMusicDirtyRows();
@@ -155,16 +164,16 @@ void refreshOpeningLibraryContent(PageId page);
 
 void IRAM_ATTR onTouchInterruptSignal() {
     touchInterruptPending = true;
+    touchInterruptTick = xTaskGetTickCountFromISR();
     touchWorkflowPriority = true;
-    // Stop decoding immediately from the GPIO interrupt path without touching
-    // the shared I2C bus. Cleanup is completed in task context below.
-    OpusPlayer::requestStopFromIsr();
 }
 
 void serviceTouchInterruptBeforeI2c() {
     bool pending = false;
+    uint32_t interruptTick = 0;
     noInterrupts();
     pending = touchInterruptPending;
+    interruptTick = touchInterruptTick;
     touchInterruptPending = false;
     interrupts();
     const bool voiceActive = currentPage == PageId::Voice && VoicePage::isAudioActive();
@@ -173,6 +182,12 @@ void serviceTouchInterruptBeforeI2c() {
     const bool wordActive = currentPage == PageId::Word &&
                             (WordPage::isAudioActive() || WordPage::isAnimating());
     if (!pending || (!voiceActive && !musicActive && !poemActive && !wordActive)) return;
+    if ((voiceActive || musicActive || poemActive || WordPage::isAudioActive()) &&
+        !OpusPlayer::acceptsTouchStop(interruptTick)) {
+        suppressNextAudioTap = true;
+        Serial.println("[TOUCH IRQ] Ignoring play-tap interrupt after audio start");
+        return;
+    }
 
     Serial.printf("[TOUCH IRQ] Stopping %s audio before FT6336 I2C read\n",
                    voiceActive ? "Voice" : musicActive ? "Music" : poemActive ? "Poem" : "Word");
@@ -183,7 +198,8 @@ void serviceTouchInterruptBeforeI2c() {
     // Audio codec setup and FT6336 share Wire. Reclock/recover the bus only
     // after the audio task has stopped, then let touch.loop() read coordinates.
     recoverSharedI2c();
-    suppressNextAudioTap = true;
+    // Do not consume this tap: touch.loop() still needs to read its coordinates
+    // so normal routing can distinguish same row, another row, or Home.
     Serial.printf("[TOUCH IRQ] I2C returned to FT6336 SDA=%d SCL=%d INT=%d\n",
                   digitalRead(BoardPins::I2C_SDA), digitalRead(BoardPins::I2C_SCL),
                   digitalRead(BoardPins::TOUCH_INT));
@@ -336,6 +352,7 @@ void clockWeatherTask(void *) {
     while (clockWeatherRequested) {
         const uint32_t nowMs = millis();
         if (static_cast<int32_t>(nowMs - nextAttemptMs) >= 0) {
+            UiLoadingIndicator::Scope loadingIndicator;
             const bool updated = fetchClockWeather();
             // Retry quickly while Wi-Fi, DNS, or the weather endpoint is still
             // becoming available. Once successful, refresh every 30 minutes.
@@ -589,6 +606,7 @@ void loadSettings() {
 }
 
 void scanWifiNetworks() {
+    UiLoadingIndicator::Scope loadingIndicator;
     SettingsPage::showWifiScanning();
     refreshCurrentPage();
     WiFi.mode(WIFI_STA);
@@ -606,6 +624,7 @@ void scanWifiNetworks() {
 }
 
 void connectSelectedWifi() {
+    UiLoadingIndicator::Scope loadingIndicator;
     settingsState.wifiEnabled = true;
     SettingsPage::setState(settingsState);
     WiFi.disconnect(true, false);
@@ -755,6 +774,52 @@ void refreshBookReaderContent() {
     epaper.sleep();
 }
 
+void openLocalBookReaderFast() {
+    constexpr uint16_t contentTop = 32;
+    constexpr uint32_t pigmentSettleMs = 500;
+    const uint32_t refreshStarted = millis();
+    BookPage::render(transitionFrame);
+    constexpr size_t topBarBytes = static_cast<size_t>(contentTop) *
+                                   (XingtaiEpd::WIDTH / 8);
+    std::memcpy(transitionFrame, frame, topBarBytes);
+
+    // The UC8253 vendor reference requires 500 ms for the pigment to finish
+    // moving (its note says 400 ms remains translucent and 500 ms is OK).
+    // First drive the complete reader area white, then let it settle before
+    // applying black text. displayPartial() powers the UC8253 off after each
+    // waveform, so the black phase must use a normal initialized refresh.
+    epaper.displayPartial(frame, whiteFrame, 0, contentTop,
+                          XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT - contentTop);
+    std::memset(frame + topBarBytes, 0x00,
+                XingtaiEpd::FRAME_BYTES - topBarBytes);
+    delay(pigmentSettleMs);
+
+    epaper.displayPartial(frame, transitionFrame, 0, contentTop,
+                          XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT - contentTop);
+    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+    epaper.sleep();
+    delay(pigmentSettleMs);
+    Serial.printf("[BOOK SD] Reader display=%lums (white pre-drive, 2x%lums settle)\n",
+                  static_cast<unsigned long>(millis() - refreshStarted),
+                  static_cast<unsigned long>(pigmentSettleMs));
+}
+
+bool refreshPendingBookOpenPressed() {
+    int16_t selectedRowTop = 0;
+    if (!BookPage::pendingBookOpenRow(selectedRowTop)) return false;
+
+    constexpr uint32_t pressedSettleMs = 500;
+    BookPage::render(transitionFrame);
+    epaper.displayPartial(frame, transitionFrame, 12,
+                          selectedRowTop, 216, 30);
+    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+    epaper.sleep();
+    delay(pressedSettleMs);
+    Serial.printf("[BOOK] Selected row inverted; loading after %lums settle\n",
+                  static_cast<unsigned long>(pressedSettleMs));
+    return true;
+}
+
 void releaseBookReaderControl(BookPage::ReaderControl control) {
     if (control != BookPage::ReaderControl::Previous &&
         control != BookPage::ReaderControl::Next) {
@@ -844,7 +909,7 @@ void startOpeningLibraryLoad(PageId page) {
     }
     openingLoadPage = page;
     openingLoadVisible = true;
-    showTopbarLoading(true);
+    UiLoadingIndicator::show();
     if (!started) Serial.printf("[UI] %s opening worker was already active or failed to start\n",
                                 pageName(page));
 }
@@ -864,7 +929,7 @@ void processOpeningLibraryLoads() {
     for (const Completion &completion : completions) {
         if (!completion.complete) continue;
         if (openingLoadVisible && openingLoadPage == completion.page) {
-            showTopbarLoading(false);
+            UiLoadingIndicator::hide();
             openingLoadVisible = false;
             openingLoadPage = PageId::Main;
             if (currentPage == completion.page) {
@@ -897,24 +962,65 @@ void refreshPoemDisplay() {
     epaper.sleep();
 }
 
+void refreshPoemPlaybackIcon() {
+    constexpr uint16_t iconX = 194;
+    constexpr uint16_t iconY = 87;
+    constexpr uint16_t iconWidth = 28;
+    constexpr uint16_t iconHeight = 28;
+    PoemPage::render(transitionFrame);
+    epaper.displayPartial(frame, transitionFrame, iconX, iconY,
+                          iconWidth, iconHeight);
+    copyFrameRegion(frame, transitionFrame, iconX, iconY,
+                    iconWidth, iconHeight);
+    epaper.sleep();
+}
+
+void refreshPlaylistRows(PageRenderer renderer, int8_t firstRow, int8_t secondRow) {
+    if (!renderer || firstRow < 0) return;
+    constexpr uint16_t listLeft = 12;
+    constexpr uint16_t listTop = 82;
+    constexpr uint16_t rowPitch = 32;
+    constexpr uint16_t rowWidth = 216;
+    constexpr uint16_t rowHeight = 30;
+
+    renderer(transitionFrame);
+    const auto rowTop = [](int8_t row) {
+        return static_cast<uint16_t>(listTop + static_cast<uint16_t>(row) * rowPitch);
+    };
+
+    // Dirty rows are queued old-first, new-second. Fully drive the previous
+    // inverted row white before restoring its normal border/text; this avoids
+    // gray remnants from white-on-black glyphs on the monochrome panel.
+    const uint16_t previousTop = rowTop(firstRow);
+    Serial.printf("[PLAYLIST] Row refresh previous=%d next=%d white_wipe=yes\n",
+                  firstRow, secondRow);
+    epaper.displayPartial(frame, whiteFrame, listLeft, previousTop,
+                          rowWidth, rowHeight);
+    clearFrameRegion(frame, listLeft, previousTop, rowWidth, rowHeight);
+    epaper.sleep();
+    delay(300);
+    epaper.displayPartial(frame, transitionFrame, listLeft, previousTop,
+                          rowWidth, rowHeight);
+    copyFrameRegion(frame, transitionFrame, listLeft, previousTop,
+                    rowWidth, rowHeight);
+    epaper.sleep();
+
+    if (secondRow >= 0 && secondRow != firstRow) {
+        const uint16_t selectedTop = rowTop(secondRow);
+        epaper.displayPartial(frame, transitionFrame, listLeft, selectedTop,
+                              rowWidth, rowHeight);
+        copyFrameRegion(frame, transitionFrame, listLeft, selectedTop,
+                        rowWidth, rowHeight);
+        epaper.sleep();
+    }
+}
+
 void refreshVoiceDirtyRows() {
     int8_t firstRow = -1;
     int8_t secondRow = -1;
     if (!VoicePage::takeDirtyRows(firstRow, secondRow)) return;
 
-    VoicePage::render(transitionFrame);
-    auto refreshRow = [&](int8_t row) {
-        if (row < 0) return;
-        constexpr uint16_t listTop = 82;
-        constexpr uint16_t rowPitch = 32;
-        epaper.displayPartial(frame, transitionFrame, 12,
-                              listTop + static_cast<uint16_t>(row) * rowPitch,
-                              216, 30);
-    };
-    refreshRow(firstRow);
-    refreshRow(secondRow);
-    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
-    epaper.sleep();
+    refreshPlaylistRows(VoicePage::render, firstRow, secondRow);
 }
 
 void refreshMusicDirtyRows() {
@@ -922,19 +1028,7 @@ void refreshMusicDirtyRows() {
     int8_t secondRow = -1;
     if (!MusicPage::takeDirtyRows(firstRow, secondRow)) return;
 
-    MusicPage::render(transitionFrame);
-    auto refreshRow = [&](int8_t row) {
-        if (row < 0) return;
-        constexpr uint16_t listTop = 82;
-        constexpr uint16_t rowPitch = 32;
-        epaper.displayPartial(frame, transitionFrame, 12,
-                              listTop + static_cast<uint16_t>(row) * rowPitch,
-                              216, 30);
-    };
-    refreshRow(firstRow);
-    refreshRow(secondRow);
-    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
-    epaper.sleep();
+    refreshPlaylistRows(MusicPage::render, firstRow, secondRow);
 }
 
 void refreshPoemDirtyRows() {
@@ -942,19 +1036,7 @@ void refreshPoemDirtyRows() {
     int8_t secondRow = -1;
     if (!PoemPage::takeDirtyRows(firstRow, secondRow)) return;
 
-    PoemPage::render(transitionFrame);
-    auto refreshRow = [&](int8_t row) {
-        if (row < 0) return;
-        constexpr uint16_t listTop = 82;
-        constexpr uint16_t rowPitch = 32;
-        epaper.displayPartial(frame, transitionFrame, 12,
-                              listTop + static_cast<uint16_t>(row) * rowPitch,
-                              216, 30);
-    };
-    refreshRow(firstRow);
-    refreshRow(secondRow);
-    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
-    epaper.sleep();
+    refreshPlaylistRows(PoemPage::render, firstRow, secondRow);
 }
 
 void refreshWordStrokeWindow(bool wipeFirst) {
@@ -1001,64 +1083,178 @@ void copyFrameRegion(uint8_t *destination, const uint8_t *source,
     }
 }
 
-void showHomePressedOutline() {
-    constexpr int left = 1;
-    constexpr int top = 1;
-    constexpr int width = 31;
-    constexpr int height = 29;
+void showPressedInversion(int left, int top, int width, int height) {
+    if (width <= 0 || height <= 0) return;
     std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
-    auto setPixel = [](uint8_t *buffer, int x, int y) {
-        if (x < 0 || x >= XingtaiEpd::WIDTH || y < 0 || y >= XingtaiEpd::HEIGHT) return;
-        buffer[static_cast<size_t>(y) * (XingtaiEpd::WIDTH / 8) + x / 8] |=
-            static_cast<uint8_t>(0x80U >> (x % 8));
+    constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
+    const int right = min<int>(XingtaiEpd::WIDTH, left + width);
+    const int bottom = min<int>(XingtaiEpd::HEIGHT, top + height);
+    for (int y = max(0, top); y < bottom; ++y) {
+        uint8_t *row = transitionFrame + static_cast<size_t>(y) * rowBytes;
+        for (int x = max(0, left); x < right; ++x) {
+            row[x / 8] ^= 0x80U >> (x % 8);
+        }
+    }
+    epaper.displayPartial(frame, transitionFrame, left, top, width, height);
+    copyFrameRegion(frame, transitionFrame, left, top, width, height);
+    epaper.sleep();
+    constexpr uint32_t pressedMs = 300;
+    delay(pressedMs);
+}
+
+bool showPriorityInversion(int left, int top, int width, int height);
+
+bool showPagerPressedInversion(int16_t x, int16_t y) {
+    constexpr int top = 52;
+    constexpr int height = 25;
+    constexpr int width = 34;
+    constexpr int lefts[] = {4, 42, 164, 202};
+    if (y < top || y >= top + height) return false;
+    for (int left : lefts) {
+        if (x >= left && x < left + width) {
+            return showPriorityInversion(left, top, width, height);
+        }
+    }
+    return false;
+}
+
+bool showPriorityInversion(int left, int top, int width, int height) {
+    priorityControlLeft = left;
+    priorityControlTop = top;
+    priorityControlWidth = width;
+    priorityControlHeight = height;
+    showPressedInversion(left, top, width, height);
+    return true;
+}
+
+void restorePriorityControl() {
+    if (!priorityControlFeedbackShown) return;
+    std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
+    constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
+    const int right = min<int>(XingtaiEpd::WIDTH,
+                               priorityControlLeft + priorityControlWidth);
+    const int bottom = min<int>(XingtaiEpd::HEIGHT,
+                                priorityControlTop + priorityControlHeight);
+    for (int y = max<int>(0, priorityControlTop); y < bottom; ++y) {
+        uint8_t *row = transitionFrame + static_cast<size_t>(y) * rowBytes;
+        for (int x = max<int>(0, priorityControlLeft); x < right; ++x) {
+            row[x / 8] ^= 0x80U >> (x % 8);
+        }
+    }
+    epaper.displayPartial(frame, transitionFrame, priorityControlLeft,
+                          priorityControlTop, priorityControlWidth,
+                          priorityControlHeight);
+    copyFrameRegion(frame, transitionFrame, priorityControlLeft,
+                    priorityControlTop, priorityControlWidth,
+                    priorityControlHeight);
+    epaper.sleep();
+}
+
+bool showPriorityControlPressed(int16_t x, int16_t y) {
+    const auto inRect = [](int16_t px, int16_t py, int left, int top,
+                           int width, int height) {
+        return px >= left && px < left + width && py >= top && py < top + height;
     };
-    auto drawRoundedFrame = [&](int inset) {
-        const int x1 = left + inset;
-        const int y1 = top + inset;
-        const int x2 = left + width - 1 - inset;
-        const int y2 = top + height - 1 - inset;
-        constexpr int radius = 6;
-        for (int x = x1 + radius; x <= x2 - radius; ++x) {
-            setPixel(transitionFrame, x, y1);
-            setPixel(transitionFrame, x, y2);
+    if (currentPage == PageId::Settings) {
+        const SettingsPage::Action action = SettingsPage::actionAt(x, y);
+        if (action == SettingsPage::Action::VoiceBack) {
+            return showPriorityInversion(14, 260, 100, 40);
         }
-        for (int y = y1 + radius; y <= y2 - radius; ++y) {
-            setPixel(transitionFrame, x1, y);
-            setPixel(transitionFrame, x2, y);
+        if (action == SettingsPage::Action::SdBack) {
+            return showPriorityInversion(18, 340, 96, 42);
         }
-        constexpr uint8_t cornerX[] = {5, 4, 3, 2, 1, 1, 0};
-        constexpr uint8_t cornerY[] = {0, 1, 1, 2, 3, 4, 5};
-        for (size_t index = 0; index < sizeof(cornerX); ++index) {
-            const int dx = cornerX[index];
-            const int dy = cornerY[index];
-            setPixel(transitionFrame, x1 + dx, y1 + dy);
-            setPixel(transitionFrame, x2 - dx, y1 + dy);
-            setPixel(transitionFrame, x1 + dx, y2 - dy);
-            setPixel(transitionFrame, x2 - dx, y2 - dy);
+        return false;
+    }
+    if (currentPage == PageId::Book) {
+        if (!BookPage::isReader()) return showPagerPressedInversion(x, y);
+        if (inRect(x, y, 0, 32, 70, 40)) {
+            return showPriorityInversion(8, 38, 50, 26);
         }
-    };
-    drawRoundedFrame(0);
-    drawRoundedFrame(1);
-    drawRoundedFrame(2);
+        if (inRect(x, y, 0, 374, 60, 42)) {
+            return showPriorityInversion(8, 386, 34, 24);
+        }
+        if (inRect(x, y, 180, 374, 60, 42)) {
+            return showPriorityInversion(198, 386, 34, 24);
+        }
+        return false;
+    }
+    if (currentPage == PageId::Poem && PoemPage::isPopupOpen()) {
+        if (inRect(x, y, 11, 79, 50, 32)) {
+            return showPriorityInversion(11, 79, 50, 32);
+        }
+        if (inRect(x, y, 14, 370, 44, 26)) {
+            return showPriorityInversion(14, 370, 44, 26);
+        }
+        if (inRect(x, y, 182, 370, 44, 26)) {
+            return showPriorityInversion(182, 370, 44, 26);
+        }
+        return false;
+    }
+    if (currentPage == PageId::Poem &&
+        inRect(x, y, 12, 82, 216, 10 * 32 - 2)) {
+        const int row = (y - 82) / 32;
+        const int rowTop = 82 + row * 32;
+        if (y < rowTop + 30) return showPriorityInversion(12, rowTop, 216, 30);
+    }
+    if (currentPage == PageId::Word && WordPage::isDetail()) {
+        if (inRect(x, y, 6, 36, 64, 36)) {
+            return showPriorityInversion(10, 40, 58, 26);
+        }
+        return false;
+    }
+    if (currentPage == PageId::Voice || currentPage == PageId::Music ||
+        currentPage == PageId::Poem || currentPage == PageId::Word) {
+        return showPagerPressedInversion(x, y);
+    }
+    return false;
+}
+
+void showHomePressedOutline() {
+    constexpr int left = 0;
+    constexpr int top = 0;
+    constexpr int width = 32;
+    constexpr int height = 32;
+    std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
+    constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
+    // Rebuild this tile from the cached normal top bar because content-page
+    // framebuffers may not contain the Home glyph even while it is physically
+    // visible. Keep the icon black on white and use only a bold frame as the
+    // pressed indication.
+    copyFrameRegion(transitionFrame, mainPageFrame, left, top, width, height);
+    for (int inset = 0; inset < 1; ++inset) {
+        const int frameLeft = left + inset;
+        const int frameTop = top + inset;
+        const int frameRight = left + width - 1 - inset;
+        const int frameBottom = top + height - 1 - inset;
+        for (int x = frameLeft; x <= frameRight; ++x) {
+            transitionFrame[static_cast<size_t>(frameTop) * rowBytes + x / 8] |=
+                0x80U >> (x % 8);
+            transitionFrame[static_cast<size_t>(frameBottom) * rowBytes + x / 8] |=
+                0x80U >> (x % 8);
+        }
+        for (int y = frameTop; y <= frameBottom; ++y) {
+            transitionFrame[static_cast<size_t>(y) * rowBytes + frameLeft / 8] |=
+                0x80U >> (frameLeft % 8);
+            transitionFrame[static_cast<size_t>(y) * rowBytes + frameRight / 8] |=
+                0x80U >> (frameRight % 8);
+        }
+    }
+
     epaper.displayPartial(frame, transitionFrame, left, top, width, height);
     std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
     epaper.sleep();
     homeOutlinePressed = true;
+    Serial.println("[NAVIGATION] Home pressed; bold frame displayed");
 }
 
 void restoreHomeIcon() {
     if (!homeOutlinePressed) return;
     constexpr uint16_t left = 0;
     constexpr uint16_t top = 0;
-    constexpr uint16_t width = 34;
+    constexpr uint16_t width = 32;
     constexpr uint16_t height = 32;
     std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
-    constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
-    for (uint16_t y = top; y < top + height; ++y) {
-        std::memcpy(transitionFrame + static_cast<size_t>(y) * rowBytes,
-                    mainPageFrame + static_cast<size_t>(y) * rowBytes,
-                    rowBytes);
-    }
+    copyFrameRegion(transitionFrame, mainPageFrame, left, top, width, height);
     epaper.displayPartial(frame, transitionFrame, left, top, width, height);
     std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
     epaper.sleep();
@@ -1206,9 +1402,12 @@ void startMainIconFeedback(PageId page) {
     std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
     epaper.sleep();
     suppressMainIconReleaseTap = true;
-    Serial.printf("[FUNCTION ICON] Pressed: %s\n", pageName(page));
-    // Navigation is queued immediately on first contact. The destination page
-    // replaces the pressed tile, so no 500 ms restore timer is required.
+    constexpr uint32_t pressedSettleMs = 500;
+    delay(pressedSettleMs);
+    Serial.printf("[FUNCTION ICON] Inverted: %s; opening after %lums settle\n",
+                  pageName(page), static_cast<unsigned long>(pressedSettleMs));
+    // Queue navigation only after the inverted tile has remained visible long
+    // enough for the UC8253 pigment and the user to register the touch feedback.
     queuePage(page);
 }
 
@@ -1361,6 +1560,8 @@ void handleTouch(TPoint point, TEvent event) {
         // release as a Tap. Once a new physical touch starts, any old release
         // suppression is necessarily stale and must not consume this gesture.
         if (suppressMainIconReleaseTap) suppressMainIconReleaseTap = false;
+        if (suppressNextAudioTap) suppressNextAudioTap = false;
+        priorityControlFeedbackShown = false;
         if (currentPage != PageId::Main && isHomeIcon(uiX, uiY)) {
             touchGestureActive = false;
             homeTouchActive = true;
@@ -1369,7 +1570,6 @@ void handleTouch(TPoint point, TEvent event) {
             // Keep the current page active for the lifetime of this physical
             // touch. Switching pages here lets later Contact/LiftUp samples be
             // routed against Main and can reopen the page that was just left.
-            Serial.println("[NAVIGATION] Home pressed; waiting for release");
             return;
         }
         if (currentPage == PageId::Main) {
@@ -1380,6 +1580,7 @@ void handleTouch(TPoint point, TEvent event) {
                 return;
             }
         }
+        priorityControlFeedbackShown = showPriorityControlPressed(uiX, uiY);
         touchGestureActive = true;
         touchGestureStartX = touchGestureLastX = uiX;
         touchGestureStartY = touchGestureLastY = uiY;
@@ -1393,6 +1594,7 @@ void handleTouch(TPoint point, TEvent event) {
         return;
     }
     if (event == TEvent::TouchEnd) {
+        restorePriorityControl();
         if (homeOutlinePressed) restoreHomeIcon();
         if (homeTouchActive) {
             homeTouchActive = false;
@@ -1433,28 +1635,34 @@ void handleTouch(TPoint point, TEvent event) {
                                BookPage::takeReaderContentRefreshRequest()) {
                         const BookPage::ReaderControl control =
                             BookPage::takeReaderControlPress();
-                        if (control != BookPage::ReaderControl::None) {
+                        if (control != BookPage::ReaderControl::None &&
+                            !priorityControlFeedbackShown) {
                             refreshBookReaderControlPressed(control);
                         }
                         refreshBookReaderContent();
                         releaseBookReaderControl(control);
                     } else if (currentPage == PageId::Book &&
                                BookPage::takeLibraryContentRefreshRequest()) {
-                        int16_t selectedRowTop = 0;
-                        if (BookPage::pendingBookOpenRow(selectedRowTop)) {
-                            BookPage::render(transitionFrame);
-                            epaper.displayPartial(frame, transitionFrame, 12,
-                                                  selectedRowTop, 216, 30);
-                            std::memcpy(frame, transitionFrame,
-                                        XingtaiEpd::FRAME_BYTES);
-                            epaper.sleep();
+                        const bool bookRowPressed = refreshPendingBookOpenPressed();
+                        if (BookPage::pendingBookOpenIsLocal()) {
+                            const uint32_t openStarted = millis();
+                            if (BookPage::preparePendingBookOpen() &&
+                                BookPage::processPendingBookOpen()) {
+                                openLocalBookReaderFast();
+                                Serial.printf("[BOOK SD] Tap-to-reader total=%lums\n",
+                                              static_cast<unsigned long>(millis() - openStarted));
+                            } else {
+                                refreshCurrentPage();
+                            }
                         } else {
-                            refreshBookLibraryContent();
-                        }
-                        if (BookPage::preparePendingBookOpen()) {
-                            refreshCurrentPage();
-                            if (BookPage::processPendingBookOpen()) {
-                                refreshBookReaderContent();
+                            if (!bookRowPressed) {
+                                refreshBookLibraryContent();
+                            }
+                            if (BookPage::preparePendingBookOpen()) {
+                                refreshCurrentPage();
+                                if (BookPage::processPendingBookOpen()) {
+                                    refreshBookReaderContent();
+                                }
                             }
                         }
                     } else {
@@ -1521,7 +1729,23 @@ void handleTouch(TPoint point, TEvent event) {
     // library. Give the overlay first refusal so its controls cannot fall
     // through to the playlist underneath.
     if (currentPage == PageId::Poem && PoemPage::isPopupOpen()) {
-        if (PoemPage::handleTap(uiX, uiY)) refreshPoemDisplay();
+        if (PoemPage::handleTap(uiX, uiY)) {
+            if (!priorityControlFeedbackShown &&
+                uiX >= 11 && uiX < 61 && uiY >= 79 && uiY < 111) {
+                showPressedInversion(11, 79, 50, 32);
+            } else if (!priorityControlFeedbackShown &&
+                       uiX >= 14 && uiX < 58 && uiY >= 370 && uiY < 396) {
+                showPressedInversion(14, 370, 44, 26);
+            } else if (!priorityControlFeedbackShown &&
+                       uiX >= 182 && uiX < 226 && uiY >= 370 && uiY < 396) {
+                showPressedInversion(182, 370, 44, 26);
+            }
+            if (PoemPage::takePlaybackIconRefreshRequest()) {
+                refreshPoemPlaybackIcon();
+            } else {
+                refreshPoemDisplay();
+            }
+        }
         return;
     }
 
@@ -1542,14 +1766,19 @@ void handleTouch(TPoint point, TEvent event) {
             applyCellularSetting();
             break;
         case SettingsPage::Action::RefreshSdCard:
+            UiLoadingIndicator::show();
             SettingsPage::setSdMounted(SdCard::isMounted());
             {
                 const uint8_t count = SdCard::listRoot(sdEntryNames, sdEntryDirectories, 8);
                 SettingsPage::showSdPage(sdEntryNames, sdEntryDirectories, count);
             }
+            UiLoadingIndicator::hide();
             refreshCurrentPage();
             return;
         case SettingsPage::Action::SdBack:
+            if (!priorityControlFeedbackShown) {
+                showPressedInversion(18, 340, 96, 42);
+            }
             SettingsPage::showSettings();
             refreshCurrentPage();
             return;
@@ -1558,8 +1787,10 @@ void handleTouch(TPoint point, TEvent event) {
             refreshCurrentPage();
             return;
         case SettingsPage::Action::SdConfirmFormat:
+            UiLoadingIndicator::show();
             if (SdCard::format()) Serial.println("[SD] Format complete");
             else Serial.println("[SD] Format failed");
+            UiLoadingIndicator::hide();
             SettingsPage::setSdMounted(SdCard::isMounted());
             SettingsPage::showSettings();
             refreshCurrentPage();
@@ -1584,6 +1815,9 @@ void handleTouch(TPoint point, TEvent event) {
             return;
         }
         case SettingsPage::Action::VoiceBack:
+            if (!priorityControlFeedbackShown) {
+                showPressedInversion(14, 260, 100, 40);
+            }
             SettingsPage::showSettings();
             refreshCurrentPage();
             return;
@@ -1704,6 +1938,11 @@ void handleTouch(TPoint point, TEvent event) {
             }
             refreshCurrentPage();
             return;
+        case SettingsPage::Action::UrlClear:
+            contentUrl[0] = '\0';
+            SettingsPage::showContentUrl(contentUrl);
+            refreshCurrentRegion(10, 68, 220, 58);
+            return;
         case SettingsPage::Action::UrlCancel:
             std::strncpy(contentUrl, savedContentUrl, sizeof(contentUrl) - 1);
             contentUrl[sizeof(contentUrl) - 1] = '\0';
@@ -1729,15 +1968,36 @@ void handleTouch(TPoint point, TEvent event) {
     }
 
     if (currentPage == PageId::Calculator) {
-        if (CalculatorPage::handleTap(uiX, uiY)) refreshCurrentPage();
+        if (CalculatorPage::handleTap(uiX, uiY)) {
+            int16_t keyX = 0;
+            int16_t keyY = 0;
+            int16_t keyWidth = 0;
+            int16_t keyHeight = 0;
+            if (CalculatorPage::takePressedKeyBounds(keyX, keyY, keyWidth, keyHeight)) {
+                CalculatorPage::renderPressedKey(transitionFrame);
+                epaper.displayPartial(frame, transitionFrame, keyX, keyY,
+                                      keyWidth, keyHeight);
+                copyFrameRegion(frame, transitionFrame, keyX, keyY,
+                                keyWidth, keyHeight);
+                epaper.sleep();
+                constexpr uint32_t calculatorKeyPressedMs = 300;
+                delay(calculatorKeyPressedMs);
+                Serial.printf("[CALCULATOR] Key inverted for %lums\n",
+                              static_cast<unsigned long>(calculatorKeyPressedMs));
+            }
+            refreshCurrentPage();
+        }
         return;
     }
 
     if (currentPage == PageId::Book) {
         if (BookPage::handleTap(uiX, uiY)) {
             const BookPage::ReaderControl control = BookPage::takeReaderControlPress();
-            if (control != BookPage::ReaderControl::None) {
+            if (control != BookPage::ReaderControl::None &&
+                !priorityControlFeedbackShown) {
                 refreshBookReaderControlPressed(control);
+            } else if (!BookPage::isReader() && !priorityControlFeedbackShown) {
+                showPagerPressedInversion(uiX, uiY);
             }
             if (BookPage::processPendingReaderBack()) {
                 refreshCurrentPage();
@@ -1749,15 +2009,20 @@ void handleTouch(TPoint point, TEvent event) {
             } else if (BookPage::takeReaderContentRefreshRequest()) {
                 refreshBookReaderContent();
             } else if (BookPage::takeLibraryContentRefreshRequest()) {
-                int16_t selectedRowTop = 0;
-                if (BookPage::pendingBookOpenRow(selectedRowTop)) {
-                    BookPage::render(transitionFrame);
-                    epaper.displayPartial(frame, transitionFrame, 12,
-                                          selectedRowTop, 216, 30);
-                    std::memcpy(frame, transitionFrame,
-                                XingtaiEpd::FRAME_BYTES);
-                    epaper.sleep();
-                } else {
+                const bool bookRowPressed = refreshPendingBookOpenPressed();
+                if (BookPage::pendingBookOpenIsLocal()) {
+                    const uint32_t openStarted = millis();
+                    if (BookPage::preparePendingBookOpen() &&
+                        BookPage::processPendingBookOpen()) {
+                        openLocalBookReaderFast();
+                        Serial.printf("[BOOK SD] Tap-to-reader total=%lums\n",
+                                      static_cast<unsigned long>(millis() - openStarted));
+                    } else {
+                        refreshCurrentPage();
+                    }
+                    return;
+                }
+                if (!bookRowPressed) {
                     refreshBookLibraryContent();
                 }
                 if (BookPage::preparePendingBookOpen()) {
@@ -1774,22 +2039,11 @@ void handleTouch(TPoint point, TEvent event) {
 
     if (currentPage == PageId::Voice) {
         if (VoicePage::handleTap(uiX, uiY)) {
+            if (!priorityControlFeedbackShown) showPagerPressedInversion(uiX, uiY);
             int8_t firstRow = -1;
             int8_t secondRow = -1;
             if (VoicePage::takeDirtyRows(firstRow, secondRow)) {
-                // Put the rows back into the queue by rendering through the
-                // dedicated helper immediately, without a content-area wipe.
-                VoicePage::render(transitionFrame);
-                auto refreshRow = [&](int8_t row) {
-                    if (row < 0) return;
-                    epaper.displayPartial(frame, transitionFrame, 12,
-                                          82 + static_cast<uint16_t>(row) * 32,
-                                          216, 30);
-                };
-                refreshRow(firstRow);
-                refreshRow(secondRow);
-                std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
-                epaper.sleep();
+                refreshPlaylistRows(VoicePage::render, firstRow, secondRow);
             } else {
                 refreshCurrentPage();
             }
@@ -1799,20 +2053,11 @@ void handleTouch(TPoint point, TEvent event) {
 
     if (currentPage == PageId::Music) {
         if (MusicPage::handleTap(uiX, uiY)) {
+            if (!priorityControlFeedbackShown) showPagerPressedInversion(uiX, uiY);
             int8_t firstRow = -1;
             int8_t secondRow = -1;
             if (MusicPage::takeDirtyRows(firstRow, secondRow)) {
-                MusicPage::render(transitionFrame);
-                auto refreshRow = [&](int8_t row) {
-                    if (row < 0) return;
-                    epaper.displayPartial(frame, transitionFrame, 12,
-                                          82 + static_cast<uint16_t>(row) * 32,
-                                          216, 30);
-                };
-                refreshRow(firstRow);
-                refreshRow(secondRow);
-                std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
-                epaper.sleep();
+                refreshPlaylistRows(MusicPage::render, firstRow, secondRow);
             } else {
                 refreshCurrentPage();
             }
@@ -1823,7 +2068,14 @@ void handleTouch(TPoint point, TEvent event) {
     if (currentPage == PageId::Poem) {
         const bool popupWasOpen = PoemPage::isPopupOpen();
         if (PoemPage::handleTap(uiX, uiY)) {
-            if (popupWasOpen || PoemPage::isPopupOpen()) refreshPoemDisplay();
+            if (!popupWasOpen && !priorityControlFeedbackShown) {
+                showPagerPressedInversion(uiX, uiY);
+            }
+            if (PoemPage::takePlaybackIconRefreshRequest()) {
+                refreshPoemPlaybackIcon();
+            } else if (popupWasOpen || PoemPage::isPopupOpen()) {
+                refreshPoemDisplay();
+            }
             else refreshCurrentPage();
         }
         return;
@@ -1831,6 +2083,12 @@ void handleTouch(TPoint point, TEvent event) {
 
     if (currentPage == PageId::Word) {
         if (WordPage::handleTap(uiX, uiY)) {
+            if (!priorityControlFeedbackShown &&
+                uiX >= 6 && uiX < 70 && uiY >= 36 && uiY < 72) {
+                showPressedInversion(10, 40, 58, 26);
+            } else if (!priorityControlFeedbackShown) {
+                showPagerPressedInversion(uiX, uiY);
+            }
             if (WordPage::takeReplayRefreshRequest()) {
                 refreshWordStrokeWindow(true);
             } else {
@@ -1965,7 +2223,7 @@ void processTouchAction() {
     touchAction.pending = false;
 
     if (openingLoadVisible && nextPage != openingLoadPage) {
-        showTopbarLoading(false);
+        UiLoadingIndicator::hide();
         openingLoadVisible = false;
         openingLoadPage = PageId::Main;
     }
@@ -2163,7 +2421,6 @@ void setup() {
 }
 
 void loop() {
-    SdCard::processSerialCommand();
     serviceTouchInterruptBeforeI2c();
     touch.loop();
     processTouchAction();
@@ -2176,6 +2433,11 @@ void loop() {
         delay(1);
         return;
     }
+    // Touch feedback has priority over a pending 下载中/LOADING top-bar update.
+    // Service the indicator only after the current physical gesture and its
+    // immediate pressed-state refresh have completed.
+    UiLoadingIndicator::service();
+    SdCard::processSerialCommand();
     // If the controller emitted no final Tap event, still restore the stopped
     // Voice row after the interrupt-driven audio shutdown.
     if (currentPage == PageId::Voice) refreshVoiceDirtyRows();

@@ -7,6 +7,7 @@ using Handler = void (*)(bool visible);
 void setHandler(Handler handler);
 void show();
 void hide();
+void service();
 
 class Scope {
 public:

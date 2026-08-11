@@ -422,8 +422,9 @@ void renderContentUrl(uint8_t *frame) {
            keyboard == Keyboard::Uppercase ? "123" : "abc");
     button(frame, 66, 288, 108, 38, cn ? "空格" : "SPACE");
     button(frame, 178, 288, 54, 38, cn ? "删除" : "DEL");
-    button(frame, 8, 342, 108, 44, cn ? "保存" : "SAVE");
-    button(frame, 124, 342, 108, 44, cn ? "取消" : "CANCEL");
+    button(frame, 8, 342, 72, 44, cn ? "保存" : "SAVE");
+    button(frame, 84, 342, 72, 44, cn ? "清除" : "CLEAR");
+    button(frame, 160, 342, 72, 44, cn ? "取消" : "CANCEL");
 }
 
 }
@@ -447,8 +448,9 @@ void render(uint8_t *frame) {
 
 Action actionAt(int16_t x, int16_t y) {
     if (view == View::ContentUrl) {
-        if (inRect(x, y, 8, 342, 108, 44)) return Action::UrlSave;
-        if (inRect(x, y, 124, 342, 108, 44)) return Action::UrlCancel;
+        if (inRect(x, y, 8, 342, 72, 44)) return Action::UrlSave;
+        if (inRect(x, y, 84, 342, 72, 44)) return Action::UrlClear;
+        if (inRect(x, y, 160, 342, 72, 44)) return Action::UrlCancel;
         if (inRect(x, y, 8, 288, 54, 38)) return Action::UrlChangeKeyboard;
         if (inRect(x, y, 66, 288, 108, 38)) return Action::UrlSpace;
         if (inRect(x, y, 178, 288, 54, 38)) return Action::UrlBackspace;

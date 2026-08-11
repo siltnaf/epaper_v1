@@ -109,6 +109,9 @@ Es8311AudioOutput *output = nullptr;
 TaskHandle_t playbackTaskHandle = nullptr;
 volatile bool playbackActive = false;
 volatile bool stopRequested = false;
+volatile bool pauseRequested = false;
+volatile bool playbackPaused = false;
+volatile TickType_t playbackStartedTick = 0;
 char requestedPath[128] = {};
 
 void releasePlayback() {
@@ -136,24 +139,48 @@ void playbackTask(void *) {
     vTaskDelay(pdMS_TO_TICKS(60));
     Serial.printf("[AUDIO PA] NS4150B enabled PA_EN=%d level=%d\n",
                   BoardPins::PA_EN, digitalRead(BoardPins::PA_EN));
-    Serial.printf("[OPUS] Heap before open free=%u largest=%u stack_free=%u\n",
+    Serial.printf("[OPUS] Heap before open free=%u largest=%u mono_decoder_state=%d stack_free=%u\n",
                   static_cast<unsigned>(ESP.getFreeHeap()),
                   static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
+                  opus_decoder_get_size(1),
                   static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
 
     source = new AudioFileSourceFS(SD_MMC, requestedPath);
     decoder = new AudioGeneratorOpus();
     output = new Es8311AudioOutput(codec);
     bool started = source && source->isOpen() && decoder && output;
+    if (source && source->isOpen()) {
+        uint8_t header[64] = {};
+        const uint32_t headerBytes = source->read(header, sizeof(header));
+        const bool oggSignature = headerBytes >= 4 && std::memcmp(header, "OggS", 4) == 0;
+        bool opusHead = false;
+        for (uint32_t i = 0; i + 8 <= headerBytes; ++i) {
+            if (std::memcmp(header + i, "OpusHead", 8) == 0) {
+                opusHead = true;
+                break;
+            }
+        }
+        const bool rewound = source->seek(0, SEEK_SET);
+        Serial.printf("[OPUS] Header bytes=%u first=%02X%02X%02X%02X OggS=%s "
+                      "OpusHead=%s rewind=%s pos=%u\n",
+                      headerBytes, header[0], header[1], header[2], header[3],
+                      oggSignature ? "yes" : "no", opusHead ? "yes" : "no",
+                      rewound ? "yes" : "no", source->getPos());
+        Serial.print("[OPUS] Header hex=");
+        for (uint32_t i = 0; i < headerBytes; ++i) Serial.printf("%02X", header[i]);
+        Serial.println();
+        started = started && oggSignature && opusHead && rewound;
+    }
     if (started) {
         output->SetGain(1.0f);
         started = decoder->begin(source, output);
     }
     if (!started) {
-        Serial.printf("[OPUS] Decoder begin failed path=%s bytes=%u open=%s error=%d "
+        Serial.printf("[OPUS] Decoder begin failed path=%s bytes=%u open=%s stage=%d error=%d "
                       "heap_free=%u largest=%u stack_free=%u\n",
                       requestedPath, source ? source->getSize() : 0,
                       source && source->isOpen() ? "yes" : "no",
+                      decoder ? decoder->getOpenStage() : 0,
                       decoder ? decoder->getLastError() : 0,
                       static_cast<unsigned>(ESP.getFreeHeap()),
                       static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
@@ -163,6 +190,21 @@ void playbackTask(void *) {
                       requestedPath, source->getSize(),
                       static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
         while (!stopRequested && decoder && decoder->isRunning()) {
+            if (pauseRequested) {
+                if (!playbackPaused) {
+                    playbackPaused = true;
+                    digitalWrite(BoardPins::PA_EN, LOW);
+                    Serial.println("[OPUS] Playback paused");
+                }
+                vTaskDelay(pdMS_TO_TICKS(5));
+                continue;
+            }
+            if (playbackPaused) {
+                playbackPaused = false;
+                digitalWrite(BoardPins::PA_EN, HIGH);
+                vTaskDelay(pdMS_TO_TICKS(20));
+                Serial.println("[OPUS] Playback resumed");
+            }
             output->resetQuota();
             if (!decoder->loop()) break;
             vTaskDelay(pdMS_TO_TICKS(1));
@@ -176,6 +218,8 @@ void playbackTask(void *) {
     Serial.printf("[AUDIO PA] NS4150B disabled PA_EN=%d level=%d\n",
                   BoardPins::PA_EN, digitalRead(BoardPins::PA_EN));
     playbackActive = false;
+    pauseRequested = false;
+    playbackPaused = false;
     playbackTaskHandle = nullptr;
     vTaskDelete(nullptr);
 }
@@ -202,7 +246,10 @@ bool play(const char *path) {
     std::strncpy(requestedPath, path, sizeof(requestedPath) - 1);
     requestedPath[sizeof(requestedPath) - 1] = '\0';
     stopRequested = false;
+    pauseRequested = false;
+    playbackPaused = false;
     playbackActive = true;
+    playbackStartedTick = xTaskGetTickCount();
     // A 32 KiB task stack consumed about half the available internal heap before
     // opusfile could allocate its decoder state. Opus decoding uses less than
     // this 16 KiB stack; the high-water mark is logged for live verification.
@@ -216,15 +263,40 @@ bool play(const char *path) {
     return true;
 }
 
+bool acceptsTouchStop(uint32_t interruptTick) {
+    // Ignore an IRQ generated by the touch that launched playback. A genuine
+    // later stop touch has a tick at or after playbackStartedTick.
+    return playbackActive &&
+           static_cast<int32_t>(interruptTick - playbackStartedTick) >= 0;
+}
+
+bool pause() {
+    if (!playbackActive) return false;
+    pauseRequested = true;
+    const uint32_t started = millis();
+    while (playbackActive && !playbackPaused && millis() - started < 500) {
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    return playbackPaused;
+}
+
+bool resume() {
+    if (!playbackActive) return false;
+    pauseRequested = false;
+    return true;
+}
+
+bool isPaused() { return playbackActive && (pauseRequested || playbackPaused); }
+
 void IRAM_ATTR requestStopFromIsr() {
-    // ISR-safe: only publish the stop request. Decoder/resource cleanup and
-    // amplifier shutdown remain in the dedicated playback task.
-    stopRequested = true;
+    // Kept for existing page-level ISR hooks. Shared touch/audio coordination
+    // now decides whether to stop in task context using the interrupt timestamp.
 }
 
 void stop() {
     if (!playbackTaskHandle && !playbackActive) return;
     stopRequested = true;
+    pauseRequested = false;
     const uint32_t started = millis();
     while (playbackTaskHandle && millis() - started < 2000) {
         vTaskDelay(pdMS_TO_TICKS(5));

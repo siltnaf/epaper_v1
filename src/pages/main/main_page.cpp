@@ -68,6 +68,25 @@ void roundedFrame(uint8_t *frame, int x, int y, int width, int height, bool bold
     }
 }
 
+void invertRoundedRect(uint8_t *frame, int x, int y, int width, int height) {
+    if (!frame || width <= 0 || height <= 0) return;
+    constexpr uint8_t cornerInsets[] = {6, 3, 2, 1, 1, 0};
+    constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
+    for (int row = 0; row < height; ++row) {
+        const int edgeDistance = min(row, height - 1 - row);
+        const int inset = edgeDistance < static_cast<int>(sizeof(cornerInsets))
+            ? cornerInsets[edgeDistance] : 0;
+        const int pixelY = y + row;
+        if (pixelY < 0 || pixelY >= XingtaiEpd::HEIGHT) continue;
+        const int left = max(0, x + inset);
+        const int right = min<int>(XingtaiEpd::WIDTH, x + width - inset);
+        uint8_t *frameRow = frame + static_cast<size_t>(pixelY) * rowBytes;
+        for (int pixelX = left; pixelX < right; ++pixelX) {
+            frameRow[pixelX / 8] ^= 0x80U >> (pixelX % 8);
+        }
+    }
+}
+
 void statusBar(uint8_t *frame) {
     // Keep the status area clean: no separator/bounding rule is drawn.
     Topbar::drawHome(frame, 4, 2);
@@ -82,7 +101,7 @@ void statusBar(uint8_t *frame) {
 void icon(uint8_t *frame, int x, int y, const uint8_t *bitmap, bool selected) {
     constexpr int framePadding = 4;
     constexpr int frameSize = 48 + framePadding * 2;
-    roundedFrame(frame, x - framePadding, y - framePadding, frameSize, frameSize, selected);
+    roundedFrame(frame, x - framePadding, y - framePadding, frameSize, frameSize);
 
     // DATA is the exact 48x48 MSB-first raster generated from the page SVG.
     for (int row = 0; row < 48; ++row) {
@@ -98,6 +117,10 @@ void icon(uint8_t *frame, int x, int y, const uint8_t *bitmap, bool selected) {
                 if ((packed & (0x80U >> bit)) != 0) pixel(frame, x + byte * 8 + bit, y + row);
             }
         }
+    }
+    if (selected) {
+        invertRoundedRect(frame, x - framePadding, y - framePadding,
+                          frameSize, frameSize);
     }
 }
 
