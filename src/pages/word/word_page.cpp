@@ -34,9 +34,9 @@ constexpr int GLYPH_X = 22;
 constexpr int GLYPH_Y = 75;
 constexpr int GLYPH_W = 100;
 constexpr int GLYPH_H = 100;
-constexpr uint8_t ANIMATION_STEPS_PER_STROKE = 2;
-constexpr uint32_t MIN_ANIMATION_DURATION_MS = 250;
-constexpr uint32_t MAX_ANIMATION_DURATION_MS = 300;
+constexpr uint8_t ANIMATION_STEPS_PER_STROKE = 1;
+constexpr uint32_t MIN_ANIMATION_DURATION_MS = 125;
+constexpr uint32_t MAX_ANIMATION_DURATION_MS = 150;
 constexpr char WORD_SD_FOLDER[] = "/word";
 constexpr int PAGER_TOP = 52;
 constexpr int PAGER_HEIGHT = 25;
@@ -281,12 +281,13 @@ String absoluteUrl(const char *value) {
     return hostBase() + (url.startsWith("/") ? url : "/" + url);
 }
 
-bool httpGetText(const String &url, String &payload, bool showLoading = true) {
+bool httpGetText(const String &url, String &payload, bool showLoading = true,
+                 uint32_t timeoutMs = 12000) {
     OptionalLoadingScope loading(showLoading);
     if (WiFi.status() != WL_CONNECTED) return cellularModem.httpGet(url.c_str(), payload);
     HTTPClient http;
     http.setConnectTimeout(7000);
-    http.setTimeout(12000);
+    http.setTimeout(min<uint32_t>(timeoutMs, 65000));
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     http.setReuse(false);
     WiFiClient plain;
@@ -755,23 +756,53 @@ void safeVoiceName(char *output, size_t size) {
 }
 
 bool playPronunciation() {
-    if (selectedIndex < 0 || selectedIndex >= itemCount || !SdCard::isMounted()) return false;
+    if (selectedIndex < 0 || selectedIndex >= itemCount || !SdCard::isMounted()) {
+        Serial.printf("[WORD PRONUNCIATION] unavailable selected=%d count=%u sd=%s\n",
+                      selectedIndex, itemCount, SdCard::isMounted() ? "yes" : "no");
+        return false;
+    }
     UiLoadingIndicator::Scope loadingIndicator;
     const WordItem &item = items[selectedIndex];
     char voice[32] = {};
     safeVoiceName(voice, sizeof(voice));
     char directory[48] = {};
     char path[96] = {};
-    snprintf(directory, sizeof(directory), "%s/%ld", WORD_SD_FOLDER, static_cast<long>(item.id));
+    if (!ensureWordDirectory(item.id, directory, sizeof(directory))) {
+        Serial.printf("[WORD PRONUNCIATION] could not create directory wordId=%ld\n",
+                      static_cast<long>(item.id));
+        return false;
+    }
     snprintf(path, sizeof(path), "%s/pronunciation_%s.opus", directory, voice);
-    if (!SD_MMC.exists(path)) {
+    if (!SdCard::isValidOggOpus(path)) {
+        if (SD_MMC.exists(path)) SD_MMC.remove(path);
         String metadata;
         const String url = apiBase() + "/api/image-learn/" + String(item.id) + "/tts?voice=" + String(voice);
-        if (!httpGetText(url, metadata)) return false;
+        Serial.printf("[WORD PRONUNCIATION] metadata wordId=%ld voice=%s url=%s\n",
+                      static_cast<long>(item.id), selectedVoice, url.c_str());
+        if (!httpGetText(url, metadata, false, 180000)) {
+            Serial.println("[WORD PRONUNCIATION] metadata request failed");
+            return false;
+        }
         JsonDocument document;
-        if (deserializeJson(document, metadata)) return false;
+        const DeserializationError error = deserializeJson(document, metadata);
+        if (error) {
+            Serial.printf("[WORD PRONUNCIATION] metadata JSON failed: %s\n", error.c_str());
+            return false;
+        }
         const char *audioUrl = document["esp32_url"] | document["absolute_audio_url"] | document["audio_url"] | "";
-        if (!audioUrl[0] || !SdCard::downloadFile(absoluteUrl(audioUrl).c_str(), path, 64)) return false;
+        if (!audioUrl[0]) {
+            Serial.println("[WORD PRONUNCIATION] metadata contains no audio URL");
+            return false;
+        }
+        const String downloadUrl = absoluteUrl(audioUrl);
+        Serial.printf("[WORD PRONUNCIATION] downloading url=%s path=%s\n",
+                      downloadUrl.c_str(), path);
+        if (!SdCard::downloadFile(downloadUrl.c_str(), path, 1024) ||
+            !SdCard::isValidOggOpus(path)) {
+            SD_MMC.remove(path);
+            Serial.println("[WORD PRONUNCIATION] invalid or incomplete Opus download");
+            return false;
+        }
     }
     wordAudioActive = OpusPlayer::play(path);
     return wordAudioActive;
@@ -942,13 +973,37 @@ bool takeLibraryLoadCompleted() {
 
 bool isDetail() { return selectedIndex >= 0; }
 
+bool libraryCardBoundsAt(int16_t x, int16_t y, int16_t &left, int16_t &top,
+                         int16_t &width, int16_t &height) {
+    if (selectedIndex >= 0) return false;
+    for (uint8_t i = 0; i < itemCount; ++i) {
+        const int column = i % 2;
+        const int row = i / 2;
+        const int cardX = CARD_X + column * (CARD_W + CARD_GAP_X);
+        const int cardY = CARD_Y + row * (CARD_H + CARD_GAP_Y);
+        if (!inRect(x, y, cardX - 3, cardY - 3, CARD_W + 6, CARD_H + 6)) continue;
+        left = cardX;
+        top = cardY;
+        width = CARD_W;
+        height = CARD_H;
+        return true;
+    }
+    return false;
+}
+
 bool handleTap(int16_t x, int16_t y) {
+    const bool replayTarget = selectedIndex >= 0 &&
+        (inRect(x, y, REPLAY_X - 4, REPLAY_Y - 4, REPLAY_W + 8, REPLAY_H + 8) ||
+         inRect(x, y, GLYPH_X, GLYPH_Y, GLYPH_W, GLYPH_H));
     if (animationActive) animationActive = false;
-    if (wordAudioActive) { OpusPlayer::stop(); wordAudioActive = false; return true; }
+    if (wordAudioActive) {
+        OpusPlayer::stop();
+        wordAudioActive = false;
+        if (!replayTarget) return true;
+    }
     if (selectedIndex >= 0) {
         if (inRect(x, y, 6, 36, 64, 36)) { selectedIndex = -1; strokeCount = 0; return true; }
-        if (inRect(x, y, REPLAY_X - 4, REPLAY_Y - 4, REPLAY_W + 8, REPLAY_H + 8) ||
-            inRect(x, y, GLYPH_X, GLYPH_Y, GLYPH_W, GLYPH_H)) {
+        if (replayTarget) {
             startAnimation();
             replayRefreshRequested = true;
             return true;
@@ -997,11 +1052,19 @@ bool processAnimation() {
     if (wordAudioActive && !OpusPlayer::isPlaying()) wordAudioActive = false;
     if (pronunciationPending) {
         pronunciationPending = false;
-        playPronunciation();
+        const bool started = playPronunciation();
+        Serial.printf("[WORD PRONUNCIATION] word=%s started=%s\n",
+                      selectedIndex >= 0 && selectedIndex < itemCount
+                          ? items[selectedIndex].word : "",
+                      started ? "yes" : "no");
         return false;
     }
-    if (!animationActive || selectedIndex < 0 || millis() < nextAnimationMs) return false;
-    nextAnimationMs = millis() + animationFrameMs;
+    const uint32_t now = millis();
+    if (!animationActive || selectedIndex < 0 ||
+        static_cast<int32_t>(now - nextAnimationMs) < 0) {
+        return false;
+    }
+    nextAnimationMs = now + animationFrameMs;
     if (++animationStep >= ANIMATION_STEPS_PER_STROKE) {
         animationStep = 0;
         ++animationStroke;
@@ -1010,6 +1073,8 @@ bool processAnimation() {
         animationStroke = strokeCount;
         animationStep = ANIMATION_STEPS_PER_STROKE;
         animationActive = false;
+        // processAnimation() returns true so the completed character reaches
+        // the panel first. Pronunciation starts on the following loop pass.
         pronunciationPending = true;
     }
     return true;

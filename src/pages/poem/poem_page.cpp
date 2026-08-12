@@ -41,6 +41,9 @@ constexpr int MARQUEE_X = 34;
 constexpr int MARQUEE_WIDTH = 171;
 constexpr int MARQUEE_HEIGHT = ROW_HEIGHT - 2;
 constexpr int MARQUEE_ROW_BYTES = (MARQUEE_WIDTH + 7) / 8;
+constexpr const char *VOICES[] = {"Bella", "Jasper", "Luna", "Bruno", "Rosie", "Hugo", "Kiki", "Leo"};
+constexpr bool VOICE_IS_FEMALE[] = {true, false, true, false, true, false, true, false};
+constexpr uint8_t VOICE_COUNT = sizeof(VOICES) / sizeof(VOICES[0]);
 constexpr int POPUP_X = 12;
 constexpr int POPUP_Y = LIST_TOP;
 constexpr int POPUP_W = 216;
@@ -588,11 +591,14 @@ bool httpGet(const String &url, String &payload, uint32_t timeoutMs = 20000,
     http.addHeader("Connection", "close");
     http.addHeader("User-Agent", "ESP32-ePaper-Poem/1.0");
     const int code = http.GET();
-    if (code >= 200 && code < 300) payload = http.getString();
+    if (code > 0) payload = http.getString();
     const String error = code < 0 ? http.errorToString(code) : String();
     http.end();
     Serial.printf("[POEM API] response code=%d%s%s bytes=%u url=%s\n", code,
                   error.isEmpty() ? "" : " ", error.c_str(), payload.length(), url.c_str());
+    if (code < 200 || code >= 300) {
+        Serial.printf("[POEM API] error body: %.240s\n", payload.c_str());
+    }
     if (code < 0) {
         if (UiLocalization::isChinese()) std::strcpy(statusText, "网络错误");
         else snprintf(statusText, sizeof(statusText), "HTTP ERROR %d", code);
@@ -624,25 +630,75 @@ String absoluteAudioUrl(const char *value) {
     return host + "/" + url;
 }
 
-void safeVoiceName(char *output, size_t outputSize) {
+void safeVoiceName(const char *voiceName, char *output, size_t outputSize) {
     if (!output || outputSize == 0) return;
     size_t length = 0;
-    for (size_t index = 0; selectedVoice[index] && length + 1 < outputSize; ++index) {
-        const char character = selectedVoice[index];
+    for (size_t index = 0; voiceName && voiceName[index] && length + 1 < outputSize; ++index) {
+        const char character = voiceName[index];
         output[length++] = isalnum(static_cast<unsigned char>(character)) ? character : '_';
     }
     if (length == 0 && outputSize > 1) output[length++] = 'v';
     output[length] = '\0';
 }
 
+int8_t configuredVoiceIndex(const char *voiceName) {
+    for (uint8_t index = 0; index < VOICE_COUNT; ++index) {
+        if (voiceName && std::strcmp(voiceName, VOICES[index]) == 0) return index;
+    }
+    return -1;
+}
+
+bool cachedVoiceOpusPath(int32_t poemId, const char *voiceName, char *path, size_t pathSize) {
+    char safeVoice[32] = {};
+    safeVoiceName(voiceName, safeVoice, sizeof(safeVoice));
+    snprintf(path, pathSize, "%s/%ld/tts_%s.opus", POEM_SD_FOLDER,
+             static_cast<long>(poemId), safeVoice);
+    if (SdCard::isValidOggOpus(path)) return true;
+    if (SD_MMC.exists(path)) SD_MMC.remove(path);
+    return false;
+}
+
 bool cachedOpusPath(int32_t poemId, char *path, size_t pathSize) {
     if (!path || pathSize == 0 || poemId <= 0 || !SdCard::isMounted()) return false;
-    char voice[32] = {};
-    safeVoiceName(voice, sizeof(voice));
-    snprintf(path, pathSize, "%s/%ld/tts_%s.opus", POEM_SD_FOLDER,
-             static_cast<long>(poemId), voice);
-    if (SdCard::isValidOggOpus(path)) return true;
-    SD_MMC.remove(path);
+
+    if (cachedVoiceOpusPath(poemId, selectedVoice, path, pathSize)) return true;
+
+    const int8_t selectedIndex = configuredVoiceIndex(selectedVoice);
+    if (selectedIndex >= 0) {
+        for (uint8_t index = 0; index < VOICE_COUNT; ++index) {
+            if (index != selectedIndex && VOICE_IS_FEMALE[index] == VOICE_IS_FEMALE[selectedIndex] &&
+                cachedVoiceOpusPath(poemId, VOICES[index], path, pathSize)) {
+                return true;
+            }
+        }
+    }
+
+    char directory[40] = {};
+    snprintf(directory, sizeof(directory), "%s/%ld", POEM_SD_FOLDER, static_cast<long>(poemId));
+    File root = SD_MMC.open(directory);
+    if (!root || !root.isDirectory()) {
+        if (root) root.close();
+        return false;
+    }
+    File entry = root.openNextFile();
+    while (entry) {
+        const String entryPath = entry.name();
+        const int slash = entryPath.lastIndexOf('/');
+        const String fileName = entryPath.substring(slash + 1);
+        const bool candidate = !entry.isDirectory() && fileName.startsWith("tts_") &&
+                               fileName.endsWith(".opus");
+        entry.close();
+        if (candidate) {
+            snprintf(path, pathSize, "%s/%s", directory, fileName.c_str());
+            if (SdCard::isValidOggOpus(path)) {
+                root.close();
+                return true;
+            }
+            SD_MMC.remove(path);
+        }
+        entry = root.openNextFile();
+    }
+    root.close();
     return false;
 }
 
@@ -693,7 +749,7 @@ bool ensurePoemOpus(char *path, size_t pathSize) {
     if (!audioUrl[0]) return false;
     const String downloadUrl = absoluteAudioUrl(audioUrl);
     char voice[32] = {};
-    safeVoiceName(voice, sizeof(voice));
+    safeVoiceName(selectedVoice, voice, sizeof(voice));
     snprintf(path, pathSize, "%s/tts_%s.opus", directory, voice);
     Serial.printf("[POEM TTS] Downloading voice=%s url=%s -> %s\n",
                   selectedVoice, downloadUrl.c_str(), path);
@@ -1289,6 +1345,8 @@ bool processAudio() {
         if (!startPoemAudio()) {
             activePoemIndex = -1;
             marqueeReady = false;
+            poemPlaybackPaused = true;
+            playbackIconRefreshRequested = true;
             return true;
         }
         return false;

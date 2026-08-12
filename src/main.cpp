@@ -179,8 +179,9 @@ void serviceTouchInterruptBeforeI2c() {
     const bool voiceActive = currentPage == PageId::Voice && VoicePage::isAudioActive();
     const bool musicActive = currentPage == PageId::Music && MusicPage::isAudioActive();
     const bool poemActive = currentPage == PageId::Poem && PoemPage::isAudioActive();
-    const bool wordActive = currentPage == PageId::Word &&
-                            (WordPage::isAudioActive() || WordPage::isAnimating());
+    // Stroke animation does not use the shared audio/touch I2C path. Including
+    // it here allowed a trailing IRQ from the opening tap to cancel the drawing.
+    const bool wordActive = currentPage == PageId::Word && WordPage::isAudioActive();
     if (!pending || (!voiceActive && !musicActive && !poemActive && !wordActive)) return;
     if ((voiceActive || musicActive || poemActive || WordPage::isAudioActive()) &&
         !OpusPlayer::acceptsTouchStop(interruptTick)) {
@@ -1100,6 +1101,37 @@ void showPressedInversion(int left, int top, int width, int height) {
     epaper.sleep();
     constexpr uint32_t pressedMs = 300;
     delay(pressedMs);
+}
+
+void showPressedBoldFrame(int left, int top, int width, int height) {
+    if (width < 3 || height < 3) return;
+    std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
+    constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
+    const auto setPixel = [](uint8_t *buffer, int x, int y) {
+        if (!buffer || x < 0 || x >= XingtaiEpd::WIDTH ||
+            y < 0 || y >= XingtaiEpd::HEIGHT) return;
+        buffer[static_cast<size_t>(y) * rowBytes + x / 8] |= 0x80U >> (x % 8);
+    };
+    const auto drawOutline = [&](int inset) {
+        const int x0 = left + inset;
+        const int y0 = top + inset;
+        const int x1 = left + width - 1 - inset;
+        const int y1 = top + height - 1 - inset;
+        for (int x = x0; x <= x1; ++x) {
+            setPixel(transitionFrame, x, y0);
+            setPixel(transitionFrame, x, y1);
+        }
+        for (int y = y0; y <= y1; ++y) {
+            setPixel(transitionFrame, x0, y);
+            setPixel(transitionFrame, x1, y);
+        }
+    };
+    drawOutline(0);
+    drawOutline(1);
+    epaper.displayPartial(frame, transitionFrame, left, top, width, height);
+    copyFrameRegion(frame, transitionFrame, left, top, width, height);
+    epaper.sleep();
+    delay(300);
 }
 
 bool showPriorityInversion(int left, int top, int width, int height);
@@ -2082,6 +2114,15 @@ void handleTouch(TPoint point, TEvent event) {
     }
 
     if (currentPage == PageId::Word) {
+        int16_t cardLeft = 0;
+        int16_t cardTop = 0;
+        int16_t cardWidth = 0;
+        int16_t cardHeight = 0;
+        const bool wordCardTapped = WordPage::libraryCardBoundsAt(
+            uiX, uiY, cardLeft, cardTop, cardWidth, cardHeight);
+        if (wordCardTapped) {
+            showPressedBoldFrame(cardLeft, cardTop, cardWidth, cardHeight);
+        }
         if (WordPage::handleTap(uiX, uiY)) {
             if (!priorityControlFeedbackShown &&
                 uiX >= 6 && uiX < 70 && uiY >= 36 && uiY < 72) {
@@ -2095,6 +2136,11 @@ void handleTouch(TPoint point, TEvent event) {
                 refreshCurrentPage();
             }
         }
+        return;
+    }
+
+    if (currentPage == PageId::Recording) {
+        if (RecordingPage::handleTap(uiX, uiY)) refreshCurrentPage();
         return;
     }
 
@@ -2243,6 +2289,9 @@ void processTouchAction() {
     if (currentPage == PageId::Word && nextPage != PageId::Word) {
         WordPage::stopAudio();
     }
+    if (currentPage == PageId::Recording && nextPage != PageId::Recording) {
+        RecordingPage::stop();
+    }
 
     Serial.printf("[UI] Opening %s page\n", pageName(nextPage));
     if (nextPage == PageId::Settings) SettingsPage::showSettings();
@@ -2270,6 +2319,7 @@ void processTouchAction() {
         WordPage::setVoice(SettingsPage::voiceName());
         WordPage::open();
     }
+    if (nextPage == PageId::Recording) RecordingPage::open();
     const bool fastHomeTransition = nextPage == PageId::Main;
     if (fastHomeTransition) {
         // Clear only the function area below the fixed top bar before drawing
@@ -2350,6 +2400,7 @@ void setup() {
     VoicePage::setVoice(SettingsPage::voiceName());
     PoemPage::setAudio(&audio);
     PoemPage::setVoice(SettingsPage::voiceName());
+    RecordingPage::setAudio(&audio);
     applyAudioSetting();
     Serial.println("[BOOT] ES8311 audio initialization complete");
     Serial.println("[BOOT] Initializing touch controller...");
@@ -2453,10 +2504,15 @@ void loop() {
         refreshMusicDirtyRows();
     }
     if (PoemPage::processAudio() && currentPage == PageId::Poem) {
-        refreshCurrentPage();
+        if (PoemPage::takePlaybackIconRefreshRequest()) {
+            refreshPoemPlaybackIcon();
+        }
     }
     if (currentPage == PageId::Word && WordPage::processAnimation()) {
         refreshWordStrokeWindow(false);
+    }
+    if (currentPage == PageId::Recording && RecordingPage::process()) {
+        refreshCurrentPage();
     }
     int16_t marqueeTop = 0;
     if (VoicePage::advanceMarquee(marqueeTop) && currentPage == PageId::Voice) {

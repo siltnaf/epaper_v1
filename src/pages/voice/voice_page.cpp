@@ -41,6 +41,9 @@ constexpr int MARQUEE_X = 34;
 constexpr int MARQUEE_WIDTH = 171;
 constexpr int MARQUEE_HEIGHT = ROW_HEIGHT - 2;
 constexpr int MARQUEE_ROW_BYTES = (MARQUEE_WIDTH + 7) / 8;
+constexpr const char *VOICES[] = {"Bella", "Jasper", "Luna", "Bruno", "Rosie", "Hugo", "Kiki", "Leo"};
+constexpr bool VOICE_IS_FEMALE[] = {true, false, true, false, true, false, true, false};
+constexpr uint8_t VOICE_COUNT = sizeof(VOICES) / sizeof(VOICES[0]);
 
 struct StoryItem {
     int32_t id = 0;
@@ -611,25 +614,75 @@ String absoluteAudioUrl(const char *value) {
     return host + "/" + url;
 }
 
-void safeVoiceName(char *output, size_t outputSize) {
+void safeVoiceName(const char *voiceName, char *output, size_t outputSize) {
     if (!output || outputSize == 0) return;
     size_t length = 0;
-    for (size_t index = 0; selectedVoice[index] && length + 1 < outputSize; ++index) {
-        const char character = selectedVoice[index];
+    for (size_t index = 0; voiceName && voiceName[index] && length + 1 < outputSize; ++index) {
+        const char character = voiceName[index];
         output[length++] = isalnum(static_cast<unsigned char>(character)) ? character : '_';
     }
     if (length == 0 && outputSize > 1) output[length++] = 'v';
     output[length] = '\0';
 }
 
+int8_t configuredVoiceIndex(const char *voiceName) {
+    for (uint8_t index = 0; index < VOICE_COUNT; ++index) {
+        if (voiceName && std::strcmp(voiceName, VOICES[index]) == 0) return index;
+    }
+    return -1;
+}
+
+bool cachedVoiceOpusPath(int32_t storyId, const char *voiceName, char *path, size_t pathSize) {
+    char safeVoice[32] = {};
+    safeVoiceName(voiceName, safeVoice, sizeof(safeVoice));
+    snprintf(path, pathSize, "%s/%ld/tts_%s.opus", STORY_SD_FOLDER,
+             static_cast<long>(storyId), safeVoice);
+    if (SdCard::isValidOggOpus(path)) return true;
+    if (SD_MMC.exists(path)) SD_MMC.remove(path);
+    return false;
+}
+
 bool cachedOpusPath(int32_t storyId, char *path, size_t pathSize) {
     if (!path || pathSize == 0 || storyId <= 0 || !SdCard::isMounted()) return false;
-    char voice[32] = {};
-    safeVoiceName(voice, sizeof(voice));
-    snprintf(path, pathSize, "%s/%ld/tts_%s.opus", STORY_SD_FOLDER,
-             static_cast<long>(storyId), voice);
-    if (SdCard::isValidOggOpus(path)) return true;
-    SD_MMC.remove(path);
+
+    if (cachedVoiceOpusPath(storyId, selectedVoice, path, pathSize)) return true;
+
+    const int8_t selectedIndex = configuredVoiceIndex(selectedVoice);
+    if (selectedIndex >= 0) {
+        for (uint8_t index = 0; index < VOICE_COUNT; ++index) {
+            if (index != selectedIndex && VOICE_IS_FEMALE[index] == VOICE_IS_FEMALE[selectedIndex] &&
+                cachedVoiceOpusPath(storyId, VOICES[index], path, pathSize)) {
+                return true;
+            }
+        }
+    }
+
+    char directory[40] = {};
+    snprintf(directory, sizeof(directory), "%s/%ld", STORY_SD_FOLDER, static_cast<long>(storyId));
+    File root = SD_MMC.open(directory);
+    if (!root || !root.isDirectory()) {
+        if (root) root.close();
+        return false;
+    }
+    File entry = root.openNextFile();
+    while (entry) {
+        const String entryPath = entry.name();
+        const int slash = entryPath.lastIndexOf('/');
+        const String fileName = entryPath.substring(slash + 1);
+        const bool candidate = !entry.isDirectory() && fileName.startsWith("tts_") &&
+                               fileName.endsWith(".opus");
+        entry.close();
+        if (candidate) {
+            snprintf(path, pathSize, "%s/%s", directory, fileName.c_str());
+            if (SdCard::isValidOggOpus(path)) {
+                root.close();
+                return true;
+            }
+            SD_MMC.remove(path);
+        }
+        entry = root.openNextFile();
+    }
+    root.close();
     return false;
 }
 
@@ -680,7 +733,7 @@ bool ensureStoryOpus(char *path, size_t pathSize) {
     if (!audioUrl[0]) return false;
     const String downloadUrl = absoluteAudioUrl(audioUrl);
     char voice[32] = {};
-    safeVoiceName(voice, sizeof(voice));
+    safeVoiceName(selectedVoice, voice, sizeof(voice));
     snprintf(path, pathSize, "%s/tts_%s.opus", directory, voice);
     Serial.printf("[STORY TTS] Downloading voice=%s url=%s -> %s\n",
                   selectedVoice, downloadUrl.c_str(), path);
