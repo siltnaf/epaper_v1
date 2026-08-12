@@ -964,9 +964,9 @@ void refreshPoemDisplay() {
 }
 
 void refreshPoemPlaybackIcon() {
-    constexpr uint16_t iconX = 194;
+    constexpr uint16_t iconX = 173;
     constexpr uint16_t iconY = 87;
-    constexpr uint16_t iconWidth = 28;
+    constexpr uint16_t iconWidth = 48;
     constexpr uint16_t iconHeight = 28;
     PoemPage::render(transitionFrame);
     epaper.displayPartial(frame, transitionFrame, iconX, iconY,
@@ -1101,6 +1101,32 @@ void showPressedInversion(int left, int top, int width, int height) {
     epaper.sleep();
     constexpr uint32_t pressedMs = 300;
     delay(pressedMs);
+}
+
+void showPressedRoundedInversion(int left, int top, int width, int height) {
+    if (width <= 0 || height <= 0) return;
+    std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
+    constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
+    constexpr uint8_t cornerInsets[] = {6, 3, 2, 1, 1, 0};
+    const int right = min<int>(XingtaiEpd::WIDTH, left + width);
+    const int bottom = min<int>(XingtaiEpd::HEIGHT, top + height);
+    for (int y = max(0, top); y < bottom; ++y) {
+        const int localY = y - top;
+        int inset = 0;
+        if (localY < 6) {
+            inset = cornerInsets[localY];
+        } else if (localY >= height - 6) {
+            inset = cornerInsets[height - 1 - localY];
+        }
+        uint8_t *row = transitionFrame + static_cast<size_t>(y) * rowBytes;
+        for (int x = max(0, left + inset); x < min(right, left + width - inset); ++x) {
+            row[x / 8] ^= 0x80U >> (x % 8);
+        }
+    }
+    epaper.displayPartial(frame, transitionFrame, left, top, width, height);
+    copyFrameRegion(frame, transitionFrame, left, top, width, height);
+    epaper.sleep();
+    delay(300);
 }
 
 void showPressedBoldFrame(int left, int top, int width, int height) {
@@ -2099,8 +2125,18 @@ void handleTouch(TPoint point, TEvent event) {
 
     if (currentPage == PageId::Poem) {
         const bool popupWasOpen = PoemPage::isPopupOpen();
+        const bool returnTapped = PoemPage::returnControlAt(uiX, uiY);
+        const bool replayTapped = PoemPage::replayControlAt(uiX, uiY);
+        if (returnTapped) {
+            // Byte-aligned window x=24..63 keeps the partial waveform away from
+            // the poem popup's bold outer frame at x=12..13.
+            showPressedInversion(24, 89, 40, 24);
+        } else if (replayTapped) {
+            showPressedInversion(173, 87, 48, 28);
+        }
         if (PoemPage::handleTap(uiX, uiY)) {
-            if (!popupWasOpen && !priorityControlFeedbackShown) {
+            if (!popupWasOpen && !priorityControlFeedbackShown &&
+                !returnTapped && !replayTapped) {
                 showPagerPressedInversion(uiX, uiY);
             }
             if (PoemPage::takePlaybackIconRefreshRequest()) {
@@ -2140,6 +2176,27 @@ void handleTouch(TPoint point, TEvent event) {
     }
 
     if (currentPage == PageId::Recording) {
+        int16_t tagLeft = 0;
+        int16_t tagTop = 0;
+        int16_t tagWidth = 0;
+        int16_t tagHeight = 0;
+        int16_t pagerLeft = 0;
+        int16_t pagerTop = 0;
+        int16_t pagerWidth = 0;
+        int16_t pagerHeight = 0;
+        if (RecordingPage::returnControlAt(uiX, uiY)) {
+            showPressedInversion(10, 40, 48, 28);
+        } else if (RecordingPage::folderControlAt(uiX, uiY)) {
+            showPressedRoundedInversion(12, 333, 56, 56);
+        } else if (RecordingPage::pauseControlAt(uiX, uiY)) {
+            showPressedRoundedInversion(172, 333, 56, 56);
+        } else if (RecordingPage::tagItemBoundsAt(uiX, uiY, tagLeft, tagTop,
+                                                   tagWidth, tagHeight)) {
+            showPressedInversion(tagLeft, tagTop, tagWidth, tagHeight);
+        } else if (RecordingPage::pagerControlBoundsAt(uiX, uiY, pagerLeft, pagerTop,
+                                                        pagerWidth, pagerHeight)) {
+            showPressedInversion(pagerLeft, pagerTop, pagerWidth, pagerHeight);
+        }
         if (RecordingPage::handleTap(uiX, uiY)) refreshCurrentPage();
         return;
     }
@@ -2531,6 +2588,12 @@ void loop() {
         PoemPage::renderMarquee(transitionFrame, frame);
         epaper.displayPartial(frame, transitionFrame, 34, marqueeTop + 1, 171, 28);
         std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+        epaper.sleep();
+    }
+    if (RecordingPage::advanceMarquee(marqueeTop) && currentPage == PageId::Recording) {
+        RecordingPage::renderMarquee(transitionFrame, frame);
+        epaper.displayPartial(frame, transitionFrame, 43, marqueeTop + 1, 125, 29);
+        copyFrameRegion(frame, transitionFrame, 43, marqueeTop + 1, 125, 29);
         epaper.sleep();
     }
     updateNetworkPriority();

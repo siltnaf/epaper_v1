@@ -4,29 +4,47 @@
 #include <SD_MMC.h>
 
 #include <cstring>
+#include <ctime>
 
+#include "board_pins.h"
 #include "devices/epd_xingtai/epd_xingtai.h"
+#include "devices/audio/opus_player.h"
 #include "devices/es8311/es8311.h"
 #include "devices/sd_card/sd_card.h"
+#include "pages/recording/folder_bitmap.h"
 #include "ui/localization.h"
 
 namespace {
 
 constexpr char ROOT_FOLDER[] = "/recordings";
 constexpr uint32_t SAMPLE_RATE = 16000;
-constexpr uint16_t CHANNELS = 2;
+constexpr uint16_t RECORDING_CHANNELS = 1;
+constexpr uint16_t I2S_CHANNELS = 2;
 constexpr uint16_t BITS_PER_SAMPLE = 16;
-constexpr uint32_t BYTE_RATE = SAMPLE_RATE * CHANNELS * BITS_PER_SAMPLE / 8;
-constexpr uint8_t TAG_COUNT = 5;
+constexpr uint32_t BYTE_RATE = SAMPLE_RATE * RECORDING_CHANNELS * BITS_PER_SAMPLE / 8;
+constexpr uint8_t TAG_COUNT = 6;
 constexpr uint8_t MAX_FILES = 8;
 constexpr int TAG_X = 48;
-constexpr int TAG_Y = 92;
+constexpr int TAG_Y = 58;
+constexpr int BROWSER_TAG_Y = 76;
 constexpr int TAG_W = 144;
 constexpr int TAG_H = 38;
 constexpr int TAG_GAP = 10;
+constexpr int TAG_TEXT_SCALE = 1;
+constexpr int FILE_LIST_TOP = 108;
+constexpr int FILE_ROW_HEIGHT = 31;
+constexpr int FILE_ROW_GAP = 7;
+constexpr int FILE_MARQUEE_X = 43;
+constexpr int FILE_MARQUEE_WIDTH = 125;
+constexpr int FILE_MARQUEE_HEIGHT = FILE_ROW_HEIGHT - 2;
+constexpr int FILE_MARQUEE_ROW_BYTES = (FILE_MARQUEE_WIDTH + 7) / 8;
+constexpr int FILE_PAGER_TOP = 76;
+constexpr int FILE_PAGER_HEIGHT = 25;
+constexpr int FILE_PAGER_BUTTON_WIDTH = 34;
 
-constexpr const char *TAG_NAMES[TAG_COUNT] = {"Note", "Work", "Idea", "Buy", "Private"};
-constexpr const char *TAG_FOLDERS[TAG_COUNT] = {"note", "work", "idea", "buy", "private"};
+constexpr const char *TAG_NAMES[TAG_COUNT] = {"Note", "Work", "Idea", "Buy", "Private", "Meeting"};
+constexpr const char *TAG_NAMES_CN[TAG_COUNT] = {"笔记", "工作", "想法", "购买", "私人", "会议"};
+constexpr const char *TAG_FOLDERS[TAG_COUNT] = {"note", "work", "idea", "buy", "private", "meeting"};
 
 enum class View : uint8_t { Tags, Recorder, BrowseTags, Files };
 
@@ -35,6 +53,8 @@ Es8311 *codec = nullptr;
 int8_t selectedTag = -1;
 char fileNames[MAX_FILES][40] = {};
 uint8_t fileCount = 0;
+uint16_t fileTotal = 0;
+uint16_t filePage = 1;
 char activePath[96] = {};
 File recordingFile;
 TaskHandle_t recordingTaskHandle = nullptr;
@@ -47,6 +67,18 @@ uint32_t pauseStartedMs = 0;
 uint32_t pausedTotalMs = 0;
 uint32_t lastRenderedSecond = UINT32_MAX;
 char statusText[48] = "READY";
+TaskHandle_t playbackTaskHandle = nullptr;
+volatile bool playbackActive = false;
+volatile bool playbackPaused = false;
+volatile bool playbackStopRequested = false;
+volatile bool playbackCompleted = false;
+bool playbackPending = false;
+int8_t activeFileIndex = -1;
+char playbackPath[96] = {};
+uint8_t marqueeBitmap[FILE_MARQUEE_ROW_BYTES * FILE_MARQUEE_HEIGHT] = {};
+bool marqueeReady = false;
+uint16_t marqueeOffset = 0;
+uint32_t nextMarqueeMs = 0;
 
 void pixel(uint8_t *frame, int x, int y) {
     if (!frame || x < 0 || x >= XingtaiEpd::WIDTH || y < 0 || y >= XingtaiEpd::HEIGHT) return;
@@ -73,6 +105,45 @@ void rect(uint8_t *frame, int x, int y, int width, int height) {
     line(frame, x + width - 1, y, x + width - 1, y + height - 1);
 }
 
+void drawArrow(uint8_t *frame, int centerX, int centerY, bool right) {
+    const int direction = right ? 1 : -1;
+    line(frame, centerX - direction * 5, centerY - 7,
+         centerX + direction * 3, centerY);
+    line(frame, centerX + direction * 3, centerY,
+         centerX - direction * 5, centerY + 7);
+}
+
+void drawDoubleArrow(uint8_t *frame, int centerX, int centerY, bool right) {
+    drawArrow(frame, centerX - (right ? 4 : -4), centerY, right);
+    drawArrow(frame, centerX + (right ? 4 : -4), centerY, right);
+}
+
+void hline(uint8_t *frame, int x, int y, int width) {
+    for (int offset = 0; offset < width; ++offset) pixel(frame, x + offset, y);
+}
+
+void vline(uint8_t *frame, int x, int y, int height) {
+    for (int offset = 0; offset < height; ++offset) pixel(frame, x, y + offset);
+}
+
+void roundedFrame(uint8_t *frame, int x, int y, int width, int height) {
+    constexpr int radius = 6;
+    hline(frame, x + radius, y, width - radius * 2);
+    hline(frame, x + radius, y + height - 1, width - radius * 2);
+    vline(frame, x, y + radius, height - radius * 2);
+    vline(frame, x + width - 1, y + radius, height - radius * 2);
+    constexpr uint8_t cornerX[] = {5, 4, 3, 2, 1, 1, 0};
+    constexpr uint8_t cornerY[] = {0, 1, 1, 2, 3, 4, 5};
+    for (size_t index = 0; index < sizeof(cornerX); ++index) {
+        const int dx = cornerX[index];
+        const int dy = cornerY[index];
+        pixel(frame, x + dx, y + dy);
+        pixel(frame, x + width - 1 - dx, y + dy);
+        pixel(frame, x + dx, y + height - 1 - dy);
+        pixel(frame, x + width - 1 - dx, y + height - 1 - dy);
+    }
+}
+
 void circle(uint8_t *frame, int centerX, int centerY, int radius) {
     int x = radius, y = 0, error = 0;
     while (x >= y) {
@@ -85,8 +156,62 @@ void circle(uint8_t *frame, int centerX, int centerY, int radius) {
     }
 }
 
+void fillCircle(uint8_t *frame, int centerX, int centerY, int radius) {
+    for (int y = -radius; y <= radius; ++y) {
+        for (int x = -radius; x <= radius; ++x) {
+            if (x * x + y * y <= radius * radius) pixel(frame, centerX + x, centerY + y);
+        }
+    }
+}
+
 bool inRect(int16_t x, int16_t y, int left, int top, int width, int height) {
     return x >= left && x < left + width && y >= top && y < top + height;
+}
+
+bool framePixel(const uint8_t *frame, int x, int y) {
+    if (!frame || x < 0 || x >= XingtaiEpd::WIDTH || y < 0 || y >= XingtaiEpd::HEIGHT) {
+        return false;
+    }
+    return (frame[static_cast<size_t>(y) * (XingtaiEpd::WIDTH / 8) + x / 8] &
+            (0x80U >> (x % 8))) != 0;
+}
+
+void captureMarquee(const uint8_t *frame, int top) {
+    std::memset(marqueeBitmap, 0x00, sizeof(marqueeBitmap));
+    for (int y = 0; y < FILE_MARQUEE_HEIGHT; ++y) {
+        for (int x = 0; x < FILE_MARQUEE_WIDTH; ++x) {
+            if (framePixel(frame, FILE_MARQUEE_X + x, top + 1 + y)) {
+                marqueeBitmap[y * FILE_MARQUEE_ROW_BYTES + x / 8] |=
+                    0x80U >> (x % 8);
+            }
+        }
+    }
+    marqueeReady = true;
+    marqueeOffset = 0;
+    nextMarqueeMs = millis() + 900;
+}
+
+bool marqueePixel(int x, int y) {
+    return (marqueeBitmap[y * FILE_MARQUEE_ROW_BYTES + x / 8] &
+            (0x80U >> (x % 8))) != 0;
+}
+
+const char *tagLabel(uint8_t tag) {
+    if (tag >= TAG_COUNT) return "";
+    return UiLocalization::isChinese() ? TAG_NAMES_CN[tag] : TAG_NAMES[tag];
+}
+
+const char *localizedStatus() {
+    if (!UiLocalization::isChinese()) return statusText;
+    if (std::strcmp(statusText, "READY") == 0) return "就绪";
+    if (std::strcmp(statusText, "RECORDING") == 0) return "录音中";
+    if (std::strcmp(statusText, "PAUSED") == 0) return "已暂停";
+    if (std::strcmp(statusText, "SAVED") == 0) return "已保存";
+    if (std::strcmp(statusText, "RECORDING UNAVAILABLE") == 0) return "录音不可用";
+    if (std::strcmp(statusText, "FILE OPEN FAILED") == 0) return "文件打开失败";
+    if (std::strcmp(statusText, "RECORD TASK FAILED") == 0) return "录音任务失败";
+    if (std::strcmp(statusText, "STOP TIMEOUT") == 0) return "停止超时";
+    return statusText;
 }
 
 void writeLe16(File &file, uint16_t value) {
@@ -105,11 +230,155 @@ void writeWavHeader(File &file, uint32_t dataBytes) {
     file.write(reinterpret_cast<const uint8_t *>("RIFF"), 4);
     writeLe32(file, 36 + dataBytes);
     file.write(reinterpret_cast<const uint8_t *>("WAVEfmt "), 8);
-    writeLe32(file, 16); writeLe16(file, 1); writeLe16(file, CHANNELS);
+    writeLe32(file, 16); writeLe16(file, 1); writeLe16(file, RECORDING_CHANNELS);
     writeLe32(file, SAMPLE_RATE); writeLe32(file, BYTE_RATE);
-    writeLe16(file, CHANNELS * BITS_PER_SAMPLE / 8); writeLe16(file, BITS_PER_SAMPLE);
+    writeLe16(file, RECORDING_CHANNELS * BITS_PER_SAMPLE / 8);
+    writeLe16(file, BITS_PER_SAMPLE);
     file.write(reinterpret_cast<const uint8_t *>("data"), 4);
     writeLe32(file, dataBytes);
+}
+
+uint16_t readLe16(const uint8_t *bytes) {
+    return static_cast<uint16_t>(bytes[0]) |
+           (static_cast<uint16_t>(bytes[1]) << 8);
+}
+
+uint32_t readLe32(const uint8_t *bytes) {
+    return static_cast<uint32_t>(bytes[0]) |
+           (static_cast<uint32_t>(bytes[1]) << 8) |
+           (static_cast<uint32_t>(bytes[2]) << 16) |
+           (static_cast<uint32_t>(bytes[3]) << 24);
+}
+
+bool seekWavData(File &file, uint32_t &dataBytes, uint16_t &channels) {
+    uint8_t header[12] = {};
+    if (file.read(header, sizeof(header)) != sizeof(header) ||
+        std::memcmp(header, "RIFF", 4) != 0 || std::memcmp(header + 8, "WAVE", 4) != 0) {
+        return false;
+    }
+    while (file.available()) {
+        uint8_t chunk[8] = {};
+        if (file.read(chunk, sizeof(chunk)) != sizeof(chunk)) return false;
+        const uint32_t size = readLe32(chunk + 4);
+        if (std::memcmp(chunk, "fmt ", 4) == 0) {
+            uint8_t format[16] = {};
+            if (size < sizeof(format) || file.read(format, sizeof(format)) != sizeof(format)) return false;
+            channels = readLe16(format + 2);
+            if (readLe16(format) != 1 || (channels != 1 && channels != 2) ||
+                readLe32(format + 4) != SAMPLE_RATE || readLe16(format + 14) != BITS_PER_SAMPLE) {
+                return false;
+            }
+            if (size > sizeof(format) && !file.seek(file.position() + size - sizeof(format))) return false;
+        } else if (std::memcmp(chunk, "data", 4) == 0) {
+            dataBytes = size;
+            return true;
+        } else if (!file.seek(file.position() + size + (size & 1U))) {
+            return false;
+        }
+    }
+    return false;
+}
+
+void playbackTask(void *) {
+    File file = SD_MMC.open(playbackPath, FILE_READ);
+    uint32_t remaining = 0;
+    uint16_t channels = 0;
+    bool valid = file && seekWavData(file, remaining, channels);
+    if (valid && codec) {
+        pinMode(BoardPins::PA_EN, OUTPUT);
+        digitalWrite(BoardPins::PA_EN, HIGH);
+        codec->setSpeakerEnabled(true);
+        vTaskDelay(pdMS_TO_TICKS(60));
+        Serial.printf("[RECORDING PLAYBACK] Started path=%s bytes=%lu channels=%u PA=%d\n",
+                      playbackPath, static_cast<unsigned long>(remaining), channels,
+                      digitalRead(BoardPins::PA_EN));
+        int16_t input[256] = {};
+        int16_t output[512] = {};
+        uint16_t playbackPeak = 0;
+        while (!playbackStopRequested && remaining > 0) {
+            if (playbackPaused) {
+                codec->setSpeakerEnabled(false);
+                vTaskDelay(pdMS_TO_TICKS(10));
+                continue;
+            }
+            codec->setSpeakerEnabled(true);
+            const size_t wanted = min<size_t>(sizeof(input), remaining);
+            const size_t bytes = file.read(reinterpret_cast<uint8_t *>(input), wanted);
+            if (bytes == 0) break;
+            remaining -= bytes;
+            const size_t inputSamples = bytes / sizeof(int16_t);
+            const size_t frames = inputSamples / channels;
+            for (size_t frame = 0; frame < frames; ++frame) {
+                int16_t sample = input[frame * channels];
+                if (channels == 2) {
+                    const int16_t other = input[frame * channels + 1];
+                    if (abs(static_cast<int32_t>(other)) > abs(static_cast<int32_t>(sample))) {
+                        sample = other;
+                    }
+                }
+                playbackPeak = max<uint16_t>(playbackPeak,
+                    static_cast<uint16_t>(min<int32_t>(32767, abs(static_cast<int32_t>(sample)))));
+                output[frame * I2S_CHANNELS] = sample;
+                output[frame * I2S_CHANNELS + 1] = sample;
+            }
+            const size_t outputSamples = frames * I2S_CHANNELS;
+            if (codec->write(output, outputSamples, 1000) != outputSamples) break;
+        }
+        Serial.printf("[RECORDING PLAYBACK] Peak=%u\n", playbackPeak);
+    } else {
+        Serial.printf("[RECORDING PLAYBACK] Invalid WAV path=%s\n", playbackPath);
+    }
+    if (file) file.close();
+    if (codec) codec->setSpeakerEnabled(false);
+    digitalWrite(BoardPins::PA_EN, LOW);
+    playbackActive = false;
+    playbackPaused = false;
+    playbackStopRequested = false;
+    playbackCompleted = true;
+    playbackTaskHandle = nullptr;
+    Serial.println("[RECORDING PLAYBACK] Finished");
+    vTaskDelete(nullptr);
+}
+
+void stopPlayback() {
+    playbackPending = false;
+    if (playbackTaskHandle || playbackActive) {
+        playbackStopRequested = true;
+        playbackPaused = false;
+        const uint32_t started = millis();
+        while (playbackTaskHandle && millis() - started < 2000) vTaskDelay(pdMS_TO_TICKS(5));
+    }
+    playbackActive = false;
+    playbackPaused = false;
+    playbackStopRequested = false;
+    playbackCompleted = false;
+    activeFileIndex = -1;
+    marqueeReady = false;
+    marqueeOffset = 0;
+}
+
+bool startPlayback() {
+    if (activeFileIndex < 0 || activeFileIndex >= static_cast<int8_t>(fileCount) ||
+        selectedTag < 0 || selectedTag >= TAG_COUNT || !codec || !codec->isInitialized()) {
+        return false;
+    }
+    OpusPlayer::stop();
+    snprintf(playbackPath, sizeof(playbackPath), "%s/%s/%s", ROOT_FOLDER,
+             TAG_FOLDERS[selectedTag], fileNames[activeFileIndex]);
+    if (!SD_MMC.exists(playbackPath)) return false;
+    playbackStopRequested = false;
+    playbackPaused = false;
+    playbackCompleted = false;
+    playbackActive = true;
+    marqueeReady = false;
+    marqueeOffset = 0;
+    if (xTaskCreatePinnedToCore(playbackTask, "wav-playback", 4096, nullptr, 2,
+                                &playbackTaskHandle, 0) != pdPASS) {
+        playbackActive = false;
+        playbackTaskHandle = nullptr;
+        return false;
+    }
+    return true;
 }
 
 bool ensureFolders(int8_t tag) {
@@ -120,26 +389,30 @@ bool ensureFolders(int8_t tag) {
     return SD_MMC.exists(folder) || SD_MMC.mkdir(folder);
 }
 
-uint16_t nextFileNumber(int8_t tag) {
-    char folder[48] = {};
-    snprintf(folder, sizeof(folder), "%s/%s", ROOT_FOLDER, TAG_FOLDERS[tag]);
-    File root = SD_MMC.open(folder);
-    uint16_t maximum = 0;
-    if (root && root.isDirectory()) {
-        File entry = root.openNextFile();
-        while (entry) {
-            const String path(entry.name());
-            const int slash = path.lastIndexOf('/');
-            const String name = path.substring(slash + 1);
-            if (!entry.isDirectory() && name.startsWith("REC_") && name.endsWith(".wav")) {
-                maximum = max<uint16_t>(maximum, static_cast<uint16_t>(name.substring(4, 8).toInt()));
-            }
-            entry.close();
-            entry = root.openNextFile();
-        }
+void buildRecordingPath(int8_t tag, char *path, size_t pathSize) {
+    if (!path || pathSize == 0 || tag < 0 || tag >= TAG_COUNT) return;
+    time_t now = time(nullptr);
+    tm local = {};
+    localtime_r(&now, &local);
+    char date[9] = {};
+    char timestamp[7] = {};
+    if (local.tm_year + 1900 >= 2024) {
+        std::strftime(date, sizeof(date), "%Y%m%d", &local);
+        std::strftime(timestamp, sizeof(timestamp), "%H%M%S", &local);
+    } else {
+        std::strcpy(date, "nosync");
+        snprintf(timestamp, sizeof(timestamp), "%06lu",
+                 static_cast<unsigned long>((millis() / 1000) % 1000000UL));
     }
-    if (root) root.close();
-    return maximum + 1;
+
+    snprintf(path, pathSize, "%s/%s/%s_%s_%s.wav", ROOT_FOLDER,
+             TAG_FOLDERS[tag], TAG_FOLDERS[tag], date, timestamp);
+    if (!SD_MMC.exists(path)) return;
+    for (uint8_t suffix = 2; suffix < 100; ++suffix) {
+        snprintf(path, pathSize, "%s/%s/%s_%s_%s_%u.wav", ROOT_FOLDER,
+                 TAG_FOLDERS[tag], TAG_FOLDERS[tag], date, timestamp, suffix);
+        if (!SD_MMC.exists(path)) return;
+    }
 }
 
 uint32_t elapsedSeconds() {
@@ -149,13 +422,26 @@ uint32_t elapsedSeconds() {
 }
 
 void recordingTask(void *) {
-    int16_t samples[480] = {};
+    int16_t i2sSamples[480] = {};
+    int16_t monoSamples[240] = {};
+    uint16_t recordingPeak = 0;
     while (!recordingStopRequested) {
-        const size_t count = codec ? codec->read(samples, 480, 100) : 0;
+        const size_t count = codec ? codec->read(i2sSamples, 480, 100) : 0;
         if (count == 0) continue;
         if (!recordingPaused && recordingFile) {
+            const size_t frames = count / I2S_CHANNELS;
+            for (size_t frame = 0; frame < frames; ++frame) {
+                int16_t sample = i2sSamples[frame * I2S_CHANNELS];
+                const int16_t other = i2sSamples[frame * I2S_CHANNELS + 1];
+                if (abs(static_cast<int32_t>(other)) > abs(static_cast<int32_t>(sample))) {
+                    sample = other;
+                }
+                monoSamples[frame] = sample;
+                recordingPeak = max<uint16_t>(recordingPeak,
+                    static_cast<uint16_t>(min<int32_t>(32767, abs(static_cast<int32_t>(sample)))));
+            }
             recordedDataBytes += recordingFile.write(
-                reinterpret_cast<const uint8_t *>(samples), count * sizeof(int16_t));
+                reinterpret_cast<const uint8_t *>(monoSamples), frames * sizeof(int16_t));
         }
     }
     if (recordingFile) {
@@ -165,17 +451,18 @@ void recordingTask(void *) {
     }
     recordingActive = false;
     recordingPaused = false;
+    Serial.printf("[RECORDING] Capture peak=%u\n", recordingPeak);
     recordingTaskHandle = nullptr;
     vTaskDelete(nullptr);
 }
 
 bool startRecording() {
+    stopPlayback();
     if (recordingActive || !codec || !codec->isInitialized() || !ensureFolders(selectedTag)) {
         std::strcpy(statusText, "RECORDING UNAVAILABLE");
         return false;
     }
-    snprintf(activePath, sizeof(activePath), "%s/%s/REC_%04u.wav",
-             ROOT_FOLDER, TAG_FOLDERS[selectedTag], nextFileNumber(selectedTag));
+    buildRecordingPath(selectedTag, activePath, sizeof(activePath));
     recordingFile = SD_MMC.open(activePath, FILE_WRITE);
     if (!recordingFile) { std::strcpy(statusText, "FILE OPEN FAILED"); return false; }
     writeWavHeader(recordingFile, 0);
@@ -224,84 +511,194 @@ void togglePause() {
     }
 }
 
+uint16_t filePageCount() {
+    return fileTotal > 0 ? (fileTotal + MAX_FILES - 1) / MAX_FILES : 1;
+}
+
 void loadFiles(int8_t tag) {
     fileCount = 0;
+    fileTotal = 0;
+    std::memset(fileNames, 0, sizeof(fileNames));
     if (!ensureFolders(tag)) return;
     char folder[48] = {};
     snprintf(folder, sizeof(folder), "%s/%s", ROOT_FOLDER, TAG_FOLDERS[tag]);
     File root = SD_MMC.open(folder);
     if (!root || !root.isDirectory()) { if (root) root.close(); return; }
     File entry = root.openNextFile();
+    while (entry) {
+        const String path(entry.name());
+        const int slash = path.lastIndexOf('/');
+        const String name = path.substring(slash + 1);
+        if (!entry.isDirectory() && name.endsWith(".wav")) ++fileTotal;
+        entry.close();
+        entry = root.openNextFile();
+    }
+    root.close();
+
+    if (filePage > filePageCount()) filePage = filePageCount();
+    const uint16_t firstItem = (filePage - 1) * MAX_FILES;
+    uint16_t validIndex = 0;
+    root = SD_MMC.open(folder);
+    if (!root || !root.isDirectory()) { if (root) root.close(); return; }
+    entry = root.openNextFile();
     while (entry && fileCount < MAX_FILES) {
         const String path(entry.name());
         const int slash = path.lastIndexOf('/');
         const String name = path.substring(slash + 1);
         if (!entry.isDirectory() && name.endsWith(".wav")) {
-            std::strncpy(fileNames[fileCount], name.c_str(), sizeof(fileNames[fileCount]) - 1);
-            ++fileCount;
+            if (validIndex >= firstItem) {
+                std::strncpy(fileNames[fileCount], name.c_str(),
+                             sizeof(fileNames[fileCount]) - 1);
+                ++fileCount;
+            }
+            ++validIndex;
         }
         entry.close();
         entry = root.openNextFile();
     }
     root.close();
+    Serial.printf("[RECORDING FILES] tag=%s page=%u/%u items=%u total=%u\n",
+                  TAG_NAMES[tag], filePage, filePageCount(), fileCount, fileTotal);
 }
 
 void drawBack(uint8_t *frame) {
     rect(frame, 10, 40, 48, 28);
-    line(frame, 40, 47, 25, 54); line(frame, 25, 54, 40, 61);
+    const char *label = UiLocalization::isChinese() ? "返回" : "BACK";
+    const int width = UiLocalization::textWidth(label, 1);
+    UiLocalization::drawText(frame, 10 + (48 - width) / 2, 49, label, 1);
 }
 
 void drawFolder(uint8_t *frame, int x, int y) {
-    line(frame, x, y + 6, x + 12, y + 6); line(frame, x + 12, y + 6, x + 16, y + 10);
-    rect(frame, x, y + 10, 38, 26);
-}
-
-void drawTags(uint8_t *frame, bool browser) {
-    UiLocalization::drawCentered(frame, 55, browser ? "CHOOSE TAG FOLDER" : "CHOOSE TAG", 1);
-    if (browser) drawBack(frame);
-    for (uint8_t i = 0; i < TAG_COUNT; ++i) {
-        const int top = TAG_Y + i * (TAG_H + TAG_GAP);
-        rect(frame, TAG_X, top, TAG_W, TAG_H);
-        UiLocalization::drawCentered(frame, top + 13, TAG_NAMES[i], 1);
+    for (uint8_t row = 0; row < FolderBitmap::HEIGHT; ++row) {
+        for (uint8_t column = 0; column < FolderBitmap::WIDTH; ++column) {
+            const uint8_t packed = FolderBitmap::DATA[
+                row * FolderBitmap::ROW_BYTES + column / 8];
+            if ((packed & (0x80U >> (column % 8))) != 0) {
+                pixel(frame, x + column, y + row);
+            }
+        }
     }
 }
 
+void drawTags(uint8_t *frame, bool browser) {
+    if (browser) {
+        drawBack(frame);
+    }
+    const int listTop = browser ? BROWSER_TAG_Y : TAG_Y;
+    for (uint8_t i = 0; i < TAG_COUNT; ++i) {
+        const int top = listTop + i * (TAG_H + TAG_GAP);
+        rect(frame, TAG_X, top, TAG_W, TAG_H);
+        UiLocalization::drawCentered(frame, top + 13, tagLabel(i), TAG_TEXT_SCALE);
+    }
+}
+
+void drawPlayPause(uint8_t *frame, int centerX, int centerY, bool pause) {
+    if (pause) {
+        rect(frame, centerX - 18, centerY - 21, 12, 43);
+        rect(frame, centerX + 7, centerY - 21, 12, 43);
+        return;
+    }
+    line(frame, centerX - 15, centerY - 22, centerX - 15, centerY + 22);
+    line(frame, centerX - 15, centerY - 22, centerX + 20, centerY);
+    line(frame, centerX + 20, centerY, centerX - 15, centerY + 22);
+}
+
+void drawRowPlayPause(uint8_t *frame, int centerX, int centerY, bool pause) {
+    if (pause) {
+        rect(frame, centerX - 7, centerY - 8, 5, 17);
+        rect(frame, centerX + 3, centerY - 8, 5, 17);
+        return;
+    }
+    line(frame, centerX - 6, centerY - 9, centerX - 6, centerY + 9);
+    line(frame, centerX - 6, centerY - 9, centerX + 8, centerY);
+    line(frame, centerX + 8, centerY, centerX - 6, centerY + 9);
+}
+
+void drawTrash(uint8_t *frame, int centerX, int centerY) {
+    rect(frame, centerX - 6, centerY - 5, 13, 15);
+    line(frame, centerX - 8, centerY - 8, centerX + 8, centerY - 8);
+    line(frame, centerX - 3, centerY - 11, centerX + 3, centerY - 11);
+    line(frame, centerX - 3, centerY - 11, centerX - 3, centerY - 9);
+    line(frame, centerX + 3, centerY - 11, centerX + 3, centerY - 9);
+    line(frame, centerX - 2, centerY - 2, centerX - 2, centerY + 7);
+    line(frame, centerX + 2, centerY - 2, centerX + 2, centerY + 7);
+}
+
 void drawRecordButton(uint8_t *frame) {
-    circle(frame, 120, 354, 39);
-    if (recordingActive) rect(frame, 108, 342, 24, 24);
-    else circle(frame, 120, 354, 14);
+    circle(frame, 120, 361, 39);
+    if (recordingActive) fillCircle(frame, 120, 361, 14);
+    else rect(frame, 108, 349, 24, 24);
 }
 
 void drawRecorder(uint8_t *frame) {
     drawBack(frame);
-    UiLocalization::drawCentered(frame, 48, TAG_NAMES[selectedTag], 1);
+    UiLocalization::drawCentered(frame, 48, tagLabel(selectedTag), 1);
     const uint32_t seconds = elapsedSeconds();
     char timer[20] = {};
     snprintf(timer, sizeof(timer), "%02lu:%02lu:%02lu",
              static_cast<unsigned long>(seconds / 3600),
              static_cast<unsigned long>((seconds / 60) % 60),
              static_cast<unsigned long>(seconds % 60));
-    UiLocalization::drawCentered(frame, 120, timer, 2);
-    UiLocalization::drawCentered(frame, 178, statusText, 1);
-    rect(frame, 154, 205, 58, 42);
-    UiLocalization::drawText(frame, 163, 216, "512", 1);
-    UiLocalization::drawText(frame, 164, 230, "kbps", 1);
+    UiLocalization::drawCentered(frame, 120, timer, 4);
+    UiLocalization::drawCentered(frame, 178, localizedStatus(), 1);
     line(frame, 12, 278, 228, 278);
-    drawFolder(frame, 27, 337);
+    roundedFrame(frame, 12, 333, 56, 56);
+    drawFolder(frame, 16, 337);
     drawRecordButton(frame);
-    line(frame, 195, 338, 195, 370); line(frame, 208, 338, 208, 370);
+    roundedFrame(frame, 172, 333, 56, 56);
+    drawPlayPause(frame, 200, 361, !recordingPaused);
 }
 
 void drawFiles(uint8_t *frame) {
     drawBack(frame);
     char title[48] = {};
-    snprintf(title, sizeof(title), "%s RECORDINGS", TAG_NAMES[selectedTag]);
+    if (UiLocalization::isChinese()) {
+        snprintf(title, sizeof(title), "%s录音", tagLabel(selectedTag));
+    } else {
+        snprintf(title, sizeof(title), "%s RECORDINGS", tagLabel(selectedTag));
+    }
     UiLocalization::drawCentered(frame, 48, title, 1);
-    if (fileCount == 0) { UiLocalization::drawCentered(frame, 190, "NO RECORDINGS", 1); return; }
+    rect(frame, 4, FILE_PAGER_TOP, FILE_PAGER_BUTTON_WIDTH, FILE_PAGER_HEIGHT);
+    drawDoubleArrow(frame, 21, FILE_PAGER_TOP + FILE_PAGER_HEIGHT / 2, false);
+    rect(frame, 42, FILE_PAGER_TOP, FILE_PAGER_BUTTON_WIDTH, FILE_PAGER_HEIGHT);
+    drawArrow(frame, 59, FILE_PAGER_TOP + FILE_PAGER_HEIGHT / 2, false);
+    rect(frame, 164, FILE_PAGER_TOP, FILE_PAGER_BUTTON_WIDTH, FILE_PAGER_HEIGHT);
+    drawArrow(frame, 181, FILE_PAGER_TOP + FILE_PAGER_HEIGHT / 2, true);
+    rect(frame, 202, FILE_PAGER_TOP, FILE_PAGER_BUTTON_WIDTH, FILE_PAGER_HEIGHT);
+    drawDoubleArrow(frame, 219, FILE_PAGER_TOP + FILE_PAGER_HEIGHT / 2, true);
+    char pager[24] = {};
+    if (UiLocalization::isChinese()) {
+        snprintf(pager, sizeof(pager), "%u/%u", filePage, filePageCount());
+    } else {
+        snprintf(pager, sizeof(pager), "PAGE %u OF %u", filePage, filePageCount());
+    }
+    UiLocalization::drawCentered(frame, FILE_PAGER_TOP + 9, pager, 1);
+    if (fileCount == 0) {
+        UiLocalization::drawCentered(frame, 190,
+            UiLocalization::isChinese() ? "没有录音" : "NO RECORDINGS", 1);
+        return;
+    }
     for (uint8_t i = 0; i < fileCount; ++i) {
-        const int top = 82 + i * 38;
-        rect(frame, 18, top, 204, 31);
-        UiLocalization::drawText(frame, 30, top + 11, fileNames[i], 1);
+        const int top = FILE_LIST_TOP + i * (FILE_ROW_HEIGHT + FILE_ROW_GAP);
+        rect(frame, 18, top, 180, 31);
+        char number[5] = {};
+        snprintf(number, sizeof(number), "%u.",
+                 static_cast<unsigned>((filePage - 1) * MAX_FILES + i + 1));
+        UiLocalization::drawText(frame, 24, top + 11, number, 1);
+        char displayName[24] = {};
+        std::strncpy(displayName, fileNames[i], sizeof(displayName) - 1);
+        UiLocalization::drawText(frame, FILE_MARQUEE_X, top + 11, displayName, 1);
+        drawTrash(frame, 218, top + 15);
+        if (i == activeFileIndex) {
+            drawRowPlayPause(frame, 181, top + 15, !playbackPaused);
+            if (!marqueeReady) captureMarquee(frame, top);
+            for (int y = top; y < top + 31; ++y) {
+                for (int x = 18; x < 198; ++x) {
+                    frame[static_cast<size_t>(y) * (XingtaiEpd::WIDTH / 8) + x / 8] ^=
+                        0x80U >> (x % 8);
+                }
+            }
+        }
     }
 }
 
@@ -313,10 +710,59 @@ void setAudio(Es8311 *audio) { codec = audio; }
 
 void open() {
     stopRecording();
+    stopPlayback();
     view = View::Tags;
     selectedTag = -1;
+    filePage = 1;
+    fileTotal = 0;
     recordingStartedMs = 0;
     std::strcpy(statusText, "READY");
+}
+
+bool returnControlAt(int16_t x, int16_t y) {
+    return view != View::Tags && inRect(x, y, 10, 40, 48, 28);
+}
+
+bool folderControlAt(int16_t x, int16_t y) {
+    return view == View::Recorder && inRect(x, y, 12, 333, 56, 56);
+}
+
+bool pauseControlAt(int16_t x, int16_t y) {
+    return view == View::Recorder && inRect(x, y, 172, 333, 56, 56);
+}
+
+bool tagItemBoundsAt(int16_t x, int16_t y, int16_t &left, int16_t &top,
+                     int16_t &width, int16_t &height) {
+    if (view != View::Tags && view != View::BrowseTags) return false;
+    const int listTop = view == View::BrowseTags ? BROWSER_TAG_Y : TAG_Y;
+    for (uint8_t i = 0; i < TAG_COUNT; ++i) {
+        const int itemTop = listTop + i * (TAG_H + TAG_GAP);
+        if (!inRect(x, y, TAG_X, itemTop, TAG_W, TAG_H)) continue;
+        left = TAG_X;
+        top = itemTop;
+        width = TAG_W;
+        height = TAG_H;
+        return true;
+    }
+    return false;
+}
+
+bool pagerControlBoundsAt(int16_t x, int16_t y, int16_t &left, int16_t &top,
+                          int16_t &width, int16_t &height) {
+    if (view != View::Files || y < FILE_PAGER_TOP ||
+        y >= FILE_PAGER_TOP + FILE_PAGER_HEIGHT) return false;
+    constexpr int lefts[] = {4, 42, 164, 202};
+    for (uint8_t index = 0; index < 4; ++index) {
+        const bool enabled = index < 2 ? filePage > 1 : filePage < filePageCount();
+        if (enabled && x >= lefts[index] && x < lefts[index] + FILE_PAGER_BUTTON_WIDTH) {
+            left = lefts[index];
+            top = FILE_PAGER_TOP;
+            width = FILE_PAGER_BUTTON_WIDTH;
+            height = FILE_PAGER_HEIGHT;
+            return true;
+        }
+    }
+    return false;
 }
 
 bool handleTap(int16_t x, int16_t y) {
@@ -324,8 +770,9 @@ bool handleTap(int16_t x, int16_t y) {
         if (view == View::BrowseTags && inRect(x, y, 10, 40, 48, 28)) {
             view = View::Recorder; return true;
         }
+        const int listTop = view == View::BrowseTags ? BROWSER_TAG_Y : TAG_Y;
         for (uint8_t i = 0; i < TAG_COUNT; ++i) {
-            const int top = TAG_Y + i * (TAG_H + TAG_GAP);
+            const int top = listTop + i * (TAG_H + TAG_GAP);
             if (!inRect(x, y, TAG_X, top, TAG_W, TAG_H)) continue;
             selectedTag = i;
             if (view == View::Tags) {
@@ -333,6 +780,7 @@ bool handleTap(int16_t x, int16_t y) {
                 recordingStartedMs = 0;
                 std::strcpy(statusText, "READY");
             } else {
+                filePage = 1;
                 loadFiles(selectedTag);
                 view = View::Files;
             }
@@ -341,33 +789,139 @@ bool handleTap(int16_t x, int16_t y) {
         return false;
     }
     if (view == View::Files) {
-        if (inRect(x, y, 10, 40, 48, 28)) { view = View::BrowseTags; return true; }
+        if (inRect(x, y, 10, 40, 48, 28)) {
+            stopPlayback();
+            view = View::BrowseTags;
+            return true;
+        }
+        if (inRect(x, y, 4, FILE_PAGER_TOP, FILE_PAGER_BUTTON_WIDTH,
+                   FILE_PAGER_HEIGHT) && filePage > 1) {
+            stopPlayback();
+            filePage = 1;
+            loadFiles(selectedTag);
+            return true;
+        }
+        if (inRect(x, y, 42, FILE_PAGER_TOP, FILE_PAGER_BUTTON_WIDTH,
+                   FILE_PAGER_HEIGHT) && filePage > 1) {
+            stopPlayback();
+            --filePage;
+            loadFiles(selectedTag);
+            return true;
+        }
+        if (inRect(x, y, 164, FILE_PAGER_TOP, FILE_PAGER_BUTTON_WIDTH,
+                   FILE_PAGER_HEIGHT) && filePage < filePageCount()) {
+            stopPlayback();
+            ++filePage;
+            loadFiles(selectedTag);
+            return true;
+        }
+        if (inRect(x, y, 202, FILE_PAGER_TOP, FILE_PAGER_BUTTON_WIDTH,
+                   FILE_PAGER_HEIGHT) && filePage < filePageCount()) {
+            stopPlayback();
+            filePage = filePageCount();
+            loadFiles(selectedTag);
+            return true;
+        }
+        for (uint8_t i = 0; i < fileCount; ++i) {
+            const int top = FILE_LIST_TOP + i * (FILE_ROW_HEIGHT + FILE_ROW_GAP);
+            if (inRect(x, y, 204, top, 28, 31)) {
+                stopPlayback();
+                char path[96] = {};
+                snprintf(path, sizeof(path), "%s/%s/%s", ROOT_FOLDER,
+                         TAG_FOLDERS[selectedTag], fileNames[i]);
+                const bool removed = SD_MMC.remove(path);
+                Serial.printf("[RECORDING] Delete path=%s result=%s\n",
+                              path, removed ? "ok" : "failed");
+                loadFiles(selectedTag);
+                return true;
+            }
+            if (!inRect(x, y, 18, top, 180, 31)) continue;
+            if (activeFileIndex == static_cast<int8_t>(i) && playbackActive) {
+                playbackPaused = !playbackPaused;
+            } else {
+                stopPlayback();
+                activeFileIndex = static_cast<int8_t>(i);
+                playbackPending = true;
+            }
+            return true;
+        }
         return false;
     }
     if (inRect(x, y, 10, 40, 48, 28)) {
         stopRecording(); view = View::Tags; selectedTag = -1; return true;
     }
-    if (inRect(x, y, 12, 320, 68, 75)) {
+    if (inRect(x, y, 12, 333, 56, 56)) {
         stopRecording(); view = View::BrowseTags; return true;
     }
-    if (inRect(x, y, 80, 310, 80, 88)) {
+    if (inRect(x, y, 80, 320, 80, 81)) {
         if (recordingActive) stopRecording(); else startRecording();
         return true;
     }
-    if (inRect(x, y, 175, 315, 55, 80)) { togglePause(); return true; }
+    if (inRect(x, y, 172, 333, 56, 56)) { togglePause(); return true; }
     return false;
 }
 
 bool process() {
-    if (view != View::Recorder || !recordingActive) return false;
-    const uint32_t second = elapsedSeconds();
-    if (second == lastRenderedSecond) return false;
-    lastRenderedSecond = second;
+    if (playbackPending) {
+        playbackPending = false;
+        if (!startPlayback()) activeFileIndex = -1;
+        return true;
+    }
+    if (playbackCompleted) {
+        playbackCompleted = false;
+        activeFileIndex = -1;
+        marqueeReady = false;
+        marqueeOffset = 0;
+        return true;
+    }
+    if (view == View::Recorder && recordingActive) {
+        const uint32_t second = elapsedSeconds();
+        if (second != lastRenderedSecond) {
+            lastRenderedSecond = second;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool advanceMarquee(int16_t &rowTop) {
+    if (view != View::Files || !playbackActive || playbackPaused ||
+        activeFileIndex < 0 || !marqueeReady || millis() < nextMarqueeMs) {
+        return false;
+    }
+    marqueeOffset = (marqueeOffset + 12) % FILE_MARQUEE_WIDTH;
+    nextMarqueeMs = millis() + 900;
+    rowTop = FILE_LIST_TOP + activeFileIndex * (FILE_ROW_HEIGHT + FILE_ROW_GAP);
     return true;
 }
 
+void renderMarquee(uint8_t *destination, const uint8_t *currentFrame) {
+    if (!destination || !currentFrame) return;
+    std::memcpy(destination, currentFrame, XingtaiEpd::FRAME_BYTES);
+    if (activeFileIndex < 0 || !marqueeReady) return;
+    const int top = FILE_LIST_TOP + activeFileIndex * (FILE_ROW_HEIGHT + FILE_ROW_GAP);
+    for (int y = 0; y < FILE_MARQUEE_HEIGHT; ++y) {
+        for (int x = 0; x < FILE_MARQUEE_WIDTH; ++x) {
+            const int drawX = FILE_MARQUEE_X + x;
+            const int drawY = top + 1 + y;
+            destination[static_cast<size_t>(drawY) * (XingtaiEpd::WIDTH / 8) + drawX / 8] |=
+                0x80U >> (drawX % 8);
+        }
+    }
+    for (int y = 0; y < FILE_MARQUEE_HEIGHT; ++y) {
+        for (int x = 0; x < FILE_MARQUEE_WIDTH; ++x) {
+            const int sourceX = (x + marqueeOffset) % FILE_MARQUEE_WIDTH;
+            if (!marqueePixel(sourceX, y)) continue;
+            const int drawX = FILE_MARQUEE_X + x;
+            const int drawY = top + 1 + y;
+            destination[static_cast<size_t>(drawY) * (XingtaiEpd::WIDTH / 8) + drawX / 8] &=
+                static_cast<uint8_t>(~(0x80U >> (drawX % 8)));
+        }
+    }
+}
+
 bool isRecording() { return recordingActive; }
-void stop() { stopRecording(); }
+void stop() { stopRecording(); stopPlayback(); }
 
 void render(uint8_t *frame) {
     std::memset(frame, 0x00, XingtaiEpd::FRAME_BYTES);

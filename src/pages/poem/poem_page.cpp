@@ -1038,14 +1038,25 @@ void renderPoemPopup(uint8_t *frame) {
         }
     }
     boldRect(frame, POPUP_X, POPUP_Y, POPUP_W, POPUP_H);
-    rect(frame, POPUP_X + 7, POPUP_Y + 7, 42, 24);
+    constexpr int backX = POPUP_X + 12;
+    constexpr int backY = POPUP_Y + 7;
+    constexpr int backW = 40;
+    constexpr int backH = 24;
+    rect(frame, backX, backY, backW, backH);
     const char *backLabel = UiLocalization::isChinese() ? "返回" : "BACK";
     const int backWidth = UiLocalization::textWidth(backLabel, 1);
-    UiLocalization::drawText(frame, POPUP_X + 7 + (42 - backWidth) / 2,
+    UiLocalization::drawText(frame, backX + (backW - backWidth) / 2,
                              POPUP_Y + 15, backLabel);
-    drawUtf8Title(frame, POPUP_X + 56, POPUP_Y + 5, 112, 28, selectedTitle);
-    drawPlayPause(frame, POPUP_X + POPUP_W - 18, POPUP_Y + 19,
-                  (poemPlaying || pendingAudioStart) && !poemPlaybackPaused);
+    drawUtf8Title(frame, POPUP_X + 56, POPUP_Y + 5, 105, 28, selectedTitle);
+    constexpr int replayX = POPUP_X + POPUP_W - 55;
+    constexpr int replayY = POPUP_Y + 5;
+    constexpr int replayW = 48;
+    constexpr int replayH = 28;
+    rect(frame, replayX, replayY, replayW, replayH);
+    const char *replayLabel = UiLocalization::isChinese() ? "重播" : "REPLAY";
+    const int replayWidth = UiLocalization::textWidth(replayLabel, 1);
+    UiLocalization::drawText(frame, replayX + (replayW - replayWidth) / 2,
+                             replayY + 10, replayLabel, 1);
 
     char byline[132] = {};
     if (selectedDynasty[0] && selectedAuthor[0]) {
@@ -1223,6 +1234,15 @@ bool takeLibraryLoadCompleted() {
     return true;
 }
 
+bool returnControlAt(int16_t x, int16_t y) {
+    return poemPopupOpen && pointInRect(x, y, POPUP_X + 12, POPUP_Y + 7, 40, 24);
+}
+
+bool replayControlAt(int16_t x, int16_t y) {
+    return poemPopupOpen &&
+           pointInRect(x, y, POPUP_X + POPUP_W - 55, POPUP_Y + 5, 48, 28);
+}
+
 void processPendingSave() {
     if (!pendingSave) return;
     pendingSave = false;
@@ -1232,7 +1252,7 @@ void processPendingSave() {
 
 bool handleTap(int16_t x, int16_t y) {
     if (poemPopupOpen) {
-        if (pointInRect(x, y, POPUP_X + 3, POPUP_Y + 3, 50, 32)) {
+        if (returnControlAt(x, y)) {
             playbackStoppedByTouch = false;
             stopAudio();
             poemPopupOpen = false;
@@ -1240,23 +1260,14 @@ bool handleTap(int16_t x, int16_t y) {
             readerPage = 0;
             return true;
         }
-        if (pointInRect(x, y, POPUP_X + POPUP_W - 34, POPUP_Y + 5, 28, 28)) {
-            if (playbackStoppedByTouch) {
-                playbackStoppedByTouch = false;
-                if (playbackWasPausedBeforeTouch) {
-                    OpusPlayer::resume();
-                    poemPlaybackPaused = false;
-                    std::strcpy(audioStatus, UiLocalization::isChinese() ? "正在播放" : "PLAYING");
-                } else {
-                    poemPlaybackPaused = true;
-                    std::strcpy(audioStatus, UiLocalization::isChinese() ? "已暂停" : "PAUSED");
-                }
-                playbackWasPausedBeforeTouch = false;
-                playbackIconRefreshRequested = true;
-                return true;
-            }
+        if (replayControlAt(x, y)) {
+            stopAudio();
+            playbackStoppedByTouch = false;
+            playbackWasPausedBeforeTouch = false;
             pendingAudioStart = true;
             poemPlaybackPaused = false;
+            std::strcpy(audioStatus,
+                        UiLocalization::isChinese() ? "正在准备语音" : "PREPARING AUDIO");
             playbackIconRefreshRequested = true;
             return true;
         }
