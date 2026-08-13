@@ -32,16 +32,26 @@ public:
     virtual bool loop() override;
     virtual bool stop() override;
     virtual bool isRunning() override;
-    // Retained for the application's playback diagnostics. The direct demuxer
-    // has no separate open stages; begin() failures report stage 1.
+    // Reserve the largest allocation before callers create file/output objects
+    // that can fragment a constrained internal heap. begin() also calls this,
+    // so pre-reservation is optional for callers with sufficient memory.
+    bool reserveDecoder();
+    // Reserve decoded PCM after the playback task has claimed its stack but
+    // before callers construct smaller file/output objects.
+    bool reserveBuffers();
+    // Retained for application diagnostics: 1 reserves the decoder, 2 reserves
+    // PCM, 3 initializes output, and 4 is ready to decode.
     int getLastError() const { return lastError; }
     int getOpenStage() const { return openStage; }
 
 private:
     OpusDecoder *od = nullptr;
 
-    uint8_t *packet; // Raw compressed, demuxed packet
+    // RFC 6716 limits an Opus audio packet to 1275 bytes. Keeping this in the
+    // generator object removes a second heap allocation from constrained begin().
+    uint8_t packet[1275] = {}; // Raw compressed, demuxed packet
     uint32_t packetOff;
+    bool discardingTags = false;
     opus_int16 *buff; // Decoded PCM
     uint32_t buffPtr;
     uint32_t buffLen;

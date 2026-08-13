@@ -62,6 +62,14 @@
 #if defined(SMALL_FOOTPRINT) && defined(FIXED_POINT)
 #define NORM_ALIASING_HACK
 #endif
+
+/* The no-PSRAM ESP32-S3 player runs one fixed-point mono decoder at a time.
+ * Reuse the decoder's synthesis memory for the normalized MDCT array instead
+ * of retaining another C99 VLA on its FreeRTOS task stack. This is libopus's
+ * existing low-memory path and saves almost 4 KiB at peak CELT decode depth. */
+#if defined(ARDUINO_ARCH_ESP32) && defined(FIXED_POINT) && !defined(NORM_ALIASING_HACK)
+#define NORM_ALIASING_HACK
+#endif
 /**********************************************************************/
 /*                                                                    */
 /*                             DECODER                                */

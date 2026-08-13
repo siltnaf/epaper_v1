@@ -20,11 +20,14 @@
 
 #include <AudioGeneratorOpus.h>
 
+namespace {
+constexpr uint32_t PCM_BUFFER_SAMPLES = 2048;
+}
+
 AudioGeneratorOpus::AudioGeneratorOpus() {
     od = nullptr;
     buff = nullptr;
     buffPtr = 0;
-    packet = nullptr;
     buffLen = 0;
     running = false;
 }
@@ -36,16 +39,16 @@ AudioGeneratorOpus::~AudioGeneratorOpus() {
     od = nullptr;
     free(buff);
     buff = nullptr;
-    free(packet);
-    packet = nullptr;
 }
 
-bool AudioGeneratorOpus::begin(AudioFileSource *source, AudioOutput *output) {
+bool AudioGeneratorOpus::reserveDecoder() {
     openStage = 1;
     lastError = 0;
+    if (od) return true;
+
     // Allocate the largest block first. On the no-PSRAM ESP32-S3, allocating
-    // the PCM and packet buffers first can fragment the ~27 KiB largest free
-    // block and make the stereo OpusDecoder state fail with OPUS_ALLOC_FAIL.
+    // file/output objects or PCM/packet buffers first can fragment the only
+    // block large enough for the mono OpusDecoder state.
     od = (OpusDecoder *) malloc(opus_decoder_get_size(1));
     if (!od) {
         lastError = OPUS_ALLOC_FAIL;
@@ -57,39 +60,32 @@ bool AudioGeneratorOpus::begin(AudioFileSource *source, AudioOutput *output) {
         od = nullptr;
         return false;
     }
+    return true;
+}
 
-    buff = (opus_int16*)malloc(2048 * sizeof(opus_int16));
+bool AudioGeneratorOpus::reserveBuffers() {
+    if (!reserveDecoder()) return false;
+    openStage = 2;
+    if (buff) return true;
+
+    buff = (opus_int16*)malloc(PCM_BUFFER_SAMPLES * sizeof(opus_int16));
     if (!buff) {
         lastError = OPUS_ALLOC_FAIL;
-        free(od);
-        od = nullptr;
         return false;
     }
+    return true;
+}
 
-    packet = (uint8_t *)malloc(1024);
-    if (!packet) {
-        lastError = OPUS_ALLOC_FAIL;
-        free(buff);
-        buff = nullptr;
-        free(od);
-        od = nullptr;
-        return false;
-    }
-    packetOff = 0;
+bool AudioGeneratorOpus::begin(AudioFileSource *source, AudioOutput *output) {
+    if (!reserveBuffers()) return false;
 
-    if (!source) {
+    if (!source || !output || !source->isOpen()) {
+        lastError = OPUS_BAD_ARG;
         return false;
     }
     file = source;
-
-    if (!output) {
-        return false;
-    }
     this->output = output;
-
-    if (!file->isOpen()) {
-        return false;    // Error
-    }
+    packetOff = 0;
 
     lastSample[0] = 0;
     lastSample[1] = 0;
@@ -99,17 +95,25 @@ bool AudioGeneratorOpus::begin(AudioFileSource *source, AudioOutput *output) {
 
     bzero(hdr, sizeof(hdr));
     packetOff = 0;
+    discardingTags = false;
     state = WaitHeader;
     preskip = 0;
 
-    output->begin();
-
-    // These are fixed by Opus
-    output->SetRate(48000);
-    output->SetChannels(2);
+    // These are fixed by Opus. The decoder is mono to save SRAM, and loop()
+    // duplicates each sample into the two output channels.
+    openStage = 3;
+    if (!output->begin() || !output->SetRate(48000) ||
+        !output->SetBitsPerSample(16) || !output->SetChannels(2)) {
+        lastError = OPUS_INVALID_STATE;
+        free(buff);
+        buff = nullptr;
+        free(od);
+        od = nullptr;
+        return false;
+    }
 
     running = true;
-    openStage = 3;
+    openStage = 4;
     return true;
 }
 
@@ -164,12 +168,25 @@ bool AudioGeneratorOpus::demux() {
         case ReadPacket:
             //audioLogger->printf("STATE: ReadPacket\n");
             //audioLogger->printf("readpacket seg %d len %d\n", curSeg, seg[curSeg]);
-            r = file->read(packet + packetOff, lacingBytesToRead);
-            packetOff += r;
+            if (!discardingTags &&
+                (packetOff > sizeof(packet) ||
+                 lacingBytesToRead > sizeof(packet) - packetOff)) {
+                lastError = OPUS_INVALID_PACKET;
+                running = false;
+                return false;
+            }
+            r = file->read(packet + (discardingTags ? 0 : packetOff), lacingBytesToRead);
+            if (!discardingTags) packetOff += r;
             lacingBytesToRead -= r;
             if (lacingBytesToRead) {
                 //audioLogger->printf("short read\n");
                 return false; // Not enough avail
+            }
+            if (!discardingTags && packetOff >= 8 && !memcmp(packet, "OpusTags", 8)) {
+                // Tags are not needed for playback and may exceed the RFC 6716
+                // audio-packet limit. Consume subsequent lacing segments into
+                // scratch space instead of retaining the metadata packet.
+                discardingTags = true;
             }
             // Read lacing bit, see if there's more
             if (seg[curSeg] != 0xff) {
@@ -180,19 +197,20 @@ bool AudioGeneratorOpus::demux() {
                 //audioLogger->printf("\n");
                 // We have a full packet in the buffer, decode it
                 // First, is it a header?
-                if ((packetOff >= 17) && !memcmp(packet, "OpusHead", 8) && (packet[8] == 1)) {
+                if ((packetOff >= 19) && !memcmp(packet, "OpusHead", 8) && (packet[8] == 1)) {
                     channels = packet[9];
                     preskip = packet[10] | (packet[11] << 8);
                     samplerate = packet[12] | (packet[13] << 8) | (packet[14] << 16) | (packet[15] << 24);
-                    gain = packet[16] | (packet[17]++);
+                    gain = packet[16] | (packet[17] << 8);
                     //audioLogger->printf("HEADER: chan: %d, sr: %d, skip %d\n", channels, samplerate, preskip);
                     packetOff = 0; // For better or worse, we've processed this pkt
-                } else if ((packetOff >= 9) && !memcmp(packet, "OpusTags", 8)) {
+                } else if (discardingTags) {
                     // This is an unparsed TAG.  TODO find metadata format
                     packetOff = 0; // For better or worse, we've processed this pkt
+                    discardingTags = false;
                 } else {
                     // This should be a regular packet
-                    int ret = opus_decode(od, packet, packetOff, buff, 2048, 0);
+                    int ret = opus_decode(od, packet, packetOff, buff, PCM_BUFFER_SAMPLES, 0);
                     packetOff = 0; // For better or worse, we've processed this pkt
                     if (ret > 0) {
                         buffLen = ret;
@@ -217,6 +235,7 @@ bool AudioGeneratorOpus::demux() {
                         }
                         return true; // We have filled a buffer
                     } else {
+                        lastError = ret;
                         //audioLogger->printf("nodecode\n");
                         // Could be header pkt, we ignore them here
                         // That means we ignore the preskip value, for now
@@ -286,7 +305,7 @@ bool AudioGeneratorOpus::stop() {
     free(buff);
     buff = nullptr;
     running = false;
-    output->stop();
+    if (output) output->stop();
     return true;
 }
 

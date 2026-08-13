@@ -3,6 +3,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <SD_MMC.h>
 #include <TJpg_Decoder.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
@@ -11,6 +12,7 @@
 #include <memory>
 
 #include "devices/epd_xingtai/epd_xingtai.h"
+#include "devices/sd_card/sd_card.h"
 #include "font/xiaozhi_font.h"
 #include "ui/loading_indicator.h"
 #include "ui/localization.h"
@@ -25,6 +27,9 @@ constexpr int ROW_GAP = 2;
 constexpr int PAGER_TOP = 52;
 constexpr int BUTTON_WIDTH = 34;
 constexpr int BUTTON_HEIGHT = 25;
+constexpr char CARTOON_SD_FOLDER[] = "/cartoon";
+constexpr char READER_JPEG_PATH[] = "/cartoon/reader.jpg";
+constexpr char READER_JPEG_PART_PATH[] = "/cartoon/reader.jpg.part";
 
 struct ListItem {
     char id[64] = {};
@@ -50,7 +55,6 @@ char selectedChapterId[32] = {};
 char selectedChapterTitle[80] = {};
 char statusText[64] = {};
 String chapterPayload;
-uint8_t *jpegData = nullptr;
 size_t jpegSize = 0;
 bool imageReady = false;
 uint8_t *decodeFrame = nullptr;
@@ -160,19 +164,36 @@ bool httpGetText(const String &url, String &payload, uint32_t timeout = 20000) {
         copyText(statusText, sizeof(statusText), "WIFI NOT CONNECTED");
         return false;
     }
-    HTTPClient http;
-    WiFiClient client;
-    http.setConnectTimeout(7000);
-    http.setTimeout(timeout);
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    if (!http.begin(client, url)) return false;
-    http.addHeader("Connection", "close");
-    const int code = http.GET();
-    if (code >= 200 && code < 300) payload = http.getString();
-    http.end();
-    Serial.printf("[CARTOON API] GET code=%d bytes=%u url=%s\n",
-                  code, payload.length(), url.c_str());
-    return code >= 200 && code < 300;
+    payload = static_cast<const char *>(nullptr);
+    for (uint8_t attempt = 1; attempt <= 2; ++attempt) {
+        HTTPClient http;
+        WiFiClient client;
+        http.setConnectTimeout(10000);
+        http.setTimeout(min<uint32_t>(timeout, 65000));
+        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        http.setReuse(false);
+        client.setTimeout((timeout + 999) / 1000);
+        if (!http.begin(client, url)) {
+            copyText(statusText, sizeof(statusText), "INVALID CARTOON URL");
+            return false;
+        }
+        http.addHeader("Connection", "close");
+        http.addHeader("User-Agent", "ESP32-ePaper-Cartoon/1.0");
+        const int code = http.GET();
+        if (code >= 200 && code < 300) payload = http.getString();
+        const String error = code < 0 ? http.errorToString(code) : String();
+        http.end();
+        Serial.printf("[CARTOON API] GET attempt=%u/2 code=%d%s%s bytes=%u "
+                      "heap=%u largest=%u url=%s\n",
+                      attempt, code, error.isEmpty() ? "" : " ", error.c_str(),
+                      payload.length(), static_cast<unsigned>(ESP.getFreeHeap()),
+                      static_cast<unsigned>(ESP.getMaxAllocHeap()), url.c_str());
+        if (code >= 200 && code < 300) return true;
+        if (code >= 0 || attempt == 2) break;
+        delay(350);
+    }
+    copyText(statusText, sizeof(statusText), "CARTOON NETWORK ERROR");
+    return false;
 }
 
 bool loadCartoons() {
@@ -243,14 +264,24 @@ void loadChapterRows() {
 }
 
 bool loadChapters(const ListItem &comic) {
-    chapterPayload = "";
-    if (!httpGetText(apiBase() + "/" + comic.id, chapterPayload, 30000)) return false;
     copyText(selectedSlug, sizeof(selectedSlug), comic.id);
     copyText(selectedComicTitle, sizeof(selectedComicTitle), comic.title);
     chapterPage = 1;
-    loadChapterRows();
+    chapterRowCount = 0;
+    chapterTotal = 0;
     view = View::Chapters;
-    return chapterRowCount > 0;
+    copyText(statusText, sizeof(statusText), "LOADING CHAPTERS");
+    chapterPayload = static_cast<const char *>(nullptr);
+    if (!httpGetText(apiBase() + "/" + comic.id, chapterPayload, 30000)) {
+        copyText(statusText, sizeof(statusText), "CHAPTER LOAD FAILED");
+        Serial.printf("[CARTOON] Chapter page opened without data comic=%s\n", comic.id);
+        return true;
+    }
+    loadChapterRows();
+    copyText(statusText, sizeof(statusText), chapterRowCount ? "" : "NO CHAPTERS");
+    Serial.printf("[CARTOON] Chapter page comic=%s total=%u visible=%u payload=%u\n",
+                  comic.id, chapterTotal, chapterRowCount, chapterPayload.length());
+    return true;
 }
 
 bool jpegOutput(int16_t x, int16_t y, uint16_t width, uint16_t height, uint16_t *data) {
@@ -268,31 +299,377 @@ bool jpegOutput(int16_t x, int16_t y, uint16_t width, uint16_t height, uint16_t 
     return true;
 }
 
+struct JpegDcTable {
+    uint8_t counts[16] = {};
+    uint8_t symbols[16] = {};
+    uint8_t symbolCount = 0;
+    bool valid = false;
+};
+
+class JpegBitReader {
+public:
+    explicit JpegBitReader(File &file) : file_(file) {}
+
+    bool readBits(uint8_t count, uint16_t &value) {
+        value = 0;
+        while (count--) {
+            if (bitsRemaining_ == 0 && !readEntropyByte(currentByte_)) return false;
+            value = static_cast<uint16_t>((value << 1) |
+                                          ((currentByte_ >> --bitsRemaining_) & 1U));
+        }
+        return true;
+    }
+
+private:
+    bool readEntropyByte(uint8_t &value) {
+        int next = file_.read();
+        if (next < 0) return false;
+        if (next != 0xFF) {
+            value = static_cast<uint8_t>(next);
+            bitsRemaining_ = 8;
+            return true;
+        }
+        do {
+            next = file_.read();
+        } while (next == 0xFF);
+        if (next != 0x00) return false;
+        value = 0xFF;
+        bitsRemaining_ = 8;
+        return true;
+    }
+
+    File &file_;
+    uint8_t currentByte_ = 0;
+    uint8_t bitsRemaining_ = 0;
+};
+
+bool readFileBytes(File &file, uint8_t *buffer, size_t size) {
+    return buffer && file.read(buffer, size) == size;
+}
+
+bool skipFileBytes(File &file, size_t size) {
+    return file.seek(file.position() + size);
+}
+
+bool readJpegMarker(File &file, uint8_t &marker) {
+    int value = 0;
+    do {
+        value = file.read();
+        if (value < 0) return false;
+    } while (value != 0xFF);
+    do {
+        value = file.read();
+        if (value < 0) return false;
+    } while (value == 0xFF);
+    marker = static_cast<uint8_t>(value);
+    return marker != 0x00;
+}
+
+bool decodeHuffmanSymbol(JpegBitReader &bits, const JpegDcTable &table, uint8_t &symbol) {
+    uint16_t code = 0;
+    uint16_t firstCode = 0;
+    uint8_t symbolIndex = 0;
+    for (uint8_t length = 1; length <= 16; ++length) {
+        uint16_t bit = 0;
+        if (!bits.readBits(1, bit)) return false;
+        code = static_cast<uint16_t>((code << 1) | bit);
+        const uint8_t count = table.counts[length - 1];
+        if (code >= firstCode && code < firstCode + count) {
+            const uint8_t index = static_cast<uint8_t>(symbolIndex + code - firstCode);
+            if (index >= table.symbolCount) return false;
+            symbol = table.symbols[index];
+            return true;
+        }
+        symbolIndex = static_cast<uint8_t>(symbolIndex + count);
+        firstCode = static_cast<uint16_t>((firstCode + count) << 1);
+    }
+    return false;
+}
+
+void drawDitheredBlock(uint8_t *frame, int left, int top, int right, int bottom,
+                       uint8_t grayscale) {
+    static constexpr uint8_t BAYER_4X4[4][4] = {
+        {0, 8, 2, 10}, {12, 4, 14, 6}, {3, 11, 1, 9}, {15, 7, 13, 5}
+    };
+    for (int y = top; y < bottom; ++y) {
+        for (int x = left; x < right; ++x) {
+            const uint8_t threshold = static_cast<uint8_t>(BAYER_4X4[y & 3][x & 3] * 16 + 8);
+            if (grayscale < threshold) pixel(frame, x, y);
+        }
+    }
+}
+
+bool drawProgressiveGrayscalePreview(uint8_t *frame, const char *path,
+                                     uint16_t &sourceWidth, uint16_t &sourceHeight,
+                                     uint8_t &outputScale) {
+    File file = SD_MMC.open(path, FILE_READ);
+    if (!file) return false;
+    uint8_t soi[2] = {};
+    if (!readFileBytes(file, soi, sizeof(soi)) || soi[0] != 0xFF || soi[1] != 0xD8) {
+        file.close();
+        return false;
+    }
+
+    uint16_t quantDc[4] = {};
+    JpegDcTable dcTables[4];
+    uint8_t componentId = 0;
+    uint8_t quantTableId = 0;
+    bool progressiveGrayscale = false;
+
+    while (file.available()) {
+        uint8_t marker = 0;
+        if (!readJpegMarker(file, marker) || marker == 0xD9) break;
+        uint8_t lengthBytes[2] = {};
+        if (!readFileBytes(file, lengthBytes, sizeof(lengthBytes))) break;
+        const uint16_t segmentLength = static_cast<uint16_t>(lengthBytes[0] << 8 | lengthBytes[1]);
+        if (segmentLength < 2) break;
+        size_t remaining = segmentLength - 2;
+
+        if (marker == 0xDB) {
+            while (remaining > 0) {
+                const int info = file.read();
+                if (info < 0) break;
+                --remaining;
+                const uint8_t precision = static_cast<uint8_t>(info >> 4);
+                const uint8_t tableId = static_cast<uint8_t>(info & 0x0F);
+                const size_t tableBytes = precision ? 128 : 64;
+                if (remaining < tableBytes) { remaining = 0; break; }
+                uint16_t firstValue = 0;
+                if (precision) {
+                    const int high = file.read(), low = file.read();
+                    if (high < 0 || low < 0) { remaining = 0; break; }
+                    firstValue = static_cast<uint16_t>(high << 8 | low);
+                    skipFileBytes(file, tableBytes - 2);
+                } else {
+                    const int value = file.read();
+                    if (value < 0) { remaining = 0; break; }
+                    firstValue = static_cast<uint16_t>(value);
+                    skipFileBytes(file, tableBytes - 1);
+                }
+                if (tableId < 4) quantDc[tableId] = firstValue;
+                remaining -= tableBytes;
+            }
+        } else if (marker == 0xC2) {
+            uint8_t header[32] = {};
+            if (remaining > sizeof(header) || !readFileBytes(file, header, remaining)) break;
+            if (remaining >= 9 && header[0] == 8 && header[5] == 1) {
+                sourceHeight = static_cast<uint16_t>(header[1] << 8 | header[2]);
+                sourceWidth = static_cast<uint16_t>(header[3] << 8 | header[4]);
+                componentId = header[6];
+                quantTableId = header[8];
+                progressiveGrayscale = header[7] == 0x11 && quantTableId < 4;
+            }
+        } else if (marker == 0xC4) {
+            while (remaining >= 17) {
+                const int info = file.read();
+                if (info < 0) { remaining = 0; break; }
+                --remaining;
+                uint8_t counts[16] = {};
+                if (!readFileBytes(file, counts, sizeof(counts))) { remaining = 0; break; }
+                remaining -= sizeof(counts);
+                uint16_t total = 0;
+                for (uint8_t count : counts) total += count;
+                if (total > remaining) { remaining = 0; break; }
+                const uint8_t tableClass = static_cast<uint8_t>(info >> 4);
+                const uint8_t tableId = static_cast<uint8_t>(info & 0x0F);
+                if (tableClass == 0 && tableId < 4 && total <= sizeof(dcTables[tableId].symbols)) {
+                    memcpy(dcTables[tableId].counts, counts, sizeof(counts));
+                    dcTables[tableId].symbolCount = static_cast<uint8_t>(total);
+                    dcTables[tableId].valid = readFileBytes(
+                        file, dcTables[tableId].symbols, total);
+                } else {
+                    skipFileBytes(file, total);
+                }
+                remaining -= total;
+            }
+            if (remaining) skipFileBytes(file, remaining);
+        } else if (marker == 0xDA) {
+            uint8_t scan[16] = {};
+            if (remaining > sizeof(scan) || !readFileBytes(file, scan, remaining)) break;
+            if (!progressiveGrayscale || remaining < 6 || scan[0] != 1 ||
+                scan[1] != componentId || scan[3] != 0 || scan[4] != 0 ||
+                (scan[5] >> 4) != 0) break;
+            const uint8_t dcTableId = static_cast<uint8_t>(scan[2] >> 4);
+            const uint8_t successiveLow = static_cast<uint8_t>(scan[5] & 0x0F);
+            if (dcTableId >= 4 || !dcTables[dcTableId].valid ||
+                !quantDc[quantTableId]) break;
+
+            outputScale = 1;
+            while ((sourceWidth / outputScale > 240 || sourceHeight / outputScale > 300) &&
+                   outputScale < 8) outputScale <<= 1;
+            const int outputWidth = max<int>(1, sourceWidth / outputScale);
+            const int outputHeight = max<int>(1, sourceHeight / outputScale);
+            const int drawX = max(0, (XingtaiEpd::WIDTH - outputWidth) / 2);
+            const int drawY = 76 + max(0, (300 - outputHeight) / 2);
+            const uint16_t blockColumns = (sourceWidth + 7) / 8;
+            const uint16_t blockRows = (sourceHeight + 7) / 8;
+            JpegBitReader bits(file);
+            int32_t dc = 0;
+            for (uint16_t by = 0; by < blockRows; ++by) {
+                for (uint16_t bx = 0; bx < blockColumns; ++bx) {
+                    uint8_t category = 0;
+                    if (!decodeHuffmanSymbol(bits, dcTables[dcTableId], category) || category > 11) {
+                        file.close();
+                        return false;
+                    }
+                    uint16_t encoded = 0;
+                    if (category && !bits.readBits(category, encoded)) {
+                        file.close();
+                        return false;
+                    }
+                    int32_t difference = encoded;
+                    if (category && encoded < (1U << (category - 1)))
+                        difference -= (1U << category) - 1;
+                    dc += difference;
+                    const int32_t coefficient = dc << successiveLow;
+                    const int32_t level = 128 + coefficient * quantDc[quantTableId] / 8;
+                    const uint8_t grayscale = static_cast<uint8_t>(constrain(level, 0, 255));
+                    const int left = drawX + (bx * 8) / outputScale;
+                    const int right = drawX + min<int>(sourceWidth, (bx + 1) * 8) / outputScale;
+                    const int top = drawY + (by * 8) / outputScale;
+                    const int bottom = drawY + min<int>(sourceHeight, (by + 1) * 8) / outputScale;
+                    drawDitheredBlock(frame, left, top, right, bottom, grayscale);
+                }
+            }
+            file.close();
+            return true;
+        } else {
+            skipFileBytes(file, remaining);
+        }
+    }
+    file.close();
+    return false;
+}
+
+bool ensureCartoonDirectory() {
+    if (!SdCard::isMounted()) return false;
+    if (SD_MMC.exists(CARTOON_SD_FOLDER)) return true;
+    const bool created = SD_MMC.mkdir(CARTOON_SD_FOLDER);
+    Serial.printf("[CARTOON SD] Create directory path=%s result=%s\n",
+                  CARTOON_SD_FOLDER, created ? "yes" : "no");
+    return created;
+}
+
 bool downloadJpeg(const String &url) {
     UiLoadingIndicator::Scope loading;
     imageReady = false;
-    if (jpegData) { free(jpegData); jpegData = nullptr; jpegSize = 0; }
-    if (WiFi.status() != WL_CONNECTED) return false;
-    HTTPClient http;
-    WiFiClient client;
-    http.setConnectTimeout(7000);
-    http.setTimeout(30000);
-    if (!http.begin(client, url)) return false;
-    http.addHeader("Connection", "close");
-    const int code = http.GET();
-    const int contentLength = http.getSize();
-    if (code < 200 || code >= 300 || contentLength <= 0 || contentLength > 90000) {
-        http.end();
+    jpegSize = 0;
+    if (WiFi.status() != WL_CONNECTED || !ensureCartoonDirectory()) {
+        copyText(statusText, sizeof(statusText), "SD OR WIFI NOT READY");
         return false;
     }
-    jpegData = static_cast<uint8_t *>(malloc(static_cast<size_t>(contentLength)));
-    if (!jpegData) { http.end(); return false; }
-    WiFiClient *stream = http.getStreamPtr();
-    jpegSize = stream->readBytes(jpegData, static_cast<size_t>(contentLength));
-    http.end();
-    Serial.printf("[CARTOON JPEG] code=%d bytes=%u/%d url=%s\n",
-                  code, jpegSize, contentLength, url.c_str());
-    return jpegSize == static_cast<size_t>(contentLength);
+    SD_MMC.remove(READER_JPEG_PART_PATH);
+    SD_MMC.remove(READER_JPEG_PATH);
+    for (uint8_t attempt = 1; attempt <= 2; ++attempt) {
+        HTTPClient http;
+        WiFiClient client;
+        http.setConnectTimeout(10000);
+        http.setTimeout(60000);
+        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        http.setReuse(false);
+        client.setTimeout(60);
+        if (!http.begin(client, url)) {
+            copyText(statusText, sizeof(statusText), "INVALID IMAGE URL");
+            return false;
+        }
+        http.addHeader("Connection", "close");
+        http.addHeader("User-Agent", "ESP32-ePaper-Cartoon/1.0");
+        const int code = http.GET();
+        const int contentLength = http.getSize();
+        const String error = code < 0 ? http.errorToString(code) : String();
+        bool complete = false;
+        if (code >= 200 && code < 300 && contentLength > 0 && contentLength <= 90000) {
+            File output = SD_MMC.open(READER_JPEG_PART_PATH, FILE_WRITE);
+            if (output) {
+                WiFiClient *stream = http.getStreamPtr();
+                uint8_t buffer[1024] = {};
+                uint32_t lastDataMs = millis();
+                const uint32_t startedMs = lastDataMs;
+                while (jpegSize < static_cast<size_t>(contentLength) &&
+                       millis() - startedMs < 90000) {
+                    const int available = stream->available();
+                    if (available > 0) {
+                        const size_t requested = min<size_t>(
+                            min<size_t>(static_cast<size_t>(available), sizeof(buffer)),
+                            static_cast<size_t>(contentLength) - jpegSize);
+                        const int received = stream->readBytes(buffer, requested);
+                        if (received <= 0 ||
+                            output.write(buffer, static_cast<size_t>(received)) !=
+                                static_cast<size_t>(received)) break;
+                        jpegSize += static_cast<size_t>(received);
+                        lastDataMs = millis();
+                    } else {
+                        // A response with "Connection: close" can report the
+                        // socket closed before lwIP exposes the buffered body.
+                        // Content-Length is authoritative; wait for buffered
+                        // bytes until the idle timeout instead of exiting at 0.
+                        if (millis() - lastDataMs >= 20000) break;
+                        delay(2);
+                    }
+                }
+                output.flush();
+                output.close();
+                complete = jpegSize == static_cast<size_t>(contentLength);
+            }
+        }
+        Serial.printf("[CARTOON JPEG] attempt=%u/2 code=%d%s%s bytes=%u/%d "
+                      "heap=%u largest=%u url=%s\n",
+                      attempt, code, error.isEmpty() ? "" : " ", error.c_str(),
+                      jpegSize, contentLength, static_cast<unsigned>(ESP.getFreeHeap()),
+                      static_cast<unsigned>(ESP.getMaxAllocHeap()), url.c_str());
+        http.end();
+        if (complete) {
+            if (SD_MMC.rename(READER_JPEG_PART_PATH, READER_JPEG_PATH)) {
+                Serial.printf("[CARTOON SD] Saved image path=%s bytes=%u\n",
+                              READER_JPEG_PATH, static_cast<unsigned>(jpegSize));
+                return true;
+            }
+            Serial.println("[CARTOON JPEG] Could not finalize SD image file");
+        }
+        SD_MMC.remove(READER_JPEG_PART_PATH);
+        jpegSize = 0;
+        if (code >= 0 && code != 408 && code != 429 && code < 500) break;
+        if (attempt < 2) delay(350);
+    }
+    return false;
+}
+
+uint16_t fetchReaderPageCount(const String &url) {
+    if (WiFi.status() != WL_CONNECTED) return 1;
+    for (uint8_t attempt = 1; attempt <= 2; ++attempt) {
+        HTTPClient http;
+        WiFiClient client;
+        http.setConnectTimeout(10000);
+        http.setTimeout(45000);
+        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        http.setReuse(false);
+        client.setTimeout(45);
+        if (!http.begin(client, url)) return 1;
+        http.addHeader("Connection", "close");
+        http.addHeader("User-Agent", "ESP32-ePaper-Cartoon/1.0");
+        const int code = http.GET();
+        uint16_t pageTotal = 1;
+        DeserializationError jsonError = DeserializationError::Ok;
+        if (code >= 200 && code < 300) {
+            JsonDocument filter;
+            filter["page_count"] = true;
+            JsonDocument document;
+            jsonError = deserializeJson(document, *http.getStreamPtr(),
+                                        DeserializationOption::Filter(filter));
+            if (!jsonError) pageTotal = max<uint16_t>(1, document["page_count"] | 1);
+        }
+        const String error = code < 0 ? http.errorToString(code) : String();
+        http.end();
+        Serial.printf("[CARTOON MANIFEST] attempt=%u/2 code=%d%s%s json=%s pages=%u "
+                      "heap=%u largest=%u url=%s\n",
+                      attempt, code, error.isEmpty() ? "" : " ", error.c_str(),
+                      jsonError.c_str(), pageTotal, static_cast<unsigned>(ESP.getFreeHeap()),
+                      static_cast<unsigned>(ESP.getMaxAllocHeap()), url.c_str());
+        if (code >= 200 && code < 300 && !jsonError) return pageTotal;
+        if (code >= 0 || attempt == 2) break;
+        delay(350);
+    }
+    return 1;
 }
 
 bool loadReaderPage() {
@@ -310,14 +687,11 @@ bool openChapter(const ListItem &chapter) {
     copyText(selectedChapterId, sizeof(selectedChapterId), chapter.id);
     copyText(selectedChapterTitle, sizeof(selectedChapterTitle), chapter.title);
     readerPage = 1;
-    readerPageTotal = 1;
-    String manifest;
-    if (httpGetText(apiBase() + "/" + selectedSlug + "/chapter/" + selectedChapterId,
-                    manifest, 30000)) {
-        JsonDocument document;
-        if (!deserializeJson(document, manifest)) readerPageTotal = document["page_count"] | 1;
-    }
-    chapterPayload = "";
+    // Release the retained chapter-list allocation before the manifest/JPEG
+    // buffers compete for the constrained internal heap.
+    chapterPayload = static_cast<const char *>(nullptr);
+    readerPageTotal = fetchReaderPageCount(
+        apiBase() + "/" + selectedSlug + "/chapter/" + selectedChapterId);
     view = View::Reader;
     return loadReaderPage();
 }
@@ -358,20 +732,42 @@ void renderReader(uint8_t *frame) {
     UiLocalization::drawText(frame, 15, 47, "BACK");
     drawTitle(frame, 66, 39, 164, 24, selectedChapterTitle);
     line(frame, 8, 72, 231, 72);
-    if (imageReady && jpegData && jpegSize) {
+    if (imageReady && jpegSize && SD_MMC.exists(READER_JPEG_PATH)) {
         uint16_t sourceWidth = 0, sourceHeight = 0;
-        TJpgDec.getJpgSize(&sourceWidth, &sourceHeight, jpegData, jpegSize);
-        const uint8_t scale = sourceWidth > 240 || sourceHeight > 300 ? 2 : 1;
-        const int imageWidth = sourceWidth / scale;
-        const int imageHeight = sourceHeight / scale;
-        const int drawX = max(0, (XingtaiEpd::WIDTH - imageWidth) / 2);
-        const int drawY = 76 + max(0, (300 - imageHeight) / 2);
-        decodeFrame = frame;
-        TJpgDec.setSwapBytes(false);
-        TJpgDec.setJpgScale(scale);
-        TJpgDec.setCallback(jpegOutput);
-        TJpgDec.drawJpg(drawX, drawY, jpegData, jpegSize);
-        decodeFrame = nullptr;
+        const JRESULT sizeResult = TJpgDec.getFsJpgSize(
+            &sourceWidth, &sourceHeight, READER_JPEG_PATH, SD_MMC);
+        if (sizeResult == JDR_OK) {
+            const uint8_t scale = sourceWidth > 240 || sourceHeight > 300 ? 2 : 1;
+            const int imageWidth = sourceWidth / scale;
+            const int imageHeight = sourceHeight / scale;
+            const int drawX = max(0, (XingtaiEpd::WIDTH - imageWidth) / 2);
+            const int drawY = 76 + max(0, (300 - imageHeight) / 2);
+            decodeFrame = frame;
+            TJpgDec.setSwapBytes(false);
+            TJpgDec.setJpgScale(scale);
+            TJpgDec.setCallback(jpegOutput);
+            const JRESULT drawResult = TJpgDec.drawFsJpg(
+                drawX, drawY, READER_JPEG_PATH, SD_MMC);
+            decodeFrame = nullptr;
+            Serial.printf("[CARTOON JPEG] Decode baseline size_result=%d draw_result=%d "
+                          "source=%ux%u scale=%u file=%u\n",
+                          static_cast<int>(sizeResult), static_cast<int>(drawResult),
+                          sourceWidth, sourceHeight, scale, static_cast<unsigned>(jpegSize));
+        } else if (sizeResult == JDR_FMT3) {
+            uint8_t previewScale = 1;
+            const bool previewReady = drawProgressiveGrayscalePreview(
+                frame, READER_JPEG_PATH, sourceWidth, sourceHeight, previewScale);
+            Serial.printf("[CARTOON JPEG] Decode progressive_dc result=%s source=%ux%u "
+                          "scale=%u file=%u\n",
+                          previewReady ? "ok" : "failed", sourceWidth, sourceHeight,
+                          previewScale, static_cast<unsigned>(jpegSize));
+            if (!previewReady)
+                UiLocalization::drawCentered(frame, 210, "UNSUPPORTED JPEG");
+        } else {
+            Serial.printf("[CARTOON JPEG] Decode failed size_result=%d file=%u\n",
+                          static_cast<int>(sizeResult), static_cast<unsigned>(jpegSize));
+            UiLocalization::drawCentered(frame, 210, "JPEG DECODE FAILED");
+        }
     } else {
         UiLocalization::drawCentered(frame, 210, statusText);
     }
@@ -399,7 +795,11 @@ void open() {
     cartoonPage = 1;
     chapterPayload = "";
     imageReady = false;
-    if (jpegData) { free(jpegData); jpegData = nullptr; jpegSize = 0; }
+    jpegSize = 0;
+    if (ensureCartoonDirectory()) {
+        SD_MMC.remove(READER_JPEG_PART_PATH);
+        SD_MMC.remove(READER_JPEG_PATH);
+    }
     loadCartoons();
 }
 
@@ -428,7 +828,9 @@ bool handleTap(int16_t x, int16_t y) {
         if (inRect(x, y, 0, 32, 70, 42)) {
             view = View::Chapters;
             imageReady = false;
-            if (jpegData) { free(jpegData); jpegData = nullptr; jpegSize = 0; }
+            jpegSize = 0;
+            SD_MMC.remove(READER_JPEG_PART_PATH);
+            SD_MMC.remove(READER_JPEG_PATH);
             if (!httpGetText(apiBase() + "/" + selectedSlug, chapterPayload, 30000)) {
                 copyText(statusText, sizeof(statusText), "CHAPTER LOAD FAILED");
             }
@@ -499,6 +901,7 @@ void render(uint8_t *frame) {
         drawArrow(frame, 22, 51, false);
         drawTitle(frame, 82, 39, 148, 24, selectedComicTitle);
         renderList(frame, chapterRows, chapterRowCount, chapterPage, pageCount(chapterTotal));
+        if (!chapterRowCount) UiLocalization::drawCentered(frame, 200, statusText);
         return;
     }
     if (UiLocalization::isChinese()) drawTitle(frame, 91, 34, 58, 18, "漫画");
