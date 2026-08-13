@@ -16,6 +16,8 @@ enum class FunctionIcon : uint8_t {
     Poem,
     Word,
     Recording,
+    Cartoon,
+    Radio,
 };
 
 enum class NetworkMode : uint8_t {

@@ -11,7 +11,6 @@
 #include "devices/audio/opus_player.h"
 #include "devices/es8311/es8311.h"
 #include "devices/sd_card/sd_card.h"
-#include "pages/recording/folder_bitmap.h"
 #include "ui/localization.h"
 
 namespace {
@@ -24,16 +23,21 @@ constexpr uint16_t BITS_PER_SAMPLE = 16;
 constexpr uint32_t BYTE_RATE = SAMPLE_RATE * RECORDING_CHANNELS * BITS_PER_SAMPLE / 8;
 constexpr uint8_t TAG_COUNT = 6;
 constexpr uint8_t MAX_FILES = 8;
-constexpr int TAG_X = 48;
-constexpr int TAG_Y = 58;
-constexpr int BROWSER_TAG_Y = 76;
-constexpr int TAG_W = 144;
-constexpr int TAG_H = 38;
-constexpr int TAG_GAP = 10;
-constexpr int TAG_TEXT_SCALE = 1;
+constexpr int HEADER_X = 62;
+constexpr int HEADER_Y = 40;
+constexpr int HEADER_W = 136;
+constexpr int HEADER_H = 30;
+constexpr int DROPDOWN_X = 12;
+constexpr int DROPDOWN_Y = 76;
+constexpr int DROPDOWN_W = 216;
+constexpr int DROPDOWN_H = 146;
+constexpr int DROPDOWN_ITEM_W = 96;
+constexpr int DROPDOWN_ITEM_H = 38;
+constexpr int DROPDOWN_COLUMN_GAP = 8;
+constexpr int DROPDOWN_ROW_GAP = 10;
 constexpr int FILE_LIST_TOP = 108;
-constexpr int FILE_ROW_HEIGHT = 31;
-constexpr int FILE_ROW_GAP = 7;
+constexpr int FILE_ROW_HEIGHT = 30;
+constexpr int FILE_ROW_GAP = 2;
 constexpr int FILE_MARQUEE_X = 43;
 constexpr int FILE_MARQUEE_WIDTH = 125;
 constexpr int FILE_MARQUEE_HEIGHT = FILE_ROW_HEIGHT - 2;
@@ -46,11 +50,11 @@ constexpr const char *TAG_NAMES[TAG_COUNT] = {"Note", "Work", "Idea", "Buy", "Pr
 constexpr const char *TAG_NAMES_CN[TAG_COUNT] = {"笔记", "工作", "想法", "购买", "私人", "会议"};
 constexpr const char *TAG_FOLDERS[TAG_COUNT] = {"note", "work", "idea", "buy", "private", "meeting"};
 
-enum class View : uint8_t { Tags, Recorder, BrowseTags, Files };
+enum class View : uint8_t { Recorder, TagDropdown, Files, FileTagDropdown };
 
-View view = View::Tags;
+View view = View::Recorder;
 Es8311 *codec = nullptr;
-int8_t selectedTag = -1;
+int8_t selectedTag = 0;
 char fileNames[MAX_FILES][40] = {};
 uint8_t fileCount = 0;
 uint16_t fileTotal = 0;
@@ -75,10 +79,13 @@ volatile bool playbackCompleted = false;
 bool playbackPending = false;
 int8_t activeFileIndex = -1;
 char playbackPath[96] = {};
+int16_t playbackInput[256] = {};
+int16_t playbackOutput[512] = {};
 uint8_t marqueeBitmap[FILE_MARQUEE_ROW_BYTES * FILE_MARQUEE_HEIGHT] = {};
 bool marqueeReady = false;
 uint16_t marqueeOffset = 0;
 uint32_t nextMarqueeMs = 0;
+bool exitRequested = false;
 
 void pixel(uint8_t *frame, int x, int y) {
     if (!frame || x < 0 || x >= XingtaiEpd::WIDTH || y < 0 || y >= XingtaiEpd::HEIGHT) return;
@@ -292,8 +299,6 @@ void playbackTask(void *) {
         Serial.printf("[RECORDING PLAYBACK] Started path=%s bytes=%lu channels=%u PA=%d\n",
                       playbackPath, static_cast<unsigned long>(remaining), channels,
                       digitalRead(BoardPins::PA_EN));
-        int16_t input[256] = {};
-        int16_t output[512] = {};
         uint16_t playbackPeak = 0;
         while (!playbackStopRequested && remaining > 0) {
             if (playbackPaused) {
@@ -302,29 +307,30 @@ void playbackTask(void *) {
                 continue;
             }
             codec->setSpeakerEnabled(true);
-            const size_t wanted = min<size_t>(sizeof(input), remaining);
-            const size_t bytes = file.read(reinterpret_cast<uint8_t *>(input), wanted);
+            const size_t wanted = min<size_t>(sizeof(playbackInput), remaining);
+            const size_t bytes = file.read(reinterpret_cast<uint8_t *>(playbackInput), wanted);
             if (bytes == 0) break;
             remaining -= bytes;
             const size_t inputSamples = bytes / sizeof(int16_t);
             const size_t frames = inputSamples / channels;
             for (size_t frame = 0; frame < frames; ++frame) {
-                int16_t sample = input[frame * channels];
+                int16_t sample = playbackInput[frame * channels];
                 if (channels == 2) {
-                    const int16_t other = input[frame * channels + 1];
+                    const int16_t other = playbackInput[frame * channels + 1];
                     if (abs(static_cast<int32_t>(other)) > abs(static_cast<int32_t>(sample))) {
                         sample = other;
                     }
                 }
                 playbackPeak = max<uint16_t>(playbackPeak,
                     static_cast<uint16_t>(min<int32_t>(32767, abs(static_cast<int32_t>(sample)))));
-                output[frame * I2S_CHANNELS] = sample;
-                output[frame * I2S_CHANNELS + 1] = sample;
+                playbackOutput[frame * I2S_CHANNELS] = sample;
+                playbackOutput[frame * I2S_CHANNELS + 1] = sample;
             }
             const size_t outputSamples = frames * I2S_CHANNELS;
-            if (codec->write(output, outputSamples, 1000) != outputSamples) break;
+            if (codec->write(playbackOutput, outputSamples, 1000) != outputSamples) break;
         }
-        Serial.printf("[RECORDING PLAYBACK] Peak=%u\n", playbackPeak);
+        Serial.printf("[RECORDING PLAYBACK] Peak=%u stack_free=%u\n", playbackPeak,
+                      static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
     } else {
         Serial.printf("[RECORDING PLAYBACK] Invalid WAV path=%s\n", playbackPath);
     }
@@ -372,7 +378,7 @@ bool startPlayback() {
     playbackActive = true;
     marqueeReady = false;
     marqueeOffset = 0;
-    if (xTaskCreatePinnedToCore(playbackTask, "wav-playback", 4096, nullptr, 2,
+    if (xTaskCreatePinnedToCore(playbackTask, "wav-playback", 8192, nullptr, 2,
                                 &playbackTaskHandle, 0) != pdPASS) {
         playbackActive = false;
         playbackTaskHandle = nullptr;
@@ -569,26 +575,51 @@ void drawBack(uint8_t *frame) {
 }
 
 void drawFolder(uint8_t *frame, int x, int y) {
-    for (uint8_t row = 0; row < FolderBitmap::HEIGHT; ++row) {
-        for (uint8_t column = 0; column < FolderBitmap::WIDTH; ++column) {
-            const uint8_t packed = FolderBitmap::DATA[
-                row * FolderBitmap::ROW_BYTES + column / 8];
-            if ((packed & (0x80U >> (column % 8))) != 0) {
-                pixel(frame, x + column, y + row);
-            }
-        }
-    }
+    // One-pixel contour based on folder.svg's tab, rear panel, and sloped front.
+    line(frame, x + 3, y + 8, x + 14, y + 8);
+    line(frame, x + 14, y + 8, x + 17, y + 12);
+    line(frame, x + 17, y + 12, x + 40, y + 12);
+    line(frame, x + 40, y + 12, x + 40, y + 20);
+    line(frame, x + 3, y + 8, x + 3, y + 39);
+    line(frame, x + 8, y + 20, x + 45, y + 20);
+    line(frame, x + 45, y + 20, x + 40, y + 41);
+    line(frame, x + 40, y + 41, x + 4, y + 41);
+    line(frame, x + 4, y + 41, x + 8, y + 20);
 }
 
-void drawTags(uint8_t *frame, bool browser) {
-    if (browser) {
-        drawBack(frame);
+void drawTagHeader(uint8_t *frame, bool fileTitle = false) {
+    rect(frame, HEADER_X, HEADER_Y, HEADER_W, HEADER_H);
+    char title[48] = {};
+    const char *label = tagLabel(selectedTag);
+    if (fileTitle) {
+        if (UiLocalization::isChinese()) snprintf(title, sizeof(title), "%s录音", label);
+        else snprintf(title, sizeof(title), "%s RECORDINGS", label);
+        label = title;
     }
-    const int listTop = browser ? BROWSER_TAG_Y : TAG_Y;
+    const int labelWidth = UiLocalization::textWidth(label, 1);
+    UiLocalization::drawText(frame, HEADER_X + (HEADER_W - labelWidth) / 2 - 5,
+                             HEADER_Y + 10, label, 1);
+    const int centerX = HEADER_X + HEADER_W - 13;
+    const int centerY = HEADER_Y + HEADER_H / 2;
+    line(frame, centerX - 5, centerY - 3, centerX, centerY + 3);
+    line(frame, centerX, centerY + 3, centerX + 5, centerY - 3);
+}
+
+void drawTagDropdown(uint8_t *frame) {
+    drawBack(frame);
+    drawTagHeader(frame, view == View::FileTagDropdown);
+    rect(frame, DROPDOWN_X, DROPDOWN_Y, DROPDOWN_W, DROPDOWN_H);
     for (uint8_t i = 0; i < TAG_COUNT; ++i) {
-        const int top = listTop + i * (TAG_H + TAG_GAP);
-        rect(frame, TAG_X, top, TAG_W, TAG_H);
-        UiLocalization::drawCentered(frame, top + 13, tagLabel(i), TAG_TEXT_SCALE);
+        const int column = i % 2;
+        const int row = i / 2;
+        const int left = DROPDOWN_X + 8 +
+                         column * (DROPDOWN_ITEM_W + DROPDOWN_COLUMN_GAP);
+        const int top = DROPDOWN_Y + 8 + row * (DROPDOWN_ITEM_H + DROPDOWN_ROW_GAP);
+        rect(frame, left, top, DROPDOWN_ITEM_W, DROPDOWN_ITEM_H);
+        const char *label = tagLabel(i);
+        const int width = UiLocalization::textWidth(label, 1);
+        UiLocalization::drawText(frame, left + (DROPDOWN_ITEM_W - width) / 2,
+                                 top + 13, label, 1);
     }
 }
 
@@ -632,7 +663,7 @@ void drawRecordButton(uint8_t *frame) {
 
 void drawRecorder(uint8_t *frame) {
     drawBack(frame);
-    UiLocalization::drawCentered(frame, 48, tagLabel(selectedTag), 1);
+    drawTagHeader(frame);
     const uint32_t seconds = elapsedSeconds();
     char timer[20] = {};
     snprintf(timer, sizeof(timer), "%02lu:%02lu:%02lu",
@@ -651,13 +682,7 @@ void drawRecorder(uint8_t *frame) {
 
 void drawFiles(uint8_t *frame) {
     drawBack(frame);
-    char title[48] = {};
-    if (UiLocalization::isChinese()) {
-        snprintf(title, sizeof(title), "%s录音", tagLabel(selectedTag));
-    } else {
-        snprintf(title, sizeof(title), "%s RECORDINGS", tagLabel(selectedTag));
-    }
-    UiLocalization::drawCentered(frame, 48, title, 1);
+    drawTagHeader(frame, true);
     rect(frame, 4, FILE_PAGER_TOP, FILE_PAGER_BUTTON_WIDTH, FILE_PAGER_HEIGHT);
     drawDoubleArrow(frame, 21, FILE_PAGER_TOP + FILE_PAGER_HEIGHT / 2, false);
     rect(frame, 42, FILE_PAGER_TOP, FILE_PAGER_BUTTON_WIDTH, FILE_PAGER_HEIGHT);
@@ -680,20 +705,20 @@ void drawFiles(uint8_t *frame) {
     }
     for (uint8_t i = 0; i < fileCount; ++i) {
         const int top = FILE_LIST_TOP + i * (FILE_ROW_HEIGHT + FILE_ROW_GAP);
-        rect(frame, 18, top, 180, 31);
+        rect(frame, 12, top, 186, FILE_ROW_HEIGHT);
         char number[5] = {};
         snprintf(number, sizeof(number), "%u.",
                  static_cast<unsigned>((filePage - 1) * MAX_FILES + i + 1));
-        UiLocalization::drawText(frame, 24, top + 11, number, 1);
+        UiLocalization::drawText(frame, 18, top + 9, number, 1);
         char displayName[24] = {};
         std::strncpy(displayName, fileNames[i], sizeof(displayName) - 1);
-        UiLocalization::drawText(frame, FILE_MARQUEE_X, top + 11, displayName, 1);
+        UiLocalization::drawText(frame, FILE_MARQUEE_X, top + 9, displayName, 1);
         drawTrash(frame, 218, top + 15);
         if (i == activeFileIndex) {
             drawRowPlayPause(frame, 181, top + 15, !playbackPaused);
             if (!marqueeReady) captureMarquee(frame, top);
-            for (int y = top; y < top + 31; ++y) {
-                for (int x = 18; x < 198; ++x) {
+            for (int y = top; y < top + FILE_ROW_HEIGHT; ++y) {
+                for (int x = 12; x < 198; ++x) {
                     frame[static_cast<size_t>(y) * (XingtaiEpd::WIDTH / 8) + x / 8] ^=
                         0x80U >> (x % 8);
                 }
@@ -711,16 +736,23 @@ void setAudio(Es8311 *audio) { codec = audio; }
 void open() {
     stopRecording();
     stopPlayback();
-    view = View::Tags;
-    selectedTag = -1;
+    view = View::Recorder;
+    if (selectedTag < 0 || selectedTag >= TAG_COUNT) selectedTag = 0;
     filePage = 1;
     fileTotal = 0;
+    exitRequested = false;
     recordingStartedMs = 0;
     std::strcpy(statusText, "READY");
 }
 
 bool returnControlAt(int16_t x, int16_t y) {
-    return view != View::Tags && inRect(x, y, 10, 40, 48, 28);
+    return inRect(x, y, 10, 40, 48, 28);
+}
+
+bool headerControlAt(int16_t x, int16_t y) {
+    return (view == View::Recorder || view == View::TagDropdown ||
+            view == View::Files || view == View::FileTagDropdown) &&
+           inRect(x, y, HEADER_X, HEADER_Y, HEADER_W, HEADER_H);
 }
 
 bool folderControlAt(int16_t x, int16_t y) {
@@ -733,16 +765,24 @@ bool pauseControlAt(int16_t x, int16_t y) {
 
 bool tagItemBoundsAt(int16_t x, int16_t y, int16_t &left, int16_t &top,
                      int16_t &width, int16_t &height) {
-    if (view != View::Tags && view != View::BrowseTags) return false;
-    const int listTop = view == View::BrowseTags ? BROWSER_TAG_Y : TAG_Y;
-    for (uint8_t i = 0; i < TAG_COUNT; ++i) {
-        const int itemTop = listTop + i * (TAG_H + TAG_GAP);
-        if (!inRect(x, y, TAG_X, itemTop, TAG_W, TAG_H)) continue;
-        left = TAG_X;
-        top = itemTop;
-        width = TAG_W;
-        height = TAG_H;
-        return true;
+    if (view == View::TagDropdown || view == View::FileTagDropdown) {
+        for (uint8_t i = 0; i < TAG_COUNT; ++i) {
+            const int column = i % 2;
+            const int row = i / 2;
+            const int itemLeft = DROPDOWN_X + 8 +
+                                 column * (DROPDOWN_ITEM_W + DROPDOWN_COLUMN_GAP);
+            const int itemTop = DROPDOWN_Y + 8 +
+                                row * (DROPDOWN_ITEM_H + DROPDOWN_ROW_GAP);
+            if (!inRect(x, y, itemLeft, itemTop, DROPDOWN_ITEM_W, DROPDOWN_ITEM_H)) {
+                continue;
+            }
+            left = itemLeft;
+            top = itemTop;
+            width = DROPDOWN_ITEM_W;
+            height = DROPDOWN_ITEM_H;
+            return true;
+        }
+        return false;
     }
     return false;
 }
@@ -766,23 +806,31 @@ bool pagerControlBoundsAt(int16_t x, int16_t y, int16_t &left, int16_t &top,
 }
 
 bool handleTap(int16_t x, int16_t y) {
-    if (view == View::Tags || view == View::BrowseTags) {
-        if (view == View::BrowseTags && inRect(x, y, 10, 40, 48, 28)) {
-            view = View::Recorder; return true;
+    if (view == View::TagDropdown || view == View::FileTagDropdown) {
+        const bool fileDropdown = view == View::FileTagDropdown;
+        if (inRect(x, y, 10, 40, 48, 28) ||
+            inRect(x, y, HEADER_X, HEADER_Y, HEADER_W, HEADER_H)) {
+            view = fileDropdown ? View::Files : View::Recorder;
+            return true;
         }
-        const int listTop = view == View::BrowseTags ? BROWSER_TAG_Y : TAG_Y;
         for (uint8_t i = 0; i < TAG_COUNT; ++i) {
-            const int top = listTop + i * (TAG_H + TAG_GAP);
-            if (!inRect(x, y, TAG_X, top, TAG_W, TAG_H)) continue;
+            const int column = i % 2;
+            const int row = i / 2;
+            const int left = DROPDOWN_X + 8 +
+                             column * (DROPDOWN_ITEM_W + DROPDOWN_COLUMN_GAP);
+            const int top = DROPDOWN_Y + 8 +
+                            row * (DROPDOWN_ITEM_H + DROPDOWN_ROW_GAP);
+            if (!inRect(x, y, left, top, DROPDOWN_ITEM_W, DROPDOWN_ITEM_H)) continue;
             selectedTag = i;
-            if (view == View::Tags) {
-                view = View::Recorder;
-                recordingStartedMs = 0;
-                std::strcpy(statusText, "READY");
-            } else {
+            if (fileDropdown) {
+                stopPlayback();
                 filePage = 1;
                 loadFiles(selectedTag);
                 view = View::Files;
+            } else {
+                recordingStartedMs = 0;
+                std::strcpy(statusText, "READY");
+                view = View::Recorder;
             }
             return true;
         }
@@ -791,7 +839,12 @@ bool handleTap(int16_t x, int16_t y) {
     if (view == View::Files) {
         if (inRect(x, y, 10, 40, 48, 28)) {
             stopPlayback();
-            view = View::BrowseTags;
+            view = View::Recorder;
+            return true;
+        }
+        if (inRect(x, y, HEADER_X, HEADER_Y, HEADER_W, HEADER_H)) {
+            stopPlayback();
+            view = View::FileTagDropdown;
             return true;
         }
         if (inRect(x, y, 4, FILE_PAGER_TOP, FILE_PAGER_BUTTON_WIDTH,
@@ -824,7 +877,7 @@ bool handleTap(int16_t x, int16_t y) {
         }
         for (uint8_t i = 0; i < fileCount; ++i) {
             const int top = FILE_LIST_TOP + i * (FILE_ROW_HEIGHT + FILE_ROW_GAP);
-            if (inRect(x, y, 204, top, 28, 31)) {
+            if (inRect(x, y, 204, top, 28, FILE_ROW_HEIGHT)) {
                 stopPlayback();
                 char path[96] = {};
                 snprintf(path, sizeof(path), "%s/%s/%s", ROOT_FOLDER,
@@ -835,7 +888,7 @@ bool handleTap(int16_t x, int16_t y) {
                 loadFiles(selectedTag);
                 return true;
             }
-            if (!inRect(x, y, 18, top, 180, 31)) continue;
+            if (!inRect(x, y, 12, top, 186, FILE_ROW_HEIGHT)) continue;
             if (activeFileIndex == static_cast<int8_t>(i) && playbackActive) {
                 playbackPaused = !playbackPaused;
             } else {
@@ -848,10 +901,21 @@ bool handleTap(int16_t x, int16_t y) {
         return false;
     }
     if (inRect(x, y, 10, 40, 48, 28)) {
-        stopRecording(); view = View::Tags; selectedTag = -1; return true;
+        stopRecording();
+        exitRequested = true;
+        return true;
+    }
+    if (inRect(x, y, HEADER_X, HEADER_Y, HEADER_W, HEADER_H)) {
+        stopRecording();
+        view = View::TagDropdown;
+        return true;
     }
     if (inRect(x, y, 12, 333, 56, 56)) {
-        stopRecording(); view = View::BrowseTags; return true;
+        stopRecording();
+        filePage = 1;
+        loadFiles(selectedTag);
+        view = View::Files;
+        return true;
     }
     if (inRect(x, y, 80, 320, 80, 81)) {
         if (recordingActive) stopRecording(); else startRecording();
@@ -859,6 +923,12 @@ bool handleTap(int16_t x, int16_t y) {
     }
     if (inRect(x, y, 172, 333, 56, 56)) { togglePause(); return true; }
     return false;
+}
+
+bool takeExitRequest() {
+    const bool requested = exitRequested;
+    exitRequested = false;
+    return requested;
 }
 
 bool process() {
@@ -926,10 +996,10 @@ void stop() { stopRecording(); stopPlayback(); }
 void render(uint8_t *frame) {
     std::memset(frame, 0x00, XingtaiEpd::FRAME_BYTES);
     switch (view) {
-    case View::Tags: drawTags(frame, false); break;
     case View::Recorder: drawRecorder(frame); break;
-    case View::BrowseTags: drawTags(frame, true); break;
+    case View::TagDropdown: drawTagDropdown(frame); break;
     case View::Files: drawFiles(frame); break;
+    case View::FileTagDropdown: drawTagDropdown(frame); break;
     }
 }
 

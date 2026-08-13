@@ -85,6 +85,8 @@ bool playbackStoppedByTouch = false;
 bool playbackWasPausedBeforeTouch = false;
 bool poemPlaybackPaused = false;
 bool playbackIconRefreshRequested = false;
+bool replayButtonReleasePending = false;
+bool replayButtonRefreshRequested = false;
 int8_t activePoemIndex = -1;
 uint8_t marqueeBitmap[MARQUEE_ROW_BYTES * MARQUEE_HEIGHT] = {};
 bool marqueeReady = false;
@@ -673,32 +675,8 @@ bool cachedOpusPath(int32_t poemId, char *path, size_t pathSize) {
         }
     }
 
-    char directory[40] = {};
-    snprintf(directory, sizeof(directory), "%s/%ld", POEM_SD_FOLDER, static_cast<long>(poemId));
-    File root = SD_MMC.open(directory);
-    if (!root || !root.isDirectory()) {
-        if (root) root.close();
-        return false;
-    }
-    File entry = root.openNextFile();
-    while (entry) {
-        const String entryPath = entry.name();
-        const int slash = entryPath.lastIndexOf('/');
-        const String fileName = entryPath.substring(slash + 1);
-        const bool candidate = !entry.isDirectory() && fileName.startsWith("tts_") &&
-                               fileName.endsWith(".opus");
-        entry.close();
-        if (candidate) {
-            snprintf(path, pathSize, "%s/%s", directory, fileName.c_str());
-            if (SdCard::isValidOggOpus(path)) {
-                root.close();
-                return true;
-            }
-            SD_MMC.remove(path);
-        }
-        entry = root.openNextFile();
-    }
-    root.close();
+    // Do not use an arbitrary cached voice. A cache from another gender or
+    // voice would make the selected voice appear to be ignored.
     return false;
 }
 
@@ -1037,26 +1015,43 @@ void renderPoemPopup(uint8_t *frame) {
                 static_cast<uint8_t>(~(0x80U >> (x % 8)));
         }
     }
-    boldRect(frame, POPUP_X, POPUP_Y, POPUP_W, POPUP_H);
-    constexpr int backX = POPUP_X + 12;
-    constexpr int backY = POPUP_Y + 7;
+    drawUtf8Title(frame, POPUP_X + 56, POPUP_Y + 5, 105, 28, selectedTitle);
+    constexpr int toolbarTop = 342;
+    constexpr int toolbarBottom = 400;
+    for (int y = toolbarTop; y < toolbarBottom; ++y) {
+        for (int x = POPUP_X; x < POPUP_X + POPUP_W; ++x) {
+            frame[static_cast<size_t>(y) * (XingtaiEpd::WIDTH / 8) + x / 8] &=
+                static_cast<uint8_t>(~(0x80U >> (x % 8)));
+        }
+    }
+    char pager[16] = {};
+    snprintf(pager, sizeof(pager), "%d/%d", readerPage + 1, readerPageCount());
+    drawCentered(frame, 350, pager);
+
+    rect(frame, 14, 370, 44, 26);
+    drawArrow(frame, 36, 383, false);
+    rect(frame, 182, 370, 44, 26);
+    drawArrow(frame, 204, 383, true);
+
+    constexpr int backX = POPUP_X + 50;
+    constexpr int backY = 370;
     constexpr int backW = 40;
-    constexpr int backH = 24;
+    constexpr int backH = 26;
     rect(frame, backX, backY, backW, backH);
     const char *backLabel = UiLocalization::isChinese() ? "返回" : "BACK";
     const int backWidth = UiLocalization::textWidth(backLabel, 1);
     UiLocalization::drawText(frame, backX + (backW - backWidth) / 2,
-                             POPUP_Y + 15, backLabel);
-    drawUtf8Title(frame, POPUP_X + 56, POPUP_Y + 5, 105, 28, selectedTitle);
-    constexpr int replayX = POPUP_X + POPUP_W - 55;
-    constexpr int replayY = POPUP_Y + 5;
+                             backY + 8, backLabel);
+
+    constexpr int replayX = POPUP_X + 118;
+    constexpr int replayY = 370;
     constexpr int replayW = 48;
-    constexpr int replayH = 28;
+    constexpr int replayH = 26;
     rect(frame, replayX, replayY, replayW, replayH);
     const char *replayLabel = UiLocalization::isChinese() ? "重播" : "REPLAY";
     const int replayWidth = UiLocalization::textWidth(replayLabel, 1);
     UiLocalization::drawText(frame, replayX + (replayW - replayWidth) / 2,
-                             replayY + 10, replayLabel, 1);
+                             replayY + 8, replayLabel, 1);
 
     char byline[132] = {};
     if (selectedDynasty[0] && selectedAuthor[0]) {
@@ -1102,11 +1097,6 @@ void renderPoemPopup(uint8_t *frame) {
         drawX += advance;
     }
 
-    if (readerPageCount() > 1) {
-        char pager[16] = {};
-        snprintf(pager, sizeof(pager), "%d/%d", readerPage + 1, readerPageCount());
-        drawCentered(frame, POPUP_Y + POPUP_H - 8, pager);
-    }
 }
 
 void renderPlayer(uint8_t *frame) {
@@ -1235,12 +1225,12 @@ bool takeLibraryLoadCompleted() {
 }
 
 bool returnControlAt(int16_t x, int16_t y) {
-    return poemPopupOpen && pointInRect(x, y, POPUP_X + 12, POPUP_Y + 7, 40, 24);
+    return poemPopupOpen && pointInRect(x, y, POPUP_X + 50, 370, 40, 26);
 }
 
 bool replayControlAt(int16_t x, int16_t y) {
     return poemPopupOpen &&
-           pointInRect(x, y, POPUP_X + POPUP_W - 55, POPUP_Y + 5, 48, 28);
+           pointInRect(x, y, POPUP_X + 118, 370, 48, 26);
 }
 
 void processPendingSave() {
@@ -1265,10 +1255,10 @@ bool handleTap(int16_t x, int16_t y) {
             playbackStoppedByTouch = false;
             playbackWasPausedBeforeTouch = false;
             pendingAudioStart = true;
+            replayButtonReleasePending = true;
             poemPlaybackPaused = false;
             std::strcpy(audioStatus,
                         UiLocalization::isChinese() ? "正在准备语音" : "PREPARING AUDIO");
-            playbackIconRefreshRequested = true;
             return true;
         }
         if (pointInRect(x, y, 14, 370, 44, 26) && readerPage > 0) {
@@ -1350,14 +1340,27 @@ bool takePlaybackIconRefreshRequest() {
     return requested;
 }
 
+bool takeReplayButtonRefreshRequest() {
+    const bool requested = replayButtonRefreshRequested;
+    replayButtonRefreshRequested = false;
+    return requested;
+}
+
 bool processAudio() {
     if (pendingAudioStart) {
         pendingAudioStart = false;
+        const bool releaseReplayButton = replayButtonReleasePending;
+        replayButtonReleasePending = false;
         if (!startPoemAudio()) {
             activePoemIndex = -1;
             marqueeReady = false;
             poemPlaybackPaused = true;
-            playbackIconRefreshRequested = true;
+            if (releaseReplayButton) replayButtonRefreshRequested = true;
+            else playbackIconRefreshRequested = true;
+            return true;
+        }
+        if (releaseReplayButton) {
+            replayButtonRefreshRequested = true;
             return true;
         }
         return false;
@@ -1428,6 +1431,7 @@ void renderMarquee(uint8_t *destination, const uint8_t *currentFrame) {
 
 void stopAudio() {
     pendingAudioStart = false;
+    replayButtonReleasePending = false;
     OpusPlayer::stop();
     poemPlaying = false;
     poemPlaybackPaused = false;

@@ -657,32 +657,8 @@ bool cachedOpusPath(int32_t storyId, char *path, size_t pathSize) {
         }
     }
 
-    char directory[40] = {};
-    snprintf(directory, sizeof(directory), "%s/%ld", STORY_SD_FOLDER, static_cast<long>(storyId));
-    File root = SD_MMC.open(directory);
-    if (!root || !root.isDirectory()) {
-        if (root) root.close();
-        return false;
-    }
-    File entry = root.openNextFile();
-    while (entry) {
-        const String entryPath = entry.name();
-        const int slash = entryPath.lastIndexOf('/');
-        const String fileName = entryPath.substring(slash + 1);
-        const bool candidate = !entry.isDirectory() && fileName.startsWith("tts_") &&
-                               fileName.endsWith(".opus");
-        entry.close();
-        if (candidate) {
-            snprintf(path, pathSize, "%s/%s", directory, fileName.c_str());
-            if (SdCard::isValidOggOpus(path)) {
-                root.close();
-                return true;
-            }
-            SD_MMC.remove(path);
-        }
-        entry = root.openNextFile();
-    }
-    root.close();
+    // Do not use an arbitrary cached voice. A cache from another gender or
+    // voice would make the selected voice appear to be ignored.
     return false;
 }
 

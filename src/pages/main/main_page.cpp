@@ -6,6 +6,8 @@
 #include "pages/settings/settings_bitmap.h"
 #include "pages/calendar/calendar_bitmap.h"
 #include "pages/recording/recording_bitmap.h"
+#include "pages/cartoon/cartoon_bitmap.h"
+#include "pages/radio/radio_bitmap.h"
 #include "pages/book/book_bitmap.h"
 #include "pages/voice/voice_bitmap.h"
 #include "pages/calculator/calculator_bitmap.h"
@@ -163,6 +165,10 @@ void render(uint8_t *frame, FunctionIcon selectedIcon) {
     icon(frame, x3, y3, WordBitmap::DATA, selectedIcon == FunctionIcon::Word);
     icon(frame, x1, y3 + iconSize + rowGap, RecordingBitmap::DATA,
          selectedIcon == FunctionIcon::Recording);
+    icon(frame, x2, y3 + iconSize + rowGap, CartoonBitmap::DATA,
+         selectedIcon == FunctionIcon::Cartoon);
+    icon(frame, x3, y3 + iconSize + rowGap, RadioBitmap::DATA,
+         selectedIcon == FunctionIcon::Radio);
 }
 
 }
