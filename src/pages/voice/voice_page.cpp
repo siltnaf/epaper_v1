@@ -14,6 +14,7 @@
 #include "devices/es8311/es8311.h"
 #include "devices/sd_card/sd_card.h"
 #include "font/xiaozhi_font.h"
+#include "pages/playlist_cache.h"
 #include "ui/loading_indicator.h"
 #include "ui/localization.h"
 
@@ -791,16 +792,28 @@ int matchingBrace(const String &json, int start) {
     return -1;
 }
 
-bool loadLibrary(bool showLoading = true) {
+bool loadLibrary(bool showLoading = true, bool forceRemote = false,
+                 bool cacheOnly = false) {
     OptionalLoadingScope loadingIndicator(showLoading);
     storyCount = 0;
     String payload;
     bool remoteLoaded = false;
-    if (std::strlen(contentBaseUrl) > 7) {
-        const String url = endpointBase() + "?page=" + String(libraryPage) +
+    bool fetchedRemote = false;
+    char cacheSlot[20] = {};
+    snprintf(cacheSlot, sizeof(cacheSlot), "page-%ld", static_cast<long>(libraryPage));
+    const String endpoint = endpointBase();
+    if (!forceRemote) remoteLoaded = PlaylistCache::load(
+        STORY_SD_FOLDER, endpoint, cacheSlot, payload);
+    if (!cacheOnly && std::strlen(contentBaseUrl) > 7) {
+        const String url = endpoint + "?page=" + String(libraryPage) +
                            "&perPage=" + String(ITEMS_PER_PAGE);
-        remoteLoaded = httpGet(url, payload, 20000, showLoading);
+        if (forceRemote || !remoteLoaded) {
+            remoteLoaded = httpGet(url, payload, 20000, showLoading);
+            fetchedRemote = remoteLoaded;
+        }
     }
+    if (!remoteLoaded && forceRemote) remoteLoaded = PlaylistCache::load(
+        STORY_SD_FOLDER, endpoint, cacheSlot, payload);
     if (!remoteLoaded) {
         // The remote library is optional once stories have been cached. Build a
         // local page directly from /voice/<id>/meta.txt + content.txt.
@@ -857,6 +870,7 @@ bool loadLibrary(bool showLoading = true) {
     JsonDocument document;
     const DeserializationError error = deserializeJson(document, payload);
     if (error) {
+        if (fetchedRemote) return loadLibrary(showLoading, false, true);
         snprintf(statusText, sizeof(statusText), "JSON %s", error.c_str());
         Serial.printf("[STORY API] JSON parse failed: %s\n", error.c_str());
         return false;
@@ -864,10 +878,13 @@ bool loadLibrary(bool showLoading = true) {
     storyTotal = document["total"] | 0;
     JsonArray items = document["items"].as<JsonArray>();
     if (items.isNull()) {
+        if (fetchedRemote) return loadLibrary(showLoading, false, true);
         std::strcpy(statusText, "NO ITEMS IN JSON");
         Serial.println("[STORY API] Parsed JSON has no items array");
         return false;
     }
+    if (fetchedRemote) PlaylistCache::save(
+        STORY_SD_FOLDER, endpoint, cacheSlot, payload);
     for (JsonObject item : items) {
         if (storyCount >= ITEMS_PER_PAGE) break;
         StoryItem &story = stories[storyCount];
@@ -889,7 +906,7 @@ bool loadLibrary(bool showLoading = true) {
 }
 
 void libraryLoadTask(void *) {
-    loadLibrary(false);
+    loadLibrary(false, true);
     libraryAwaitingContent = false;
     libraryLoadRunning = false;
     libraryLoadCompleted = true;
@@ -1032,13 +1049,14 @@ void openLibrary() {
     storyTotal = 0;
     libraryAwaitingContent = true;
     libraryLoadCompleted = false;
+    if (loadLibrary(false, false, true)) libraryAwaitingContent = false;
 }
 
 bool startLibraryLoad() {
     if (libraryLoadRunning) return false;
     libraryLoadRunning = true;
     libraryLoadCompleted = false;
-    if (xTaskCreate(libraryLoadTask, "voice-library", 8192, nullptr, 1, nullptr) != pdPASS) {
+    if (xTaskCreate(libraryLoadTask, "voice-library", 4096, nullptr, 1, nullptr) != pdPASS) {
         libraryLoadRunning = false;
         libraryAwaitingContent = false;
         std::strcpy(statusText, "VOICE TASK FAILED");

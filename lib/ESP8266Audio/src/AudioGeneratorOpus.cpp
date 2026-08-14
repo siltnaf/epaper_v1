@@ -22,6 +22,11 @@
 
 namespace {
 constexpr uint32_t PCM_BUFFER_SAMPLES = 2048;
+// The no-PSRAM ESP32-S3 can have enough total heap but no single free block
+// large enough for the mono decoder state. Keep this one decoder workspace out
+// of the fragmented heap; the application has only one active Opus decoder.
+constexpr size_t OPUS_DECODER_WORKSPACE_BYTES = 17776 + 4;
+alignas(4) uint8_t opusDecoderWorkspace[OPUS_DECODER_WORKSPACE_BYTES] = {};
 }
 
 AudioGeneratorOpus::AudioGeneratorOpus() {
@@ -33,10 +38,11 @@ AudioGeneratorOpus::AudioGeneratorOpus() {
 }
 
 AudioGeneratorOpus::~AudioGeneratorOpus() {
-    if (od) {
+    if (od && !decoderUsesStaticWorkspace) {
         free(od);
     }
     od = nullptr;
+    decoderUsesStaticWorkspace = false;
     free(buff);
     buff = nullptr;
 }
@@ -44,20 +50,27 @@ AudioGeneratorOpus::~AudioGeneratorOpus() {
 bool AudioGeneratorOpus::reserveDecoder() {
     openStage = 1;
     lastError = 0;
-    if (od) return true;
-
-    // Allocate the largest block first. On the no-PSRAM ESP32-S3, allocating
-    // file/output objects or PCM/packet buffers first can fragment the only
-    // block large enough for the mono OpusDecoder state.
-    od = (OpusDecoder *) malloc(opus_decoder_get_size(1));
+    if (!od) {
+        // Allocate the largest block first. On the no-PSRAM ESP32-S3, allocating
+        // file/output objects or PCM/packet buffers first can fragment the only
+        // block large enough for the mono OpusDecoder state.
+        const size_t decoderBytes = static_cast<size_t>(opus_decoder_get_size(1));
+        if (decoderBytes <= OPUS_DECODER_WORKSPACE_BYTES) {
+            od = reinterpret_cast<OpusDecoder *>(opusDecoderWorkspace);
+            decoderUsesStaticWorkspace = true;
+        } else {
+            od = (OpusDecoder *) malloc(decoderBytes);
+        }
+    }
     if (!od) {
         lastError = OPUS_ALLOC_FAIL;
         return false;
     }
     lastError = opus_decoder_init(od, 48000, 1);
     if (lastError != OPUS_OK) {
-        free(od);
+        if (!decoderUsesStaticWorkspace) free(od);
         od = nullptr;
+        decoderUsesStaticWorkspace = false;
         return false;
     }
     return true;
@@ -105,10 +118,6 @@ bool AudioGeneratorOpus::begin(AudioFileSource *source, AudioOutput *output) {
     if (!output->begin() || !output->SetRate(48000) ||
         !output->SetBitsPerSample(16) || !output->SetChannels(2)) {
         lastError = OPUS_INVALID_STATE;
-        free(buff);
-        buff = nullptr;
-        free(od);
-        od = nullptr;
         return false;
     }
 
@@ -298,10 +307,11 @@ done:
 }
 
 bool AudioGeneratorOpus::stop() {
-    if (od) {
+    if (od && !decoderUsesStaticWorkspace) {
         free(od);
     }
     od = nullptr;
+    decoderUsesStaticWorkspace = false;
     free(buff);
     buff = nullptr;
     running = false;

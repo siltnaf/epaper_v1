@@ -8,6 +8,7 @@
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
 
+#include <cstdlib>
 #include <cstring>
 
 #include "devices/epd_xingtai/epd_xingtai.h"
@@ -15,6 +16,7 @@
 #include "devices/ml307/ml307.h"
 #include "devices/sd_card/sd_card.h"
 #include "font/xiaozhi_font.h"
+#include "pages/playlist_cache.h"
 #include "ui/loading_indicator.h"
 #include "ui/localization.h"
 
@@ -284,6 +286,19 @@ void copyUtf8(char *destination, size_t destinationSize, const char *source,
     destination[output] = '\0';
 }
 
+bool readMetadataLine(File &file, char *destination, size_t destinationSize) {
+    if (!destination || destinationSize == 0) return false;
+    size_t length = 0;
+    while (file.available()) {
+        const int value = file.read();
+        if (value < 0 || value == '\n') break;
+        if (value == '\r') continue;
+        if (length + 1 < destinationSize) destination[length++] = static_cast<char>(value);
+    }
+    destination[length] = '\0';
+    return length > 0;
+}
+
 String endpointBase() {
     String base(contentBaseUrl);
     base.trim();
@@ -342,15 +357,16 @@ bool isSongSavedOnSd(int32_t songId) {
              static_cast<long>(songId));
     File meta = SD_MMC.open(metaPath, FILE_READ);
     if (!meta) return false;
-    meta.readStringUntil('\n');
-    meta.readStringUntil('\n');
-    String filename = meta.readStringUntil('\n');
+    char ignored[80] = {};
+    char filename[80] = {};
+    readMetadataLine(meta, ignored, sizeof(ignored));
+    readMetadataLine(meta, ignored, sizeof(ignored));
+    readMetadataLine(meta, filename, sizeof(filename));
     meta.close();
-    filename.trim();
-    if (filename.isEmpty()) return false;
+    if (!filename[0]) return false;
     char audioPath[144] = {};
     snprintf(audioPath, sizeof(audioPath), "%s/%ld/%s", MUSIC_SD_FOLDER,
-             static_cast<long>(songId), filename.c_str());
+             static_cast<long>(songId), filename);
     return SD_MMC.exists(audioPath);
 }
 
@@ -448,9 +464,10 @@ bool loadSavedSongs() {
     File entry = root.openNextFile();
     while (entry && songCount < ITEMS_PER_PAGE) {
         if (entry.isDirectory()) {
-            String entryName = entry.name();
-            const int slash = entryName.lastIndexOf('/');
-            const int32_t id = entryName.substring(slash + 1).toInt();
+            const char *entryName = entry.name();
+            const char *leaf = entryName ? std::strrchr(entryName, '/') : nullptr;
+            const int32_t id = static_cast<int32_t>(std::strtol(leaf ? leaf + 1 : entryName,
+                                                                nullptr, 10));
             if (id <= 0) {
                 entry.close();
                 entry = root.openNextFile();
@@ -465,18 +482,25 @@ bool loadSavedSongs() {
             snprintf(metaPath, sizeof(metaPath), "%s/meta.txt", directory);
             File meta = SD_MMC.open(metaPath, FILE_READ);
             if (meta) {
-                meta.readStringUntil('\n');
-                const String title = meta.readStringUntil('\n');
-                const String filename = meta.readStringUntil('\n');
-                const String source = meta.readStringUntil('\n');
+                char ignored[24] = {};
+                char title[80] = {};
+                char filename[80] = {};
+                char sourceName[40] = {};
+                readMetadataLine(meta, ignored, sizeof(ignored));
+                readMetadataLine(meta, title, sizeof(title));
+                readMetadataLine(meta, filename, sizeof(filename));
+                readMetadataLine(meta, sourceName, sizeof(sourceName));
                 meta.close();
                 if (isSongSavedOnSd(id)) {
                     SongItem &song = songs[songCount++];
                     song.id = id;
-                    copyUtf8(song.title, sizeof(song.title), title.c_str(), "UNTITLED");
-                    copyUtf8(song.filename, sizeof(song.filename), filename.c_str(), "");
-                    copyUtf8(song.source, sizeof(song.source), source.c_str(), "");
+                    copyUtf8(song.title, sizeof(song.title), title, "UNTITLED");
+                    copyUtf8(song.filename, sizeof(song.filename), filename, "");
+                    copyUtf8(song.source, sizeof(song.source), sourceName, "");
                     song.saved = true;
+                    Serial.printf("[MUSIC SD] item=%u id=%ld title_bytes=%u title=%s\n",
+                                  songCount - 1, static_cast<long>(song.id),
+                                  static_cast<unsigned>(std::strlen(song.title)), song.title);
                 }
             }
         }
@@ -491,7 +515,8 @@ bool loadSavedSongs() {
     return true;
 }
 
-bool loadLibrary(bool showLoading = true) {
+bool loadLibrary(bool showLoading = true, bool forceRemote = false,
+                 bool cacheOnly = false) {
     OptionalLoadingScope loadingIndicator(showLoading);
     OpusPlayer::stop();
     musicPlaying = false;
@@ -500,25 +525,46 @@ bool loadLibrary(bool showLoading = true) {
     marqueeReady = false;
     songCount = 0;
     selectedIndex = -1;
-    // With Wi-Fi disabled, do not spend time making a network request. The
-    // SD library is the authoritative source for previously played songs.
-    if (WiFi.status() != WL_CONNECTED && loadSavedSongs()) return true;
-
     String payload;
-    const String url = endpointBase() + "?page=" + String(libraryPage) +
+    char cacheSlot[20] = {};
+    snprintf(cacheSlot, sizeof(cacheSlot), "page-%ld", static_cast<long>(libraryPage));
+    const String endpoint = endpointBase();
+    bool loaded = !forceRemote && PlaylistCache::load(
+        MUSIC_SD_FOLDER, endpoint, cacheSlot, payload);
+    bool fetchedRemote = false;
+    const String url = endpoint + "?page=" + String(libraryPage) +
                        "&perPage=" + String(ITEMS_PER_PAGE);
-    if (!httpGet(url, payload, showLoading)) return loadSavedSongs();
+    if (!cacheOnly && (forceRemote || !loaded)) {
+        loaded = httpGet(url, payload, showLoading);
+        fetchedRemote = loaded;
+    }
+    if (!loaded && forceRemote) loaded = PlaylistCache::load(
+        MUSIC_SD_FOLDER, endpoint, cacheSlot, payload);
+    if (!loaded) return loadSavedSongs();
 
     Serial.printf("[MUSIC] Library payload preview: %.180s\n", payload.c_str());
+    JsonDocument filter;
+    filter["total"] = true;
+    filter["items"][0]["id"] = true;
+    filter["items"][0]["title"] = true;
+    filter["items"][0]["filename"] = true;
+    filter["items"][0]["source"] = true;
     JsonDocument document;
-    const DeserializationError error = deserializeJson(document, payload);
+    const DeserializationError error = deserializeJson(
+        document, payload, DeserializationOption::Filter(filter));
     if (error) {
+        if (fetchedRemote) return loadLibrary(showLoading, false, true);
         snprintf(statusText, sizeof(statusText), "JSON %s", error.c_str());
         return loadSavedSongs();
     }
     songTotal = document["total"] | 0;
     JsonArray items = document["items"].as<JsonArray>();
-    if (items.isNull()) { std::strcpy(statusText, "NO ITEMS IN JSON"); return loadSavedSongs(); }
+    if (items.isNull()) {
+        if (fetchedRemote) return loadLibrary(showLoading, false, true);
+        std::strcpy(statusText, "NO ITEMS IN JSON");
+        return loadSavedSongs();
+    }
+    if (fetchedRemote) PlaylistCache::save(MUSIC_SD_FOLDER, endpoint, cacheSlot, payload);
     for (JsonObject item : items) {
         if (songCount >= ITEMS_PER_PAGE) break;
         SongItem &song = songs[songCount];
@@ -535,11 +581,15 @@ bool loadLibrary(bool showLoading = true) {
     }
     if (songCount == 0) { std::strcpy(statusText, "NO SONGS FOUND"); return false; }
     snprintf(statusText, sizeof(statusText), "%u SONGS", songCount);
+    Serial.printf("[MUSIC] Playlist ready items=%u total=%ld heap=%u largest=%u\n",
+                  songCount, static_cast<long>(songTotal),
+                  static_cast<unsigned>(ESP.getFreeHeap()),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
     return true;
 }
 
 void libraryLoadTask(void *) {
-    loadLibrary(false);
+    loadLibrary(false, true);
     libraryAwaitingContent = false;
     libraryLoadRunning = false;
     libraryLoadCompleted = true;
@@ -631,13 +681,14 @@ void open() {
     songTotal = 0;
     libraryAwaitingContent = true;
     libraryLoadCompleted = false;
+    if (loadLibrary(false, false, true)) libraryAwaitingContent = false;
 }
 
 bool startLibraryLoad() {
     if (libraryLoadRunning) return false;
     libraryLoadRunning = true;
     libraryLoadCompleted = false;
-    if (xTaskCreate(libraryLoadTask, "music-library", 8192, nullptr, 1, nullptr) != pdPASS) {
+    if (xTaskCreate(libraryLoadTask, "music-library", 4096, nullptr, 1, nullptr) != pdPASS) {
         libraryLoadRunning = false;
         libraryAwaitingContent = false;
         std::strcpy(statusText, "MUSIC TASK FAILED");

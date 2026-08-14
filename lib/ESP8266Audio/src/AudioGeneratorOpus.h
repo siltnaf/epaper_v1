@@ -46,6 +46,7 @@ public:
 
 private:
     OpusDecoder *od = nullptr;
+    bool decoderUsesStaticWorkspace = false;
 
     // RFC 6716 limits an Opus audio packet to 1275 bytes. Keeping this in the
     // generator object removes a second heap allocation from constrained begin().

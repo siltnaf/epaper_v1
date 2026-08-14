@@ -35,6 +35,7 @@ public:
 
     bool setOutputVolume(uint8_t percent);
     bool setMicrophoneGain(uint8_t gainDb);
+    bool prepareRecording(uint8_t gainDb = 30);
     void setSpeakerEnabled(bool enabled);
     void setChipEnabled(bool enabled);
     void setPowerEnabled(bool enabled);

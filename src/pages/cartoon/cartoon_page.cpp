@@ -14,13 +14,13 @@
 #include "devices/epd_xingtai/epd_xingtai.h"
 #include "devices/sd_card/sd_card.h"
 #include "font/xiaozhi_font.h"
+#include "pages/playlist_cache.h"
 #include "ui/loading_indicator.h"
 #include "ui/localization.h"
 
 namespace {
 
 constexpr uint8_t ROWS_PER_PAGE = 10;
-constexpr uint8_t MAX_CARTOONS = 30;
 constexpr int LIST_TOP = 82;
 constexpr int ROW_HEIGHT = 30;
 constexpr int ROW_GAP = 2;
@@ -28,25 +28,29 @@ constexpr int PAGER_TOP = 52;
 constexpr int BUTTON_WIDTH = 34;
 constexpr int BUTTON_HEIGHT = 25;
 constexpr char CARTOON_SD_FOLDER[] = "/cartoon";
-constexpr char READER_JPEG_PATH[] = "/cartoon/reader.jpg";
-constexpr char READER_JPEG_PART_PATH[] = "/cartoon/reader.jpg.part";
 
 struct ListItem {
     char id[64] = {};
     char title[80] = {};
+    bool saved = false;
 };
 
 enum class View : uint8_t { Cartoons, Chapters, Reader };
 
 View view = View::Cartoons;
 char contentBaseUrl[128] = "http://";
-ListItem cartoons[MAX_CARTOONS] = {};
+ListItem cartoons[ROWS_PER_PAGE] = {};
 ListItem chapterRows[ROWS_PER_PAGE] = {};
 uint8_t cartoonCount = 0;
 uint8_t chapterRowCount = 0;
 uint16_t cartoonPage = 1;
+uint16_t cartoonTotal = 0;
+uint16_t cartoonOffset = 0;
+bool cartoonHasMore = false;
 uint16_t chapterPage = 1;
 uint16_t chapterTotal = 0;
+uint16_t chapterOffset = 0;
+bool chapterHasMore = false;
 uint16_t readerPage = 1;
 uint16_t readerPageTotal = 1;
 char selectedSlug[64] = {};
@@ -58,6 +62,23 @@ String chapterPayload;
 size_t jpegSize = 0;
 bool imageReady = false;
 uint8_t *decodeFrame = nullptr;
+char readerJpegPath[192] = {};
+CartoonPage::RefreshMode refreshMode = CartoonPage::RefreshMode::Layout;
+volatile bool libraryLoadRunning = false;
+volatile bool libraryLoadCompleted = false;
+
+bool loadChapterPayloadFromSd(const char *slug, String &payload);
+bool saveChapterPayloadToSd(const char *slug, const String &payload);
+bool cartoonHasCache(const char *slug);
+bool chapterHasCache(const char *slug, const char *chapterId);
+bool ensureCartoonDirectory();
+bool ensureCacheDirectory(const char *slug, const char *chapterId = nullptr);
+bool loadChapterRowsFromSd(const char *slug);
+bool loadSavedCartoonsFromSd();
+bool loadSavedChapterPageFromSd(const char *slug, int32_t requestedOffset);
+void saveCartoonTitleToSd(const char *slug, const char *title);
+void saveChapterTitleToSd(const char *slug, const char *chapterId, const char *title);
+void safePathComponent(const char *value, char *output, size_t outputSize);
 
 void pixel(uint8_t *frame, int x, int y) {
     if (!frame || x < 0 || x >= XingtaiEpd::WIDTH || y < 0 || y >= XingtaiEpd::HEIGHT) return;
@@ -93,6 +114,11 @@ void drawArrow(uint8_t *frame, int centerX, int centerY, bool right) {
 void drawDoubleArrow(uint8_t *frame, int centerX, int centerY, bool right) {
     drawArrow(frame, centerX - (right ? 4 : -4), centerY, right);
     drawArrow(frame, centerX + (right ? 4 : -4), centerY, right);
+}
+
+void drawCheckmark(uint8_t *frame, int centerX, int centerY) {
+    line(frame, centerX - 7, centerY, centerX - 2, centerY + 6);
+    line(frame, centerX - 2, centerY + 6, centerX + 8, centerY - 7);
 }
 
 bool inRect(int16_t x, int16_t y, int left, int top, int width, int height) {
@@ -158,6 +184,37 @@ void drawTitle(uint8_t *frame, int x, int y, int width, int height, const char *
     }
 }
 
+void drawCenteredTitle(uint8_t *frame, int x, int y, int width, int height,
+                       const char *text) {
+    const char *cursor = text ? text : "";
+    int textWidth = 0;
+    while (*cursor && textWidth < width) {
+        const uint8_t first = static_cast<uint8_t>(*cursor);
+        uint32_t codepoint = first;
+        int bytes = 1;
+        if ((first & 0xE0U) == 0xC0U) {
+            codepoint = ((first & 0x1FU) << 6) |
+                        (static_cast<uint8_t>(cursor[1]) & 0x3FU);
+            bytes = 2;
+        } else if ((first & 0xF0U) == 0xE0U) {
+            codepoint = ((first & 0x0FU) << 12) |
+                        ((static_cast<uint8_t>(cursor[1]) & 0x3FU) << 6) |
+                        (static_cast<uint8_t>(cursor[2]) & 0x3FU);
+            bytes = 3;
+        }
+        const XiaozhiFont::Glyph *glyph = codepoint < 0x80
+            ? nullptr : XiaozhiFont::glyph(codepoint);
+        const int advance = codepoint < 0x80
+            ? (codepoint == ' ' ? 5 : 7)
+            : (glyph ? max(1, static_cast<int>(glyph->advance)) + 1 : 18);
+        if (textWidth + advance > width) break;
+        textWidth += advance;
+        cursor += bytes;
+    }
+    drawTitle(frame, x + max(0, (width - textWidth) / 2), y,
+              width - max(0, (width - textWidth) / 2), height, text);
+}
+
 bool httpGetText(const String &url, String &payload, uint32_t timeout = 20000) {
     UiLoadingIndicator::Scope loading;
     if (WiFi.status() != WL_CONNECTED) {
@@ -196,24 +253,72 @@ bool httpGetText(const String &url, String &payload, uint32_t timeout = 20000) {
     return false;
 }
 
-bool loadCartoons() {
+bool loadCartoons(int32_t requestedOffset, bool forceRemote = false,
+                  bool cacheOnly = false) {
     String payload;
-    if (!httpGetText(apiBase() + "?limit=" + String(MAX_CARTOONS), payload)) return false;
+    const String endpoint = apiBase();
+    char cacheSlot[24] = {};
+    snprintf(cacheSlot, sizeof(cacheSlot), "offset-%ld", static_cast<long>(requestedOffset));
+    bool loaded = !forceRemote && PlaylistCache::load(
+        CARTOON_SD_FOLDER, endpoint, cacheSlot, payload);
+    bool fetchedRemote = false;
+    const String url = endpoint + "?limit=" + String(ROWS_PER_PAGE) +
+                       "&offset=" + String(requestedOffset);
+    if (!cacheOnly && (forceRemote || !loaded)) {
+        loaded = httpGetText(url, payload);
+        fetchedRemote = loaded;
+    }
+    if (!loaded && forceRemote) loaded = PlaylistCache::load(
+        CARTOON_SD_FOLDER, endpoint, cacheSlot, payload);
+    if (!loaded) return loadSavedCartoonsFromSd();
     JsonDocument document;
     if (deserializeJson(document, payload)) {
+        if (fetchedRemote) return loadCartoons(requestedOffset, false, true);
         copyText(statusText, sizeof(statusText), "CARTOON JSON FAILED");
         return false;
     }
+    if (fetchedRemote) PlaylistCache::save(
+        CARTOON_SD_FOLDER, endpoint, cacheSlot, payload);
+    const uint16_t responseTotal = document["total"] | 0;
+    const uint16_t responseOffset = document["offset"] |
+        static_cast<uint16_t>(requestedOffset < 0 ? 0 : requestedOffset);
     cartoonCount = 0;
+    cartoonTotal = max<uint16_t>(responseTotal, responseOffset);
+    cartoonOffset = responseOffset;
+    cartoonHasMore = document["has_more"] | false;
+    const bool offline = WiFi.status() != WL_CONNECTED;
     for (JsonObject item : document["cartoons"].as<JsonArray>()) {
-        if (cartoonCount >= MAX_CARTOONS) break;
+        if (cartoonCount >= ROWS_PER_PAGE) break;
         copyText(cartoons[cartoonCount].id, sizeof(cartoons[cartoonCount].id), item["id"] | "");
         copyText(cartoons[cartoonCount].title, sizeof(cartoons[cartoonCount].title),
                  item["name"] | "", "UNTITLED");
+        cartoons[cartoonCount].saved = cartoonHasCache(cartoons[cartoonCount].id);
+        if (offline && !cartoons[cartoonCount].saved) continue;
+        if (cartoons[cartoonCount].saved) {
+            saveCartoonTitleToSd(cartoons[cartoonCount].id, cartoons[cartoonCount].title);
+        }
         if (cartoons[cartoonCount].id[0]) ++cartoonCount;
     }
+    if (cartoonTotal < cartoonOffset + cartoonCount) {
+        cartoonTotal = cartoonOffset + cartoonCount;
+    }
+    if (offline) {
+        cartoonTotal = cartoonCount;
+        cartoonOffset = 0;
+        cartoonHasMore = false;
+        if (cartoonCount == 0) return loadSavedCartoonsFromSd();
+    }
+    cartoonPage = max<uint16_t>(
+        1, (cartoonOffset + ROWS_PER_PAGE - 1) / ROWS_PER_PAGE + 1);
     copyText(statusText, sizeof(statusText), cartoonCount ? "" : "NO CARTOONS");
-    return cartoonCount > 0;
+    return cartoonCount > 0 || cartoonTotal == 0;
+}
+
+void libraryLoadTask(void *) {
+    loadCartoons(0, true);
+    libraryLoadRunning = false;
+    libraryLoadCompleted = true;
+    vTaskDelete(nullptr);
 }
 
 String jsonStringAt(const String &json, int objectStart, const char *key, int objectEnd) {
@@ -256,11 +361,146 @@ void loadChapterRows() {
             copyText(chapterRows[chapterRowCount].id, sizeof(chapterRows[chapterRowCount].id), id.c_str());
             copyText(chapterRows[chapterRowCount].title, sizeof(chapterRows[chapterRowCount].title),
                      title.c_str(), "UNTITLED");
+            chapterRows[chapterRowCount].saved =
+                chapterHasCache(selectedSlug, chapterRows[chapterRowCount].id);
             if (chapterRows[chapterRowCount].id[0]) ++chapterRowCount;
         }
         ++chapterTotal;
         position = objectEnd + 1;
     }
+}
+
+void chapterListPath(const char *slug, char *path, size_t pathSize) {
+    char safeSlug[64] = {};
+    safePathComponent(slug, safeSlug, sizeof(safeSlug));
+    snprintf(path, pathSize, "%s/%s/chapters.json", CARTOON_SD_FOLDER, safeSlug);
+}
+
+bool parseChapterObject(const String &object, uint16_t firstVisible) {
+    if (object.indexOf("\"chapters\"") >= 0) return false;
+    const String id = jsonStringAt(object, 0, "id", object.length());
+    const String title = jsonStringAt(object, 0, "title", object.length());
+    if (id.isEmpty()) return false;
+    if (chapterTotal >= firstVisible && chapterRowCount < ROWS_PER_PAGE) {
+        copyText(chapterRows[chapterRowCount].id, sizeof(chapterRows[chapterRowCount].id), id.c_str());
+        copyText(chapterRows[chapterRowCount].title, sizeof(chapterRows[chapterRowCount].title),
+                 title.c_str(), "UNTITLED");
+        chapterRows[chapterRowCount].saved =
+            chapterHasCache(selectedSlug, chapterRows[chapterRowCount].id);
+        ++chapterRowCount;
+    }
+    ++chapterTotal;
+    return true;
+}
+
+bool loadChapterRowsFromSd(const char *slug) {
+    char path[128] = {};
+    chapterListPath(slug, path, sizeof(path));
+    File file = SD_MMC.open(path, FILE_READ);
+    if (!file || file.size() == 0) {
+        if (file) file.close();
+        return false;
+    }
+    chapterRowCount = 0;
+    chapterTotal = 0;
+    const uint16_t firstVisible = (chapterPage - 1) * ROWS_PER_PAGE;
+    String object;
+    String marker;
+    bool chaptersKeyFound = false;
+    bool inArray = false;
+    bool inObject = false;
+    uint16_t depth = 0;
+    while (file.available()) {
+        const char character = static_cast<char>(file.read());
+        if (!inArray) {
+            if (!chaptersKeyFound) {
+                marker += character;
+                if (marker.length() > 12) marker.remove(0, marker.length() - 12);
+                chaptersKeyFound = marker.endsWith("\"chapters\"");
+            } else if (character == '[') {
+                inArray = true;
+            }
+            continue;
+        }
+        if (!inObject) {
+            if (character == ']') break;
+            if (character == '{') {
+                inObject = true;
+                depth = 1;
+                object = "{";
+            }
+            continue;
+        }
+        object += character;
+        if (character == '{') ++depth;
+        else if (character == '}' && depth > 0 && --depth == 0) {
+            parseChapterObject(object, firstVisible);
+            inObject = false;
+            object = "";
+        }
+    }
+    file.close();
+    chapterOffset = firstVisible;
+    chapterHasMore = firstVisible + chapterRowCount < chapterTotal;
+    chapterPage = max<uint16_t>(1, firstVisible / ROWS_PER_PAGE + 1);
+    return chapterTotal > 0;
+}
+
+bool loadChapterPageFromApi(const char *slug, int32_t requestedOffset) {
+    String payload;
+    const String endpoint = apiBase() + "/" + slug;
+    char cacheSlot[24] = {};
+    snprintf(cacheSlot, sizeof(cacheSlot), "offset-%ld", static_cast<long>(requestedOffset));
+    bool loaded = PlaylistCache::load(
+        CARTOON_SD_FOLDER, endpoint, cacheSlot, payload);
+    const String url = endpoint + "?limit=" + String(ROWS_PER_PAGE) +
+                       "&offset=" + String(requestedOffset);
+    if (!loaded) {
+        loaded = httpGetText(url, payload, 30000);
+        if (loaded) PlaylistCache::save(
+            CARTOON_SD_FOLDER, endpoint, cacheSlot, payload);
+    }
+    if (!loaded) {
+        if (requestedOffset >= 0) {
+            chapterPage = static_cast<uint16_t>(requestedOffset / ROWS_PER_PAGE + 1);
+            if (loadChapterRowsFromSd(slug)) return true;
+        }
+        return loadSavedChapterPageFromSd(slug, requestedOffset);
+    }
+
+    JsonDocument document;
+    if (deserializeJson(document, payload)) {
+        copyText(statusText, sizeof(statusText), "CHAPTER JSON FAILED");
+        return false;
+    }
+    const uint16_t responseTotal = document["total"] | 0;
+    const uint16_t responseOffset = document["offset"] |
+        static_cast<uint16_t>(requestedOffset < 0 ? 0 : requestedOffset);
+    chapterRowCount = 0;
+    chapterTotal = max<uint16_t>(responseTotal, responseOffset);
+    chapterOffset = responseOffset;
+    chapterHasMore = document["has_more"] | false;
+    for (JsonObject item : document["chapters"].as<JsonArray>()) {
+        if (chapterRowCount >= ROWS_PER_PAGE) break;
+        copyText(chapterRows[chapterRowCount].id, sizeof(chapterRows[chapterRowCount].id),
+                 item["id"] | "");
+        copyText(chapterRows[chapterRowCount].title, sizeof(chapterRows[chapterRowCount].title),
+                 item["title"] | "", "UNTITLED");
+        chapterRows[chapterRowCount].saved =
+            chapterHasCache(selectedSlug, chapterRows[chapterRowCount].id);
+        if (chapterRows[chapterRowCount].saved) {
+            saveChapterTitleToSd(slug, chapterRows[chapterRowCount].id,
+                                 chapterRows[chapterRowCount].title);
+        }
+        if (chapterRows[chapterRowCount].id[0]) ++chapterRowCount;
+    }
+    if (chapterTotal < chapterOffset + chapterRowCount) {
+        chapterTotal = chapterOffset + chapterRowCount;
+    }
+    chapterPage = max<uint16_t>(
+        1, (chapterOffset + ROWS_PER_PAGE - 1) / ROWS_PER_PAGE + 1);
+    copyText(statusText, sizeof(statusText), chapterRowCount ? "" : "NO CHAPTERS");
+    return chapterRowCount > 0 || chapterTotal == 0;
 }
 
 bool loadChapters(const ListItem &comic) {
@@ -269,18 +509,19 @@ bool loadChapters(const ListItem &comic) {
     chapterPage = 1;
     chapterRowCount = 0;
     chapterTotal = 0;
+    chapterOffset = 0;
+    chapterHasMore = false;
     view = View::Chapters;
     copyText(statusText, sizeof(statusText), "LOADING CHAPTERS");
-    chapterPayload = static_cast<const char *>(nullptr);
-    if (!httpGetText(apiBase() + "/" + comic.id, chapterPayload, 30000)) {
+    chapterPayload = "";
+    if (!loadChapterPageFromApi(comic.id, 0) && !loadChapterRowsFromSd(comic.id)) {
         copyText(statusText, sizeof(statusText), "CHAPTER LOAD FAILED");
         Serial.printf("[CARTOON] Chapter page opened without data comic=%s\n", comic.id);
         return true;
     }
-    loadChapterRows();
     copyText(statusText, sizeof(statusText), chapterRowCount ? "" : "NO CHAPTERS");
     Serial.printf("[CARTOON] Chapter page comic=%s total=%u visible=%u payload=%u\n",
-                  comic.id, chapterTotal, chapterRowCount, chapterPayload.length());
+                  comic.id, chapterTotal, chapterRowCount, 0U);
     return true;
 }
 
@@ -550,16 +791,285 @@ bool ensureCartoonDirectory() {
     return created;
 }
 
-bool downloadJpeg(const String &url) {
+void safePathComponent(const char *value, char *output, size_t outputSize) {
+    if (!output || outputSize == 0) return;
+    size_t written = 0;
+    for (size_t index = 0; value && value[index] && written + 1 < outputSize; ++index) {
+        const char character = value[index];
+        if ((character >= 'a' && character <= 'z') ||
+            (character >= 'A' && character <= 'Z') ||
+            (character >= '0' && character <= '9') || character == '-' || character == '_') {
+            output[written++] = character;
+        } else {
+            output[written++] = '_';
+        }
+    }
+    output[written] = '\0';
+}
+
+bool ensureCacheDirectory(const char *slug, const char *chapterId) {
+    if (!ensureCartoonDirectory()) return false;
+    char safeSlug[64] = {};
+    safePathComponent(slug, safeSlug, sizeof(safeSlug));
+    if (!safeSlug[0]) return false;
+    char comicDirectory[96] = {};
+    snprintf(comicDirectory, sizeof(comicDirectory), "%s/%s", CARTOON_SD_FOLDER, safeSlug);
+    if (!SD_MMC.exists(comicDirectory) && !SD_MMC.mkdir(comicDirectory)) return false;
+    if (!chapterId) return true;
+    char safeChapter[48] = {};
+    safePathComponent(chapterId, safeChapter, sizeof(safeChapter));
+    if (!safeChapter[0]) return false;
+    char chapterDirectory[160] = {};
+    snprintf(chapterDirectory, sizeof(chapterDirectory), "%s/%s", comicDirectory, safeChapter);
+    return SD_MMC.exists(chapterDirectory) || SD_MMC.mkdir(chapterDirectory);
+}
+
+void chapterCachePath(const char *slug, const char *chapterId, uint16_t page,
+                      char *path, size_t pathSize) {
+    char safeSlug[64] = {};
+    char safeChapter[48] = {};
+    safePathComponent(slug, safeSlug, sizeof(safeSlug));
+    safePathComponent(chapterId, safeChapter, sizeof(safeChapter));
+    snprintf(path, pathSize, "%s/%s/%s/page-%u.jpg", CARTOON_SD_FOLDER,
+             safeSlug, safeChapter, page);
+}
+
+bool validCachedJpeg(const char *path, size_t *size = nullptr) {
+    if (!SdCard::isMounted() || !path || !SD_MMC.exists(path)) return false;
+    File file = SD_MMC.open(path, FILE_READ);
+    uint8_t header[2] = {};
+    const size_t bytes = file ? file.read(header, sizeof(header)) : 0;
+    const size_t fileSize = file ? file.size() : 0;
+    if (file) file.close();
+    const bool valid = bytes == sizeof(header) && fileSize >= 128 &&
+                       header[0] == 0xFF && header[1] == 0xD8;
+    if (valid && size) *size = fileSize;
+    return valid;
+}
+
+bool chapterHasCache(const char *slug, const char *chapterId) {
+    char path[192] = {};
+    chapterCachePath(slug, chapterId, 1, path, sizeof(path));
+    return validCachedJpeg(path);
+}
+
+bool cartoonHasCache(const char *slug) {
+    if (!SdCard::isMounted()) return false;
+    char safeSlug[64] = {};
+    safePathComponent(slug, safeSlug, sizeof(safeSlug));
+    char comicDirectory[96] = {};
+    snprintf(comicDirectory, sizeof(comicDirectory), "%s/%s", CARTOON_SD_FOLDER, safeSlug);
+    File directory = SD_MMC.open(comicDirectory);
+    if (!directory || !directory.isDirectory()) return false;
+    File entry = directory.openNextFile();
+    while (entry) {
+        const bool isDirectory = entry.isDirectory();
+        const String entryPath = entry.path();
+        entry.close();
+        if (isDirectory) {
+            const String firstPage = entryPath + "/page-1.jpg";
+            if (validCachedJpeg(firstPage.c_str())) {
+                directory.close();
+                return true;
+            }
+        }
+        entry = directory.openNextFile();
+    }
+    directory.close();
+    return false;
+}
+
+String pathLeaf(const String &path) {
+    const int slash = path.lastIndexOf('/');
+    return slash >= 0 ? path.substring(slash + 1) : path;
+}
+
+void saveTextMetadata(const char *path, const char *value) {
+    if (!path || !value || !value[0] || SD_MMC.exists(path)) return;
+    File file = SD_MMC.open(path, FILE_WRITE);
+    if (file) {
+        file.println(value);
+        file.close();
+    }
+}
+
+void saveCartoonTitleToSd(const char *slug, const char *title) {
+    if (!ensureCacheDirectory(slug)) return;
+    char safeSlug[64] = {};
+    safePathComponent(slug, safeSlug, sizeof(safeSlug));
+    char path[128] = {};
+    snprintf(path, sizeof(path), "%s/%s/title.txt", CARTOON_SD_FOLDER, safeSlug);
+    saveTextMetadata(path, title);
+}
+
+void saveChapterTitleToSd(const char *slug, const char *chapterId, const char *title) {
+    if (!ensureCacheDirectory(slug, chapterId)) return;
+    char safeSlug[64] = {};
+    char safeChapter[48] = {};
+    safePathComponent(slug, safeSlug, sizeof(safeSlug));
+    safePathComponent(chapterId, safeChapter, sizeof(safeChapter));
+    char path[176] = {};
+    snprintf(path, sizeof(path), "%s/%s/%s/title.txt", CARTOON_SD_FOLDER,
+             safeSlug, safeChapter);
+    saveTextMetadata(path, title);
+}
+
+void readTitleMetadata(const char *path, const char *fallback,
+                       char *title, size_t titleSize) {
+    String value;
+    File file = SD_MMC.open(path, FILE_READ);
+    if (file) {
+        value = file.readStringUntil('\n');
+        value.trim();
+        file.close();
+    }
+    copyText(title, titleSize, value.c_str(), fallback);
+}
+
+bool loadSavedCartoonsFromSd() {
+    if (!SdCard::isMounted()) return false;
+    File root = SD_MMC.open(CARTOON_SD_FOLDER);
+    if (!root || !root.isDirectory()) return false;
+    cartoonCount = 0;
+    cartoonTotal = 0;
+    cartoonOffset = 0;
+    cartoonHasMore = false;
+    File entry = root.openNextFile();
+    while (entry && cartoonCount < ROWS_PER_PAGE) {
+        const bool directory = entry.isDirectory();
+        const String slug = pathLeaf(entry.path());
+        entry.close();
+        if (directory && !slug.isEmpty() && cartoonHasCache(slug.c_str())) {
+            ListItem &cartoon = cartoons[cartoonCount++];
+            copyText(cartoon.id, sizeof(cartoon.id), slug.c_str());
+            char titlePath[128] = {};
+            snprintf(titlePath, sizeof(titlePath), "%s/%s/title.txt",
+                     CARTOON_SD_FOLDER, slug.c_str());
+            readTitleMetadata(titlePath, slug.c_str(), cartoon.title, sizeof(cartoon.title));
+            cartoon.saved = true;
+        }
+        entry = root.openNextFile();
+    }
+    root.close();
+    cartoonTotal = cartoonCount;
+    cartoonPage = 1;
+    copyText(statusText, sizeof(statusText), cartoonCount ? "" : "NO SAVED CARTOONS");
+    Serial.printf("[CARTOON SD] Offline cartoons=%u\n", cartoonCount);
+    return cartoonCount > 0;
+}
+
+uint16_t savedChapterCount(const char *slug) {
+    char safeSlug[64] = {};
+    safePathComponent(slug, safeSlug, sizeof(safeSlug));
+    char comicPath[96] = {};
+    snprintf(comicPath, sizeof(comicPath), "%s/%s", CARTOON_SD_FOLDER, safeSlug);
+    File root = SD_MMC.open(comicPath);
+    if (!root || !root.isDirectory()) return 0;
+    uint16_t count = 0;
+    File entry = root.openNextFile();
+    while (entry) {
+        const bool directory = entry.isDirectory();
+        const String chapterId = pathLeaf(entry.path());
+        entry.close();
+        if (directory && chapterHasCache(slug, chapterId.c_str())) ++count;
+        entry = root.openNextFile();
+    }
+    root.close();
+    return count;
+}
+
+bool loadSavedChapterPageFromSd(const char *slug, int32_t requestedOffset) {
+    if (!SdCard::isMounted()) return false;
+    const uint16_t total = savedChapterCount(slug);
+    if (total == 0) return false;
+    const uint16_t start = requestedOffset < 0
+        ? (total > ROWS_PER_PAGE ? total - ROWS_PER_PAGE : 0)
+        : min<uint16_t>(requestedOffset, total);
+    char safeSlug[64] = {};
+    safePathComponent(slug, safeSlug, sizeof(safeSlug));
+    char comicPath[96] = {};
+    snprintf(comicPath, sizeof(comicPath), "%s/%s", CARTOON_SD_FOLDER, safeSlug);
+    File root = SD_MMC.open(comicPath);
+    if (!root || !root.isDirectory()) return false;
+    chapterRowCount = 0;
+    uint16_t savedIndex = 0;
+    File entry = root.openNextFile();
+    while (entry && chapterRowCount < ROWS_PER_PAGE) {
+        const bool directory = entry.isDirectory();
+        const String chapterId = pathLeaf(entry.path());
+        entry.close();
+        if (directory && chapterHasCache(slug, chapterId.c_str())) {
+            if (savedIndex >= start) {
+                ListItem &chapter = chapterRows[chapterRowCount++];
+                copyText(chapter.id, sizeof(chapter.id), chapterId.c_str());
+                char titlePath[176] = {};
+                snprintf(titlePath, sizeof(titlePath), "%s/%s/%s/title.txt",
+                         CARTOON_SD_FOLDER, safeSlug, chapterId.c_str());
+                readTitleMetadata(titlePath, chapterId.c_str(), chapter.title,
+                                  sizeof(chapter.title));
+                chapter.saved = true;
+            }
+            ++savedIndex;
+        }
+        entry = root.openNextFile();
+    }
+    root.close();
+    chapterTotal = total;
+    chapterOffset = start;
+    chapterHasMore = start + chapterRowCount < total;
+    chapterPage = max<uint16_t>(1, start / ROWS_PER_PAGE + 1);
+    copyText(statusText, sizeof(statusText), chapterRowCount ? "" : "NO SAVED CHAPTERS");
+    Serial.printf("[CARTOON SD] Offline chapters comic=%s offset=%u visible=%u total=%u\n",
+                  slug, start, chapterRowCount, chapterTotal);
+    return chapterRowCount > 0;
+}
+
+bool saveChapterPayloadToSd(const char *slug, const String &payload) {
+    if (payload.isEmpty() || !ensureCacheDirectory(slug)) return false;
+    char safeSlug[64] = {};
+    safePathComponent(slug, safeSlug, sizeof(safeSlug));
+    char path[128] = {};
+    char temporary[136] = {};
+    snprintf(path, sizeof(path), "%s/%s/chapters.json", CARTOON_SD_FOLDER, safeSlug);
+    snprintf(temporary, sizeof(temporary), "%s.part", path);
+    SD_MMC.remove(temporary);
+    File file = SD_MMC.open(temporary, FILE_WRITE);
+    if (!file) return false;
+    const size_t written = file.print(payload);
+    file.flush();
+    file.close();
+    if (written != payload.length()) {
+        SD_MMC.remove(temporary);
+        return false;
+    }
+    SD_MMC.remove(path);
+    return SD_MMC.rename(temporary, path);
+}
+
+bool loadChapterPayloadFromSd(const char *slug, String &payload) {
+    if (!SdCard::isMounted()) return false;
+    char safeSlug[64] = {};
+    safePathComponent(slug, safeSlug, sizeof(safeSlug));
+    char path[128] = {};
+    snprintf(path, sizeof(path), "%s/%s/chapters.json", CARTOON_SD_FOLDER, safeSlug);
+    File file = SD_MMC.open(path, FILE_READ);
+    if (!file || file.size() == 0) return false;
+    payload = file.readString();
+    file.close();
+    return !payload.isEmpty();
+}
+
+bool downloadJpeg(const String &url, const char *destinationPath) {
     UiLoadingIndicator::Scope loading;
     imageReady = false;
     jpegSize = 0;
-    if (WiFi.status() != WL_CONNECTED || !ensureCartoonDirectory()) {
+    if (WiFi.status() != WL_CONNECTED ||
+        !ensureCacheDirectory(selectedSlug, selectedChapterId)) {
         copyText(statusText, sizeof(statusText), "SD OR WIFI NOT READY");
         return false;
     }
-    SD_MMC.remove(READER_JPEG_PART_PATH);
-    SD_MMC.remove(READER_JPEG_PATH);
+    const String temporaryPath = String(destinationPath) + ".part";
+    SD_MMC.remove(temporaryPath);
     for (uint8_t attempt = 1; attempt <= 2; ++attempt) {
         HTTPClient http;
         WiFiClient client;
@@ -579,7 +1089,7 @@ bool downloadJpeg(const String &url) {
         const String error = code < 0 ? http.errorToString(code) : String();
         bool complete = false;
         if (code >= 200 && code < 300 && contentLength > 0 && contentLength <= 90000) {
-            File output = SD_MMC.open(READER_JPEG_PART_PATH, FILE_WRITE);
+            File output = SD_MMC.open(temporaryPath, FILE_WRITE);
             if (output) {
                 WiFiClient *stream = http.getStreamPtr();
                 uint8_t buffer[1024] = {};
@@ -619,14 +1129,15 @@ bool downloadJpeg(const String &url) {
                       static_cast<unsigned>(ESP.getMaxAllocHeap()), url.c_str());
         http.end();
         if (complete) {
-            if (SD_MMC.rename(READER_JPEG_PART_PATH, READER_JPEG_PATH)) {
+            SD_MMC.remove(destinationPath);
+            if (SD_MMC.rename(temporaryPath, destinationPath)) {
                 Serial.printf("[CARTOON SD] Saved image path=%s bytes=%u\n",
-                              READER_JPEG_PATH, static_cast<unsigned>(jpegSize));
+                              destinationPath, static_cast<unsigned>(jpegSize));
                 return true;
             }
             Serial.println("[CARTOON JPEG] Could not finalize SD image file");
         }
-        SD_MMC.remove(READER_JPEG_PART_PATH);
+        SD_MMC.remove(temporaryPath);
         jpegSize = 0;
         if (code >= 0 && code != 408 && code != 429 && code < 500) break;
         if (attempt < 2) delay(350);
@@ -673,9 +1184,17 @@ uint16_t fetchReaderPageCount(const String &url) {
 }
 
 bool loadReaderPage() {
+    chapterCachePath(selectedSlug, selectedChapterId, readerPage,
+                     readerJpegPath, sizeof(readerJpegPath));
+    if (validCachedJpeg(readerJpegPath, &jpegSize)) {
+        imageReady = true;
+        Serial.printf("[CARTOON SD] Loaded cached image path=%s bytes=%u\n",
+                      readerJpegPath, static_cast<unsigned>(jpegSize));
+        return true;
+    }
     const String url = apiBase() + "/" + selectedSlug + "/chapter/" +
                        selectedChapterId + "/page/" + String(readerPage);
-    if (!downloadJpeg(url)) {
+    if (!downloadJpeg(url, readerJpegPath)) {
         copyText(statusText, sizeof(statusText), "IMAGE DOWNLOAD FAILED");
         return false;
     }
@@ -690,8 +1209,28 @@ bool openChapter(const ListItem &chapter) {
     // Release the retained chapter-list allocation before the manifest/JPEG
     // buffers compete for the constrained internal heap.
     chapterPayload = static_cast<const char *>(nullptr);
-    readerPageTotal = fetchReaderPageCount(
-        apiBase() + "/" + selectedSlug + "/chapter/" + selectedChapterId);
+    char safeSlug[64] = {};
+    char safeChapter[48] = {};
+    safePathComponent(selectedSlug, safeSlug, sizeof(safeSlug));
+    safePathComponent(selectedChapterId, safeChapter, sizeof(safeChapter));
+    char pageCountPath[176] = {};
+    snprintf(pageCountPath, sizeof(pageCountPath), "%s/%s/%s/page-count.txt",
+             CARTOON_SD_FOLDER, safeSlug, safeChapter);
+    File pageCountFile = SD_MMC.open(pageCountPath, FILE_READ);
+    if (pageCountFile) {
+        readerPageTotal = max<uint16_t>(1, pageCountFile.parseInt());
+        pageCountFile.close();
+    } else {
+        readerPageTotal = fetchReaderPageCount(
+            apiBase() + "/" + selectedSlug + "/chapter/" + selectedChapterId);
+        if (ensureCacheDirectory(selectedSlug, selectedChapterId)) {
+            pageCountFile = SD_MMC.open(pageCountPath, FILE_WRITE);
+            if (pageCountFile) {
+                pageCountFile.print(readerPageTotal);
+                pageCountFile.close();
+            }
+        }
+    }
     view = View::Reader;
     return loadReaderPage();
 }
@@ -714,28 +1253,31 @@ void renderPager(uint8_t *frame, uint16_t page, uint16_t pages) {
     UiLocalization::drawCentered(frame, 61, counter);
 }
 
-void renderList(uint8_t *frame, const ListItem *items, uint8_t count, uint16_t page, uint16_t pages) {
+void renderList(uint8_t *frame, const ListItem *items, uint8_t count,
+                uint16_t offset, uint16_t page, uint16_t pages) {
     renderPager(frame, page, pages);
     for (uint8_t index = 0; index < count; ++index) {
         const int top = LIST_TOP + index * (ROW_HEIGHT + ROW_GAP);
         rect(frame, 12, top, 216, ROW_HEIGHT);
         char number[8] = {};
-        snprintf(number, sizeof(number), "%u", (page - 1) * ROWS_PER_PAGE + index + 1);
+        snprintf(number, sizeof(number), "%u", offset + index + 1);
         UiLocalization::drawText(frame, 18, top + 9, number);
         drawTitle(frame, 34, top + 1, 171, ROW_HEIGHT - 2, items[index].title);
-        drawArrow(frame, 215, top + ROW_HEIGHT / 2, true);
+        if (items[index].saved) drawCheckmark(frame, 215, top + ROW_HEIGHT / 2);
+        else drawArrow(frame, 215, top + ROW_HEIGHT / 2, true);
     }
 }
 
 void renderReader(uint8_t *frame) {
     rect(frame, 8, 38, 50, 26);
-    UiLocalization::drawText(frame, 15, 47, "BACK");
+    if (UiLocalization::isChinese()) drawTitle(frame, 12, 39, 42, 24, "返回");
+    else UiLocalization::drawText(frame, 14, 47, "RETURN");
     drawTitle(frame, 66, 39, 164, 24, selectedChapterTitle);
     line(frame, 8, 72, 231, 72);
-    if (imageReady && jpegSize && SD_MMC.exists(READER_JPEG_PATH)) {
+    if (imageReady && jpegSize && SD_MMC.exists(readerJpegPath)) {
         uint16_t sourceWidth = 0, sourceHeight = 0;
         const JRESULT sizeResult = TJpgDec.getFsJpgSize(
-            &sourceWidth, &sourceHeight, READER_JPEG_PATH, SD_MMC);
+            &sourceWidth, &sourceHeight, readerJpegPath, SD_MMC);
         if (sizeResult == JDR_OK) {
             const uint8_t scale = sourceWidth > 240 || sourceHeight > 300 ? 2 : 1;
             const int imageWidth = sourceWidth / scale;
@@ -747,7 +1289,7 @@ void renderReader(uint8_t *frame) {
             TJpgDec.setJpgScale(scale);
             TJpgDec.setCallback(jpegOutput);
             const JRESULT drawResult = TJpgDec.drawFsJpg(
-                drawX, drawY, READER_JPEG_PATH, SD_MMC);
+                drawX, drawY, readerJpegPath, SD_MMC);
             decodeFrame = nullptr;
             Serial.printf("[CARTOON JPEG] Decode baseline size_result=%d draw_result=%d "
                           "source=%ux%u scale=%u file=%u\n",
@@ -756,7 +1298,7 @@ void renderReader(uint8_t *frame) {
         } else if (sizeResult == JDR_FMT3) {
             uint8_t previewScale = 1;
             const bool previewReady = drawProgressiveGrayscalePreview(
-                frame, READER_JPEG_PATH, sourceWidth, sourceHeight, previewScale);
+                frame, readerJpegPath, sourceWidth, sourceHeight, previewScale);
             Serial.printf("[CARTOON JPEG] Decode progressive_dc result=%s source=%ux%u "
                           "scale=%u file=%u\n",
                           previewReady ? "ok" : "failed", sourceWidth, sourceHeight,
@@ -793,24 +1335,87 @@ void setContentUrl(const char *url) {
 void open() {
     view = View::Cartoons;
     cartoonPage = 1;
+    cartoonOffset = 0;
+    cartoonHasMore = false;
     chapterPayload = "";
     imageReady = false;
     jpegSize = 0;
-    if (ensureCartoonDirectory()) {
-        SD_MMC.remove(READER_JPEG_PART_PATH);
-        SD_MMC.remove(READER_JPEG_PATH);
+    readerJpegPath[0] = '\0';
+    ensureCartoonDirectory();
+    cartoonCount = 0;
+    cartoonTotal = 0;
+    libraryLoadCompleted = false;
+    loadCartoons(0, false, true);
+}
+
+bool startLibraryLoad() {
+    if (libraryLoadRunning) return false;
+    libraryLoadRunning = true;
+    libraryLoadCompleted = false;
+    if (xTaskCreate(libraryLoadTask, "cartoon-library", 4096,
+                    nullptr, 1, nullptr) != pdPASS) {
+        libraryLoadRunning = false;
+        libraryLoadCompleted = true;
+        copyText(statusText, sizeof(statusText), "CARTOON TASK FAILED");
+        return false;
     }
-    loadCartoons();
+    return true;
+}
+
+bool takeLibraryLoadCompleted() {
+    if (!libraryLoadCompleted) return false;
+    libraryLoadCompleted = false;
+    return true;
+}
+
+bool controlBoundsAt(int16_t x, int16_t y, int16_t &left, int16_t &top,
+                     int16_t &width, int16_t &height) {
+    if (view == View::Reader) {
+        if (inRect(x, y, 0, 32, 70, 42)) {
+            left = 8; top = 38; width = 50; height = 26;
+            return true;
+        }
+        if (readerPage > 1 && inRect(x, y, 0, 374, 60, 42)) {
+            left = 8; top = 386; width = 34; height = 24;
+            return true;
+        }
+        if (readerPage < readerPageTotal && inRect(x, y, 180, 374, 60, 42)) {
+            left = 198; top = 386; width = 34; height = 24;
+            return true;
+        }
+        return false;
+    }
+
+    if (view == View::Chapters && inRect(x, y, 4, 34, 58, 18)) {
+        left = 8; top = 34; width = 50; height = 17;
+        return true;
+    }
+
+    const uint16_t offset = view == View::Cartoons ? cartoonOffset : chapterOffset;
+    const bool hasMore = view == View::Cartoons ? cartoonHasMore : chapterHasMore;
+    if (offset > 0 && inRect(x, y, 4, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT)) {
+        left = 4; top = PAGER_TOP; width = BUTTON_WIDTH; height = BUTTON_HEIGHT;
+        return true;
+    }
+    if (offset > 0 && inRect(x, y, 42, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT)) {
+        left = 42; top = PAGER_TOP; width = BUTTON_WIDTH; height = BUTTON_HEIGHT;
+        return true;
+    }
+    if (hasMore && inRect(x, y, 164, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT)) {
+        left = 164; top = PAGER_TOP; width = BUTTON_WIDTH; height = BUTTON_HEIGHT;
+        return true;
+    }
+    if (hasMore && inRect(x, y, 202, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT)) {
+        left = 202; top = PAGER_TOP; width = BUTTON_WIDTH; height = BUTTON_HEIGHT;
+        return true;
+    }
+    return false;
 }
 
 bool rowBoundsAt(int16_t x, int16_t y, int16_t &left, int16_t &top,
                  int16_t &width, int16_t &height) {
     if (view == View::Reader) return false;
-    const uint8_t visibleRows = view == View::Cartoons
-        ? min<uint16_t>(ROWS_PER_PAGE,
-                        cartoonCount > (cartoonPage - 1) * ROWS_PER_PAGE
-                            ? cartoonCount - (cartoonPage - 1) * ROWS_PER_PAGE : 0)
-        : chapterRowCount;
+    const uint8_t visibleRows = view == View::Cartoons ? cartoonCount : chapterRowCount;
     for (uint8_t index = 0; index < visibleRows; ++index) {
         const int rowTop = LIST_TOP + index * (ROW_HEIGHT + ROW_GAP);
         if (!inRect(x, y, 12, rowTop, 216, ROW_HEIGHT)) continue;
@@ -824,70 +1429,99 @@ bool rowBoundsAt(int16_t x, int16_t y, int16_t &left, int16_t &top,
 }
 
 bool handleTap(int16_t x, int16_t y) {
+    refreshMode = RefreshMode::Layout;
     if (view == View::Reader) {
         if (inRect(x, y, 0, 32, 70, 42)) {
             view = View::Chapters;
             imageReady = false;
             jpegSize = 0;
-            SD_MMC.remove(READER_JPEG_PART_PATH);
-            SD_MMC.remove(READER_JPEG_PATH);
-            if (!httpGetText(apiBase() + "/" + selectedSlug, chapterPayload, 30000)) {
+            readerJpegPath[0] = '\0';
+            chapterPayload = "";
+            if (!loadChapterPageFromApi(selectedSlug, chapterOffset) &&
+                !loadChapterRowsFromSd(selectedSlug)) {
                 copyText(statusText, sizeof(statusText), "CHAPTER LOAD FAILED");
             }
-            loadChapterRows();
+            for (ListItem &cartoon : cartoons) {
+                if (std::strcmp(cartoon.id, selectedSlug) == 0) {
+                    cartoon.saved = cartoonHasCache(cartoon.id);
+                    break;
+                }
+            }
             return true;
         }
         if (inRect(x, y, 0, 374, 60, 42) && readerPage > 1) {
             --readerPage;
             loadReaderPage();
+            refreshMode = RefreshMode::ImageContent;
             return true;
         }
         if (inRect(x, y, 180, 374, 60, 42) && readerPage < readerPageTotal) {
             ++readerPage;
             loadReaderPage();
+            refreshMode = RefreshMode::ImageContent;
             return true;
         }
         return false;
     }
 
-    if (view == View::Chapters && inRect(x, y, 4, 34, 34, 42)) {
+    if (view == View::Chapters && inRect(x, y, 4, 34, 58, 18)) {
+        for (ListItem &cartoon : cartoons) {
+            if (std::strcmp(cartoon.id, selectedSlug) == 0) {
+                cartoon.saved = cartoonHasCache(cartoon.id);
+                break;
+            }
+        }
         view = View::Cartoons;
         chapterPayload = "";
         return true;
     }
 
-    uint16_t &page = view == View::Cartoons ? cartoonPage : chapterPage;
-    const uint16_t pages = view == View::Cartoons ? pageCount(cartoonCount) : pageCount(chapterTotal);
-    if (inRect(x, y, 4, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT) && page > 1) {
-        page = 1;
-        if (view == View::Chapters) loadChapterRows();
-        return true;
+    const uint16_t offset = view == View::Cartoons ? cartoonOffset : chapterOffset;
+    const uint8_t rowCount = view == View::Cartoons ? cartoonCount : chapterRowCount;
+    const bool hasMore = view == View::Cartoons ? cartoonHasMore : chapterHasMore;
+    if (inRect(x, y, 4, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT) && offset > 0) {
+        const bool loaded = view == View::Cartoons
+            ? loadCartoons(0) : loadChapterPageFromApi(selectedSlug, 0);
+        if (loaded) refreshMode = RefreshMode::ListContent;
+        return loaded;
     }
-    if (inRect(x, y, 42, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT) && page > 1) {
-        --page;
-        if (view == View::Chapters) loadChapterRows();
-        return true;
+    if (inRect(x, y, 42, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT) && offset > 0) {
+        const int32_t previousOffset = max<int32_t>(0, offset - ROWS_PER_PAGE);
+        const bool loaded = view == View::Cartoons
+            ? loadCartoons(previousOffset)
+            : loadChapterPageFromApi(selectedSlug, previousOffset);
+        if (loaded) refreshMode = RefreshMode::ListContent;
+        return loaded;
     }
-    if (inRect(x, y, 164, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT) && page < pages) {
-        ++page;
-        if (view == View::Chapters) loadChapterRows();
-        return true;
+    if (inRect(x, y, 164, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT) && hasMore) {
+        const int32_t nextOffset = offset + rowCount;
+        const bool loaded = view == View::Cartoons
+            ? loadCartoons(nextOffset)
+            : loadChapterPageFromApi(selectedSlug, nextOffset);
+        if (loaded) refreshMode = RefreshMode::ListContent;
+        return loaded;
     }
-    if (inRect(x, y, 202, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT) && page < pages) {
-        page = pages;
-        if (view == View::Chapters) loadChapterRows();
-        return true;
+    if (inRect(x, y, 202, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT) && hasMore) {
+        const bool loaded = view == View::Cartoons
+            ? loadCartoons(-1) : loadChapterPageFromApi(selectedSlug, -1);
+        if (loaded) refreshMode = RefreshMode::ListContent;
+        return loaded;
     }
     for (uint8_t index = 0; index < ROWS_PER_PAGE; ++index) {
         const int top = LIST_TOP + index * (ROW_HEIGHT + ROW_GAP);
         if (!inRect(x, y, 12, top, 216, ROW_HEIGHT)) continue;
         if (view == View::Cartoons) {
-            const uint16_t item = (cartoonPage - 1) * ROWS_PER_PAGE + index;
-            return item < cartoonCount && loadChapters(cartoons[item]);
+            return index < cartoonCount && loadChapters(cartoons[index]);
         }
         return index < chapterRowCount && openChapter(chapterRows[index]);
     }
     return false;
+}
+
+RefreshMode takeRefreshMode() {
+    const RefreshMode mode = refreshMode;
+    refreshMode = RefreshMode::Layout;
+    return mode;
 }
 
 void render(uint8_t *frame) {
@@ -897,19 +1531,19 @@ void render(uint8_t *frame) {
         return;
     }
     if (view == View::Chapters) {
-        rect(frame, 8, 38, 28, 26);
-        drawArrow(frame, 22, 51, false);
-        drawTitle(frame, 82, 39, 148, 24, selectedComicTitle);
-        renderList(frame, chapterRows, chapterRowCount, chapterPage, pageCount(chapterTotal));
+        rect(frame, 8, 34, 50, 17);
+        if (UiLocalization::isChinese()) drawTitle(frame, 12, 34, 42, 17, "返回");
+        else UiLocalization::drawText(frame, 14, 39, "RETURN");
+        drawCenteredTitle(frame, 0, 34, XingtaiEpd::WIDTH, 18, selectedComicTitle);
+        renderList(frame, chapterRows, chapterRowCount, chapterOffset,
+                   chapterPage, pageCount(chapterTotal));
         if (!chapterRowCount) UiLocalization::drawCentered(frame, 200, statusText);
         return;
     }
     if (UiLocalization::isChinese()) drawTitle(frame, 91, 34, 58, 18, "漫画");
     else UiLocalization::drawCentered(frame, 36, "CARTOON", 2);
-    const uint16_t first = (cartoonPage - 1) * ROWS_PER_PAGE;
-    const uint8_t visible = first < cartoonCount
-        ? min<uint16_t>(ROWS_PER_PAGE, cartoonCount - first) : 0;
-    renderList(frame, cartoons + first, visible, cartoonPage, pageCount(cartoonCount));
+    renderList(frame, cartoons, cartoonCount, cartoonOffset,
+               cartoonPage, pageCount(cartoonTotal));
     if (!cartoonCount) UiLocalization::drawCentered(frame, 200, statusText);
 }
 

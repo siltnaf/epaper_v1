@@ -142,18 +142,34 @@ void FT6X36::processTouch()
 	uint8_t n = 0;
 	TRawEvent event = (TRawEvent)_touchEvent[n];
 	TPoint point{_touchX[n], _touchY[n]};
+	if (_touches == 0 && event != TRawEvent::LiftUp)
+	{
+		if (!_touchActive)
+			return;
+		event = TRawEvent::LiftUp;
+		point = _pointIdx > 0 ? _points[_pointIdx - 1] : _points[0];
+	}
 
 	if (event == TRawEvent::PressDown)
 	{
-		_points[0] = point;
-		_pointIdx = 1;
-		_dragMode = false;
-		_touchActive = true;
-		_touchStartTime = millis();
-		fireEvent(point, TEvent::TouchStart);
-		// Wait until LiftUp before classifying the interaction. Firing Tap here
-		// opens list rows before a finger sweep can be recognized as a swipe.
-		_tapFiredOnPress = false;
+		if (!_touchActive)
+		{
+			_points[0] = point;
+			_pointIdx = 1;
+			_dragMode = false;
+			_touchActive = true;
+			_touchStartTime = millis();
+			fireEvent(point, TEvent::TouchStart);
+			// Wait until LiftUp before classifying the interaction. Firing Tap here
+			// opens list rows before a finger sweep can be recognized as a swipe.
+			_tapFiredOnPress = false;
+		}
+		else
+		{
+			if (_pointIdx < 10)
+				_points[_pointIdx++] = point;
+			fireEvent(point, TEvent::TouchMove);
+		}
 	}
 	else if (event == TRawEvent::Contact)
 	{

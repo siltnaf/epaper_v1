@@ -955,7 +955,7 @@ bool startLibraryLoad() {
     if (libraryLoadRunning) return false;
     libraryLoadRunning = true;
     libraryLoadCompleted = false;
-    if (xTaskCreate(libraryLoadTask, "word-library", 12288, nullptr, 1, nullptr) != pdPASS) {
+    if (xTaskCreate(libraryLoadTask, "word-library", 4096, nullptr, 1, nullptr) != pdPASS) {
         libraryLoadRunning = false;
         libraryAwaitingContent = false;
         std::strcpy(statusText, "WORD TASK FAILED");

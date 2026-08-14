@@ -13,15 +13,16 @@
 
 namespace {
 
-// ESP-IDF expresses task stack sizes and high-water marks in bytes. A 16 KiB
-// task left no heap block large enough for the 17,776-byte mono decoder state.
-// The libopus CELT low-stack path removes its ~4 KiB normalized-MDCT VLA, making
-// this 8 KiB stack compatible with the contiguous-heap requirement.
-constexpr uint32_t PLAYBACK_TASK_STACK_BYTES = 8192;
+// Reserve Opus decoder/PCM memory before this task stack is created. The task
+// then only needs enough stack for demux/output work on the low-stack libopus path.
+constexpr uint32_t PLAYBACK_TASK_STACK_BYTES = 4096;
+StackType_t playbackTaskStack[PLAYBACK_TASK_STACK_BYTES] = {};
+StaticTask_t playbackTaskBuffer = {};
 
 class Es8311AudioOutput final : public AudioOutput {
 public:
     explicit Es8311AudioOutput(Es8311 *audio) : audio_(audio) {}
+    void setAudio(Es8311 *audio) { audio_ = audio; }
 
     bool begin() override {
         bufferedSamples_ = 0;
@@ -112,6 +113,8 @@ Es8311 *codec = nullptr;
 AudioFileSourceFS *source = nullptr;
 AudioGeneratorOpus *decoder = nullptr;
 Es8311AudioOutput *output = nullptr;
+AudioFileSourceFS playbackSource(SD_MMC);
+Es8311AudioOutput playbackOutput(nullptr);
 TaskHandle_t playbackTaskHandle = nullptr;
 volatile bool playbackActive = false;
 volatile bool stopRequested = false;
@@ -128,10 +131,8 @@ void releasePlayback() {
     }
     if (source) {
         source->close();
-        delete source;
         source = nullptr;
     }
-    delete output;
     output = nullptr;
 }
 
@@ -151,7 +152,7 @@ void playbackTask(void *) {
                   opus_decoder_get_size(1),
                   static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
 
-    decoder = new AudioGeneratorOpus();
+    if (!decoder) decoder = new AudioGeneratorOpus();
     const bool decoderReserved = decoder && decoder->reserveDecoder();
     Serial.printf("[OPUS] Decoder reserve=%s state=%d heap_free=%u largest=%u\n",
                   decoderReserved ? "yes" : "no", opus_decoder_get_size(1),
@@ -166,8 +167,10 @@ void playbackTask(void *) {
                   static_cast<unsigned>(ESP.getFreeHeap()),
                   static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
     if (buffersReserved) {
-        source = new AudioFileSourceFS(SD_MMC, requestedPath);
-        output = new Es8311AudioOutput(codec);
+        source = &playbackSource;
+        output = &playbackOutput;
+        output->setAudio(codec);
+        source->open(requestedPath);
     }
     bool started = buffersReserved && source && source->isOpen() && output;
     if (source && source->isOpen()) {
@@ -187,9 +190,6 @@ void playbackTask(void *) {
                       headerBytes, header[0], header[1], header[2], header[3],
                       oggSignature ? "yes" : "no", opusHead ? "yes" : "no",
                       rewound ? "yes" : "no", source->getPos());
-        Serial.print("[OPUS] Header hex=");
-        for (uint32_t i = 0; i < headerBytes; ++i) Serial.printf("%02X", header[i]);
-        Serial.println();
         started = started && oggSignature && opusHead && rewound;
     }
     if (started) {
@@ -272,26 +272,36 @@ bool play(const char *path) {
 
     std::strncpy(requestedPath, path, sizeof(requestedPath) - 1);
     requestedPath[sizeof(requestedPath) - 1] = '\0';
+    releasePlayback();
+    decoder = new AudioGeneratorOpus();
+    const bool reserved = decoder && decoder->reserveBuffers();
+    Serial.printf("[OPUS] Pre-task reserve=%s decoder_state=%d pcm=%u heap_free=%u largest=%u\n",
+                  reserved ? "yes" : "no", opus_decoder_get_size(1),
+                  2048U * sizeof(opus_int16),
+                  static_cast<unsigned>(ESP.getFreeHeap()),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+    if (!reserved) {
+        releasePlayback();
+        playbackActive = false;
+        return false;
+    }
     stopRequested = false;
     pauseRequested = false;
     playbackPaused = false;
     playbackActive = true;
     playbackStartedTick = xTaskGetTickCount();
 
-    const unsigned heapBeforeTask = static_cast<unsigned>(ESP.getFreeHeap());
-    const unsigned largestBeforeTask = static_cast<unsigned>(
-        heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-    if (xTaskCreatePinnedToCore(playbackTask, "opus-playback", PLAYBACK_TASK_STACK_BYTES,
-                                nullptr, 2,
-                                &playbackTaskHandle, 0) != pdPASS) {
+    playbackTaskHandle = xTaskCreateStaticPinnedToCore(
+        playbackTask, "opus-playback", PLAYBACK_TASK_STACK_BYTES, nullptr, 2,
+        playbackTaskStack, &playbackTaskBuffer, 0);
+    if (!playbackTaskHandle) {
         playbackActive = false;
-        playbackTaskHandle = nullptr;
-        Serial.printf("[OPUS] Could not create playback task stack=%u "
-                      "heap_before=%u largest_before=%u heap_after=%u largest_after=%u\n",
+        Serial.printf("[OPUS] Could not create static playback task stack=%u "
+                      "heap_free=%u largest=%u\n",
                       static_cast<unsigned>(PLAYBACK_TASK_STACK_BYTES),
-                      heapBeforeTask, largestBeforeTask,
                       static_cast<unsigned>(ESP.getFreeHeap()),
                       static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+        releasePlayback();
         return false;
     }
     return true;

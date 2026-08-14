@@ -65,6 +65,7 @@ TaskHandle_t recordingTaskHandle = nullptr;
 volatile bool recordingActive = false;
 volatile bool recordingPaused = false;
 volatile bool recordingStopRequested = false;
+volatile bool recordingCompleted = false;
 volatile uint32_t recordedDataBytes = 0;
 uint32_t recordingStartedMs = 0;
 uint32_t pauseStartedMs = 0;
@@ -213,6 +214,7 @@ const char *localizedStatus() {
     if (std::strcmp(statusText, "READY") == 0) return "就绪";
     if (std::strcmp(statusText, "RECORDING") == 0) return "录音中";
     if (std::strcmp(statusText, "PAUSED") == 0) return "已暂停";
+    if (std::strcmp(statusText, "SAVING") == 0) return "保存中";
     if (std::strcmp(statusText, "SAVED") == 0) return "已保存";
     if (std::strcmp(statusText, "RECORDING UNAVAILABLE") == 0) return "录音不可用";
     if (std::strcmp(statusText, "FILE OPEN FAILED") == 0) return "文件打开失败";
@@ -431,9 +433,13 @@ void recordingTask(void *) {
     int16_t i2sSamples[480] = {};
     int16_t monoSamples[240] = {};
     uint16_t recordingPeak = 0;
+    uint32_t emptyReads = 0;
     while (!recordingStopRequested) {
         const size_t count = codec ? codec->read(i2sSamples, 480, 100) : 0;
-        if (count == 0) continue;
+        if (count == 0) {
+            ++emptyReads;
+            continue;
+        }
         if (!recordingPaused && recordingFile) {
             const size_t frames = count / I2S_CHANNELS;
             for (size_t frame = 0; frame < frames; ++frame) {
@@ -457,14 +463,18 @@ void recordingTask(void *) {
     }
     recordingActive = false;
     recordingPaused = false;
-    Serial.printf("[RECORDING] Capture peak=%u\n", recordingPeak);
+    recordingStopRequested = false;
+    recordingCompleted = true;
+    Serial.printf("[RECORDING] Capture peak=%u empty_reads=%lu\n", recordingPeak,
+                  static_cast<unsigned long>(emptyReads));
     recordingTaskHandle = nullptr;
     vTaskDelete(nullptr);
 }
 
 bool startRecording() {
     stopPlayback();
-    if (recordingActive || !codec || !codec->isInitialized() || !ensureFolders(selectedTag)) {
+    if (recordingActive || recordingTaskHandle || !codec || !codec->isInitialized() ||
+        !ensureFolders(selectedTag)) {
         std::strcpy(statusText, "RECORDING UNAVAILABLE");
         return false;
     }
@@ -474,6 +484,7 @@ bool startRecording() {
     writeWavHeader(recordingFile, 0);
     recordedDataBytes = 0;
     recordingStopRequested = false;
+    recordingCompleted = false;
     recordingPaused = false;
     recordingStartedMs = millis();
     pauseStartedMs = 0;
@@ -481,7 +492,22 @@ bool startRecording() {
     recordingActive = true;
     lastRenderedSecond = UINT32_MAX;
     std::strcpy(statusText, "RECORDING");
-    codec->setSpeakerEnabled(false);
+    if (!codec->prepareRecording(30)) {
+        recordingActive = false;
+        recordingFile.close();
+        SD_MMC.remove(activePath);
+        std::strcpy(statusText, "RECORDING UNAVAILABLE");
+        Serial.println("[RECORDING] ES8311 ADC preparation failed");
+        return false;
+    }
+    uint8_t microphoneMode = 0;
+    uint8_t microphoneGain = 0;
+    uint8_t adcVolume = 0;
+    codec->readRegister(0x14, microphoneMode);
+    codec->readRegister(0x16, microphoneGain);
+    codec->readRegister(0x17, adcVolume);
+    Serial.printf("[RECORDING] ES8311 ADC reg14=0x%02X reg16=0x%02X reg17=0x%02X\n",
+                  microphoneMode, microphoneGain, adcVolume);
     if (xTaskCreatePinnedToCore(recordingTask, "wav-recording", 4096, nullptr, 2,
                                 &recordingTaskHandle, 0) != pdPASS) {
         recordingActive = false;
@@ -497,11 +523,9 @@ bool startRecording() {
 void stopRecording() {
     if (!recordingActive && !recordingTaskHandle) return;
     recordingStopRequested = true;
-    const uint32_t started = millis();
-    while (recordingTaskHandle && millis() - started < 2500) vTaskDelay(pdMS_TO_TICKS(10));
-    std::strcpy(statusText, recordingTaskHandle ? "STOP TIMEOUT" : "SAVED");
-    Serial.printf("[RECORDING] Stopped path=%s bytes=%lu\n",
-                  activePath, static_cast<unsigned long>(recordedDataBytes));
+    recordingPaused = false;
+    std::strcpy(statusText, "SAVING");
+    Serial.printf("[RECORDING] Stop requested path=%s\n", activePath);
 }
 
 void togglePause() {
@@ -932,6 +956,13 @@ bool takeExitRequest() {
 }
 
 bool process() {
+    if (recordingCompleted) {
+        recordingCompleted = false;
+        std::strcpy(statusText, "SAVED");
+        Serial.printf("[RECORDING] Saved path=%s bytes=%lu\n",
+                      activePath, static_cast<unsigned long>(recordedDataBytes));
+        return true;
+    }
     if (playbackPending) {
         playbackPending = false;
         if (!startPlayback()) activeFileIndex = -1;

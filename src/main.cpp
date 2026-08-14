@@ -71,6 +71,7 @@ static uint8_t frame[XingtaiEpd::FRAME_BYTES];
 static uint8_t transitionFrame[XingtaiEpd::FRAME_BYTES];
 static uint8_t mainPageFrame[XingtaiEpd::FRAME_BYTES];
 static uint8_t whiteFrame[XingtaiEpd::FRAME_BYTES] = {};
+static uint8_t calculatorRefreshFrame[XingtaiEpd::FRAME_BYTES];
 Preferences touchPreferences;
 Preferences settingsPreferences;
 Preferences wifiPreferences;
@@ -144,11 +145,16 @@ int16_t priorityControlLeft = 0;
 int16_t priorityControlTop = 0;
 int16_t priorityControlWidth = 0;
 int16_t priorityControlHeight = 0;
+volatile bool calculatorRefreshRunning = false;
+volatile bool calculatorRefreshPending = false;
+bool calculatorPressHandled = false;
+bool immediateControlPressHandled = false;
 
 void recoverSharedI2c();
 void setCalculatorI2cPriority(bool enabled);
 void refreshCurrentPage();
 void refreshCurrentRegion(uint16_t x, uint16_t y, uint16_t width, uint16_t height);
+void startCalculatorRefresh();
 void refreshBookReaderContent();
 void refreshBookLibraryContent();
 bool refreshPendingBookOpenPressed();
@@ -765,6 +771,131 @@ void refreshCurrentRegion(uint16_t x, uint16_t y, uint16_t width, uint16_t heigh
     epaper.sleep();
 }
 
+void calculatorRefreshTask(void *) {
+    constexpr uint16_t displayX = 8;
+    constexpr uint16_t displayY = 38;
+    constexpr uint16_t displayWidth = 224;
+    constexpr uint16_t displayHeight = 68;
+
+    epaper.displayPartial(frame, calculatorRefreshFrame, displayX, displayY,
+                          displayWidth, displayHeight);
+    copyFrameRegion(frame, calculatorRefreshFrame, displayX, displayY,
+                    displayWidth, displayHeight);
+    epaper.sleep();
+    calculatorRefreshRunning = false;
+    vTaskDelete(nullptr);
+}
+
+void startCalculatorRefresh() {
+    if (currentPage != PageId::Calculator || calculatorRefreshRunning ||
+        !calculatorRefreshPending) {
+        return;
+    }
+
+    calculatorRefreshPending = false;
+    CalculatorPage::render(calculatorRefreshFrame);
+    calculatorRefreshRunning = true;
+    if (xTaskCreate(calculatorRefreshTask, "calculator-epd", 4096,
+                    nullptr, 1, nullptr) != pdPASS) {
+        calculatorRefreshRunning = false;
+        calculatorRefreshPending = true;
+        Serial.printf("[CALCULATOR] Display worker start failed; free_heap=%u largest_block=%u\n",
+                      static_cast<unsigned>(ESP.getFreeHeap()),
+                      static_cast<unsigned>(ESP.getMaxAllocHeap()));
+    }
+}
+
+void refreshCartoonLayout() {
+    // Cartoon playlist, chapter list, and reader use different controls and
+    // borders. White-drive their complete shared layout area before drawing the
+    // destination view so no rows or image pixels remain underneath it. Keep
+    // the global top bar and the unused bottom edge untouched. Keep two guard
+    // rows below the 32 px bar because this panel's wide partial waveform can
+    // disturb pixels immediately adjacent to the configured window.
+    constexpr uint16_t contentX = 0;
+    constexpr uint16_t contentY = 34;
+    constexpr uint16_t contentWidth = XingtaiEpd::WIDTH;
+    constexpr uint16_t contentBottom = 410;
+    constexpr uint16_t contentHeight = contentBottom - contentY;
+
+    CartoonPage::render(transitionFrame);
+    copyFrameRegion(transitionFrame, frame, 0, 0,
+                    XingtaiEpd::WIDTH, contentY);
+    copyFrameRegion(transitionFrame, frame, 0, contentBottom,
+                    XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT - contentBottom);
+
+    epaper.displayPartial(frame, whiteFrame, contentX, contentY,
+                          contentWidth, contentHeight);
+    clearFrameRegion(frame, contentX, contentY, contentWidth, contentHeight);
+    epaper.sleep();
+    epaper.displayPartial(frame, transitionFrame, contentX, contentY,
+                          contentWidth, contentHeight);
+    copyFrameRegion(frame, transitionFrame, contentX, contentY,
+                    contentWidth, contentHeight);
+    epaper.sleep();
+}
+
+void refreshCartoonListContent(int controlLeft, int controlTop,
+                               int controlWidth, int controlHeight) {
+    constexpr uint16_t contentX = 12;
+    constexpr uint16_t contentY = 82;
+    constexpr uint16_t contentWidth = 216;
+    constexpr uint16_t contentHeight = 320;
+    constexpr uint16_t counterX = 78;
+    constexpr uint16_t counterY = 54;
+    constexpr uint16_t counterWidth = 84;
+    constexpr uint16_t counterHeight = 20;
+
+    CartoonPage::render(transitionFrame);
+    epaper.displayPartial(frame, whiteFrame, contentX, contentY,
+                          contentWidth, contentHeight);
+    clearFrameRegion(frame, contentX, contentY, contentWidth, contentHeight);
+    epaper.sleep();
+    epaper.displayPartial(frame, transitionFrame, contentX, contentY,
+                          contentWidth, contentHeight);
+    epaper.displayPartial(frame, transitionFrame, counterX, counterY,
+                          counterWidth, counterHeight);
+    if (controlWidth > 0 && controlHeight > 0) {
+        epaper.displayPartial(frame, transitionFrame, controlLeft, controlTop,
+                              controlWidth, controlHeight);
+    }
+    copyFrameRegion(frame, transitionFrame, contentX, contentY,
+                    contentWidth, contentHeight);
+    copyFrameRegion(frame, transitionFrame, counterX, counterY,
+                    counterWidth, counterHeight);
+    if (controlWidth > 0 && controlHeight > 0) {
+        copyFrameRegion(frame, transitionFrame, controlLeft, controlTop,
+                        controlWidth, controlHeight);
+    }
+    epaper.sleep();
+}
+
+void refreshCartoonImageContent() {
+    constexpr uint16_t contentX = 0;
+    constexpr uint16_t contentY = 76;
+    constexpr uint16_t contentWidth = XingtaiEpd::WIDTH;
+    constexpr uint16_t contentHeight = 300;
+    constexpr uint16_t counterX = 50;
+    constexpr uint16_t counterY = 390;
+    constexpr uint16_t counterWidth = 140;
+    constexpr uint16_t counterHeight = 18;
+
+    CartoonPage::render(transitionFrame);
+    epaper.displayPartial(frame, whiteFrame, contentX, contentY,
+                          contentWidth, contentHeight);
+    clearFrameRegion(frame, contentX, contentY, contentWidth, contentHeight);
+    epaper.sleep();
+    epaper.displayPartial(frame, transitionFrame, contentX, contentY,
+                          contentWidth, contentHeight);
+    epaper.displayPartial(frame, transitionFrame, counterX, counterY,
+                          counterWidth, counterHeight);
+    copyFrameRegion(frame, transitionFrame, contentX, contentY,
+                    contentWidth, contentHeight);
+    copyFrameRegion(frame, transitionFrame, counterX, counterY,
+                    counterWidth, counterHeight);
+    epaper.sleep();
+}
+
 void refreshBookReaderContent() {
     constexpr uint16_t contentX = 10;
     constexpr uint16_t contentY = 82;
@@ -916,13 +1047,17 @@ void startOpeningLibraryLoad(PageId page) {
     case PageId::Music: started = MusicPage::startLibraryLoad(); break;
     case PageId::Poem: started = PoemPage::startLibraryLoad(); break;
     case PageId::Word: started = WordPage::startLibraryLoad(); break;
+    case PageId::Cartoon: started = CartoonPage::startLibraryLoad(); break;
     default: return;
     }
     openingLoadPage = page;
     openingLoadVisible = true;
     UiLoadingIndicator::show();
-    if (!started) Serial.printf("[UI] %s opening worker was already active or failed to start\n",
-                                pageName(page));
+    if (!started) {
+        Serial.printf("[UI] %s opening worker was not started; free_heap=%u largest_block=%u\n",
+                      pageName(page), static_cast<unsigned>(ESP.getFreeHeap()),
+                      static_cast<unsigned>(ESP.getMaxAllocHeap()));
+    }
 }
 
 void processOpeningLibraryLoads() {
@@ -936,6 +1071,7 @@ void processOpeningLibraryLoads() {
         {PageId::Music, MusicPage::takeLibraryLoadCompleted()},
         {PageId::Poem, PoemPage::takeLibraryLoadCompleted()},
         {PageId::Word, WordPage::takeLibraryLoadCompleted()},
+        {PageId::Cartoon, CartoonPage::takeLibraryLoadCompleted()},
     };
     for (const Completion &completion : completions) {
         if (!completion.complete) continue;
@@ -1598,6 +1734,73 @@ bool isHomeIcon(int16_t x, int16_t y) {
                        homeTargetWidth, homeTargetHeight);
 }
 
+bool isImmediateTouchControl(int16_t x, int16_t y) {
+    const auto inRect = [](int16_t px, int16_t py, int left, int top,
+                           int width, int height) {
+        return px >= left && px < left + width && py >= top && py < top + height;
+    };
+    const auto pagerControl = [&](int top = 52) {
+        if (y < top || y >= top + 25) return false;
+        return inRect(x, y, 4, top, 34, 25) || inRect(x, y, 42, top, 34, 25) ||
+               inRect(x, y, 164, top, 34, 25) || inRect(x, y, 202, top, 34, 25);
+    };
+
+    if (currentPage == PageId::Settings) {
+        const SettingsPage::Action action = SettingsPage::actionAt(x, y);
+        return action != SettingsPage::Action::None &&
+               action != SettingsPage::Action::SelectWifiNetwork &&
+               action != SettingsPage::Action::SelectVoice;
+    }
+    if (currentPage == PageId::Calendar) {
+        return CalendarPage::actionAt(x, y) != CalendarPage::Action::None;
+    }
+    if (currentPage == PageId::Book) {
+        if (!BookPage::isReader()) return pagerControl();
+        return inRect(x, y, 0, 32, 70, 40) ||
+               inRect(x, y, 0, 374, 60, 42) ||
+               inRect(x, y, 180, 374, 60, 42);
+    }
+    if (currentPage == PageId::Voice || currentPage == PageId::Music) {
+        return pagerControl();
+    }
+    if (currentPage == PageId::Poem) {
+        if (!PoemPage::isPopupOpen()) return pagerControl();
+        return inRect(x, y, 14, 370, 44, 26) ||
+               inRect(x, y, 62, 370, 40, 26) ||
+               inRect(x, y, 130, 370, 48, 26) ||
+               inRect(x, y, 182, 370, 44, 26);
+    }
+    if (currentPage == PageId::Word) {
+        if (!WordPage::isDetail()) return pagerControl();
+        return inRect(x, y, 6, 36, 64, 36) ||
+               inRect(x, y, 22, 75, 100, 100) ||
+               inRect(x, y, 170, 358, 56, 38);
+    }
+    if (currentPage == PageId::Recording) {
+        int16_t left = 0;
+        int16_t top = 0;
+        int16_t width = 0;
+        int16_t height = 0;
+        return RecordingPage::returnControlAt(x, y) ||
+               RecordingPage::headerControlAt(x, y) ||
+               RecordingPage::folderControlAt(x, y) ||
+               RecordingPage::pauseControlAt(x, y) ||
+               RecordingPage::tagItemBoundsAt(x, y, left, top, width, height) ||
+               RecordingPage::pagerControlBoundsAt(x, y, left, top, width, height) ||
+               inRect(x, y, 80, 320, 80, 81) ||
+               inRect(x, y, 204, 108, 28, 8 * 32 - 2);
+    }
+    if (currentPage == PageId::Cartoon) {
+        int16_t left = 0;
+        int16_t top = 0;
+        int16_t width = 0;
+        int16_t height = 0;
+        return CartoonPage::controlBoundsAt(x, y, left, top, width, height);
+    }
+    if (currentPage == PageId::Radio) return pagerControl();
+    return false;
+}
+
 PageId mainPageAt(int16_t x, int16_t y) {
     constexpr int16_t iconSize = 48;
     constexpr int16_t hitPadding = 10;
@@ -1657,12 +1860,14 @@ void handleTouch(TPoint point, TEvent event) {
         // suppression is necessarily stale and must not consume this gesture.
         if (suppressMainIconReleaseTap) suppressMainIconReleaseTap = false;
         if (suppressNextAudioTap) suppressNextAudioTap = false;
+        if (currentPage == PageId::Calculator) calculatorPressHandled = false;
+        immediateControlPressHandled = false;
         priorityControlFeedbackShown = false;
         if (currentPage != PageId::Main && isHomeIcon(uiX, uiY)) {
             touchGestureActive = false;
             homeTouchActive = true;
             suppressMainIconReleaseTap = true;
-            showHomePressedOutline();
+            if (!calculatorRefreshRunning) showHomePressedOutline();
             // Keep the current page active for the lifetime of this physical
             // touch. Switching pages here lets later Contact/LiftUp samples be
             // routed against Main and can reopen the page that was just left.
@@ -1675,6 +1880,28 @@ void handleTouch(TPoint point, TEvent event) {
                 startMainIconFeedback(page);
                 return;
             }
+        }
+        // Calculator input is committed on the hardware press event. The later
+        // Tap event is only a release notification and must not repeat the key.
+        if (currentPage == PageId::Calculator &&
+            CalculatorPage::handleTouchStart(uiX, uiY)) {
+            calculatorPressHandled = true;
+            calculatorRefreshPending = true;
+            touchGestureActive = true;
+            touchGestureStartX = touchGestureLastX = uiX;
+            touchGestureStartY = touchGestureLastY = uiY;
+            Serial.printf("[CALCULATOR] Key accepted on press ui=(%d,%d)\n", uiX, uiY);
+            return;
+        }
+        if (isImmediateTouchControl(uiX, uiY)) {
+            immediateControlPressHandled = true;
+            touchGestureActive = false;
+            dispatchingSyntheticTap = true;
+            handleTouch(point, TEvent::Tap);
+            dispatchingSyntheticTap = false;
+            Serial.printf("[TOUCH] Control accepted on press page=%s ui=(%d,%d)\n",
+                          pageName(currentPage), uiX, uiY);
+            return;
         }
         priorityControlFeedbackShown = showPriorityControlPressed(uiX, uiY);
         touchGestureActive = true;
@@ -1765,7 +1992,8 @@ void handleTouch(TPoint point, TEvent event) {
                         refreshCurrentPage();
                     }
                 }
-            } else if (!homeTouchActive) {
+            } else if (!homeTouchActive && !calculatorPressHandled &&
+                       !immediateControlPressHandled) {
                 // E-paper feedback can outlast the FT6336 Tap timing window.
                 // Dispatch a stationary release now; consume the driver's
                 // follow-up Tap if that event is emitted as well.
@@ -1775,11 +2003,20 @@ void handleTouch(TPoint point, TEvent event) {
                 dispatchingSyntheticTap = false;
             }
         }
+        calculatorPressHandled = false;
         touchWorkflowPriority = false;
         return;
     }
     if (event != TEvent::Tap) return;
     touchWorkflowPriority = false;
+    if (immediateControlPressHandled && !dispatchingSyntheticTap) {
+        immediateControlPressHandled = false;
+        return;
+    }
+    if (currentPage == PageId::Calculator && calculatorPressHandled) {
+        calculatorPressHandled = false;
+        return;
+    }
     if (suppressDriverTap && !dispatchingSyntheticTap) {
         suppressDriverTap = false;
         return;
@@ -2071,9 +2308,8 @@ void handleTouch(TPoint point, TEvent event) {
     }
 
     if (currentPage == PageId::Calculator) {
-        if (CalculatorPage::handleTap(uiX, uiY)) {
-            refreshCurrentRegion(8, 38, 224, 68);
-        }
+        // Calculator keys are accepted on TouchStart. A release-generated Tap
+        // reaches here only for touches outside the keypad.
         return;
     }
 
@@ -2240,17 +2476,37 @@ void handleTouch(TPoint point, TEvent event) {
     }
 
     if (currentPage == PageId::Cartoon) {
+        int16_t controlLeft = 0;
+        int16_t controlTop = 0;
+        int16_t controlWidth = 0;
+        int16_t controlHeight = 0;
         int16_t rowLeft = 0;
         int16_t rowTop = 0;
         int16_t rowWidth = 0;
         int16_t rowHeight = 0;
+        const bool controlPressed = CartoonPage::controlBoundsAt(
+            uiX, uiY, controlLeft, controlTop, controlWidth, controlHeight);
         const bool rowPressed = CartoonPage::rowBoundsAt(
             uiX, uiY, rowLeft, rowTop, rowWidth, rowHeight);
-        if (rowPressed) {
+        if (controlPressed) {
+            showPressedInversion(controlLeft, controlTop, controlWidth, controlHeight);
+        } else if (rowPressed) {
             showPressedInversion(rowLeft, rowTop, rowWidth, rowHeight);
         }
         const bool changed = CartoonPage::handleTap(uiX, uiY);
-        if (changed || rowPressed) refreshCurrentPage();
+        if (changed || rowPressed) {
+            const CartoonPage::RefreshMode refreshMode = CartoonPage::takeRefreshMode();
+            if (changed && refreshMode == CartoonPage::RefreshMode::ListContent) {
+                refreshCartoonListContent(controlLeft, controlTop,
+                                          controlWidth, controlHeight);
+            } else if (changed && refreshMode == CartoonPage::RefreshMode::ImageContent) {
+                refreshCartoonImageContent();
+            } else if (changed && refreshMode == CartoonPage::RefreshMode::Layout) {
+                refreshCartoonLayout();
+            } else {
+                refreshCurrentPage();
+            }
+        }
         return;
     }
 
@@ -2396,6 +2652,7 @@ bool beginTouch() {
 
 void processTouchAction() {
     if (!touchAction.pending) return;
+    if (calculatorRefreshRunning) return;
 
     const PageId nextPage = touchAction.page;
     touchAction.pending = false;
@@ -2428,6 +2685,10 @@ void processTouchAction() {
         RadioPage::stop();
     }
     if ((currentPage == PageId::Calculator) != (nextPage == PageId::Calculator)) {
+        if (currentPage == PageId::Calculator) {
+            calculatorRefreshPending = false;
+            calculatorPressHandled = false;
+        }
         setCalculatorI2cPriority(nextPage == PageId::Calculator);
     }
 
@@ -2491,7 +2752,7 @@ void processTouchAction() {
     currentPage = nextPage;
     if (nextPage == PageId::Book || nextPage == PageId::Voice ||
         nextPage == PageId::Music || nextPage == PageId::Poem ||
-        nextPage == PageId::Word) {
+        nextPage == PageId::Word || nextPage == PageId::Cartoon) {
         startOpeningLibraryLoad(nextPage);
     }
     Serial.printf("[UI] %s page ready\n", pageName(currentPage));
@@ -2622,6 +2883,11 @@ void loop() {
     serviceTouchInterruptBeforeI2c();
     touch.loop();
     processTouchAction();
+    startCalculatorRefresh();
+    if (calculatorRefreshRunning) {
+        delay(1);
+        return;
+    }
     processOpeningLibraryLoads();
 
     // A touch interrupt promotes input handling above every nonessential

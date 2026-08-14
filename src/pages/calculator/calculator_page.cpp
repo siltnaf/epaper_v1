@@ -270,7 +270,7 @@ void render(uint8_t *frame) {
     }
 }
 
-bool handleTap(int16_t x, int16_t y) {
+bool handleTouchStart(int16_t x, int16_t y) {
     for (size_t index = 0; index < sizeof(BUTTONS) / sizeof(BUTTONS[0]); ++index) {
         const Button &button = BUTTONS[index];
         if (!inRect(x, y, button)) continue;

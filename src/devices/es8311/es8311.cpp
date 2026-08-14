@@ -175,7 +175,7 @@ bool Es8311::configureCodec() {
         {REG_SYSTEM_13, 0x10},      // enable output to HP/line driver
         {REG_SYSTEM_14, 0x1A},      // analog MIC, max PGA gain
         {REG_ADC_15, 0x40},
-        {REG_ADC_16, 0x1F},
+        {REG_ADC_16, 0x24},         // Espressif ES8311 analog ADC default
         {REG_ADC_17, 0xBF},         // ADC volume
         {REG_ADC_18, 0x03},
         {REG_ADC_19, 0x00},
@@ -200,9 +200,27 @@ bool Es8311::setOutputVolume(uint8_t percent) {
 }
 
 bool Es8311::setMicrophoneGain(uint8_t gainDb) {
-    // PGA supports 0..42 dB in 6 dB steps in the low nibble.
+    // Espressif's ES8311 driver programs PGA gain directly through ADC reg 0x16.
+    // SYSTEM reg 0x14 selects analog/digital MIC and must remain 0x1A.
     const uint8_t step = std::min<uint8_t>(gainDb / 6, 7);
-    return updateRegister(REG_SYSTEM_14, 0x0F, step);
+    return writeRegister(REG_ADC_16, step);
+}
+
+bool Es8311::prepareRecording(uint8_t gainDb) {
+    if (!_initialized) return false;
+    setSpeakerEnabled(false);
+    const RegisterValue sequence[] = {
+        {REG_SDP_OUT, 0x0C},        // standard I2S, 16-bit ADC output
+        {REG_SYSTEM_0E, 0x02},      // enable analog PGA and ADC modulator
+        {REG_SYSTEM_14, 0x1A},      // analog microphone input
+        {REG_SYSTEM_0D, 0x01},      // power up analog circuitry
+        {REG_ADC_15, 0x40},         // enable ADC path
+        {REG_ADC_17, 0xBF},         // ADC digital volume
+        {REG_ADC_1B, 0x0A},         // ADC high-pass filter stage 1
+        {REG_ADC_1C, 0x6A},         // ADC high-pass filter stage 2
+    };
+    return writeSequence(sequence, sizeof(sequence) / sizeof(sequence[0])) &&
+           setMicrophoneGain(gainDb);
 }
 
 void Es8311::setSpeakerEnabled(bool enabled) {
