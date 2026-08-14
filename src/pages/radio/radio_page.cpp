@@ -26,10 +26,7 @@ namespace {
 constexpr uint8_t ITEMS_PER_PAGE = 10;
 constexpr uint8_t MAX_STATIONS = 20;
 constexpr uint16_t STREAM_BUFFER_BYTES = 2048;
-constexpr size_t MP3_DECODER_WORKSPACE_BYTES = AudioGeneratorMP3::preAllocSize();
-// libmad and the HTTP client have deep call chains. A 4 KiB worker stack can
-// overflow into adjacent heap allocations as soon as MP3 decoding begins.
-constexpr uint16_t PLAYBACK_TASK_STACK_BYTES = 12288;
+constexpr uint16_t PLAYBACK_TASK_STACK_BYTES = 4096;
 constexpr int LIST_TOP = 82;
 constexpr int ROW_HEIGHT = 30;
 constexpr int ROW_GAP = 2;
@@ -123,15 +120,11 @@ char statusText[64] = {};
 Es8311 *codec = nullptr;
 
 TaskHandle_t playbackTaskHandle = nullptr;
-StaticTask_t playbackTaskBuffer = {};
-StackType_t playbackTaskStack[PLAYBACK_TASK_STACK_BYTES / sizeof(StackType_t)] = {};
 volatile bool stopRequested = false;
 volatile bool playbackActive = false;
 volatile bool playbackEnded = false;
 char requestedUrl[384] = {};
-// Keep the fixed libmad workspace out of the fragmented runtime heap. It is
-// shared only by the radio playback task and is released logically on cleanup.
-alignas(8) uint8_t decoderWorkspace[MP3_DECODER_WORKSPACE_BYTES] = {};
+void *decoderWorkspace = nullptr;
 
 void pixel(uint8_t *frame, int x, int y) {
     if (!frame || x < 0 || x >= XingtaiEpd::WIDTH || y < 0 || y >= XingtaiEpd::HEIGHT) return;
@@ -273,65 +266,23 @@ bool loadStations() {
     if (!http.begin(client, url)) return false;
     http.addHeader("Connection", "close");
     const int code = http.GET();
-    const int contentLength = http.getSize();
-    Serial.printf("[RADIO API] GET code=%d content_length=%d heap=%u largest=%u url=%s\n",
-                  code, contentLength, static_cast<unsigned>(ESP.getFreeHeap()),
-                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
-                  url.c_str());
-    if (code < 200 || code >= 300) {
-        http.end();
-        return false;
-    }
-
-    // Parse directly from the socket. HTTPClient::getString() needs a contiguous
-    // allocation for the complete ~10 KiB response, which is unreliable once
-    // Wi-Fi has fragmented the runtime heap. Filtering also discards fields the
-    // radio UI never uses before ArduinoJson stores them.
-    JsonDocument filter;
-    filter["city"] = true;
-    const char *arrayKeys[] = {"radio", "stations", "items"};
-    for (const char *key : arrayKeys) {
-        filter[key][0]["name"] = true;
-        filter[key][0]["codec"] = true;
-        filter[key][0]["esp32_url"] = true;
-        filter[key][0]["stream_url"] = true;
-        filter[key][0]["url"] = true;
-    }
-    JsonDocument document;
-    const DeserializationError error = deserializeJson(
-        document, *http.getStreamPtr(), DeserializationOption::Filter(filter));
+    const String payload = code >= 200 && code < 300 ? http.getString() : String();
     http.end();
-    if (error) {
-        snprintf(statusText, sizeof(statusText), "JSON %s", error.c_str());
-        Serial.printf("[RADIO API] Stream JSON parse failed: %s heap=%u largest=%u\n",
-                      error.c_str(), static_cast<unsigned>(ESP.getFreeHeap()),
-                      static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+    Serial.printf("[RADIO API] GET code=%d bytes=%u url=%s\n", code, payload.length(), url.c_str());
+    if (code < 200 || code >= 300) return false;
+    JsonDocument document;
+    if (deserializeJson(document, payload)) {
+        copyText(statusText, sizeof(statusText), "RADIO JSON FAILED");
         return false;
     }
     copyText(locatedCity, sizeof(locatedCity), document["city"] | "");
     stationCount = 0;
-    JsonArray items = document["radio"].as<JsonArray>();
-    if (items.isNull()) items = document["stations"].as<JsonArray>();
-    if (items.isNull()) items = document["items"].as<JsonArray>();
-    if (items.isNull()) {
-        copyText(statusText, sizeof(statusText), "NO RADIO ARRAY");
-        Serial.println("[RADIO API] Parsed JSON has no radio, stations, or items array");
-        return false;
-    }
-    for (JsonObject item : items) {
+    for (JsonObject item : document["radio"].as<JsonArray>()) {
         if (stationCount >= MAX_STATIONS) break;
         Station &station = stations[stationCount];
         copyText(station.name, sizeof(station.name), item["name"] | "", "UNTITLED");
         copyText(station.codec, sizeof(station.codec), item["codec"] | "MP3");
         copyText(station.streamPath, sizeof(station.streamPath), item["esp32_url"] | "");
-        if (!station.streamPath[0]) {
-            copyText(station.streamPath, sizeof(station.streamPath), item["stream_url"] | "");
-        }
-        if (!station.streamPath[0]) {
-            copyText(station.streamPath, sizeof(station.streamPath), item["url"] | "");
-        }
-        Serial.printf("[RADIO API] item=%u name=%s codec=%s stream=%s\n",
-                      stationCount, station.name, station.codec, station.streamPath);
         if (station.streamPath[0]) ++stationCount;
     }
     if (!stationCount) copyText(statusText, sizeof(statusText), "NO RADIO STATIONS");
@@ -372,8 +323,6 @@ void playbackTask(void *) {
         decoderReady = bufferReady && decoder->begin(buffer, output);
         started = decoderReady;
         logMemory(decoderReady ? "MP3 decoder started" : "MP3 decoder begin failed");
-        Serial.printf("[RADIO] Heap integrity after decoder begin=%s\n",
-                      heap_caps_check_integrity_all(false) ? "ok" : "corrupt");
     }
     Serial.printf("[RADIO] Stream %s objects=%s http=%s buffer=%s decoder=%s url=%s\n",
                   started ? "started" : "failed", objectsReady ? "ok" : "failed",
@@ -391,10 +340,9 @@ void playbackTask(void *) {
     delete buffer;
     delete source;
     delete output;
+    free(decoderWorkspace);
+    decoderWorkspace = nullptr;
     digitalWrite(BoardPins::PA_EN, LOW);
-    logMemory("after cleanup");
-    Serial.printf("[RADIO] Heap integrity after cleanup=%s\n",
-                  heap_caps_check_integrity_all(false) ? "ok" : "corrupt");
     playbackActive = false;
     playbackEnded = !stopRequested;
     playbackTaskHandle = nullptr;
@@ -407,21 +355,24 @@ bool startStream(uint8_t index) {
     OpusPlayer::stop();
     const String url = absoluteStreamUrl(stations[index].streamPath);
     copyText(requestedUrl, sizeof(requestedUrl), url.c_str());
-    Serial.printf("[RADIO] Decoder workspace bytes=%u allocation=static heap=%u largest=%u\n",
-                  static_cast<unsigned>(MP3_DECODER_WORKSPACE_BYTES),
+    constexpr size_t decoderBytes = AudioGeneratorMP3::preAllocSize();
+    decoderWorkspace = heap_caps_malloc(decoderBytes, MALLOC_CAP_8BIT);
+    Serial.printf("[RADIO] Decoder workspace bytes=%u allocation=%s heap=%u largest=%u\n",
+                  static_cast<unsigned>(decoderBytes), decoderWorkspace ? "ok" : "failed",
                   static_cast<unsigned>(ESP.getFreeHeap()),
                   static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+    if (!decoderWorkspace) return false;
     stopRequested = false;
     playbackEnded = false;
     playbackActive = true;
-    playbackTaskHandle = xTaskCreateStaticPinnedToCore(
-        playbackTask, "radio-playback", PLAYBACK_TASK_STACK_BYTES, nullptr, 2,
-        playbackTaskStack, &playbackTaskBuffer, 0);
-    if (!playbackTaskHandle) {
+    if (xTaskCreatePinnedToCore(playbackTask, "radio-playback", PLAYBACK_TASK_STACK_BYTES, nullptr, 2,
+                                &playbackTaskHandle, 0) != pdPASS) {
         Serial.printf("[RADIO] Playback task creation failed stack=%u heap=%u largest=%u\n",
                       static_cast<unsigned>(PLAYBACK_TASK_STACK_BYTES),
                       static_cast<unsigned>(ESP.getFreeHeap()),
                       static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+        free(decoderWorkspace);
+        decoderWorkspace = nullptr;
         playbackActive = false;
         playbackTaskHandle = nullptr;
         return false;
