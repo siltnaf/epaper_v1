@@ -8,15 +8,18 @@
 
 #include "board_pins.h"
 #include "devices/es8311/es8311.h"
+#include "memory_budget.h"
 
 #include <cstring>
 
 namespace {
 
-// Reserve Opus decoder/PCM memory before this task stack is created. The task
-// then only needs enough stack for demux/output work on the low-stack libopus path.
-constexpr uint32_t PLAYBACK_TASK_STACK_BYTES = 4096;
-StackType_t playbackTaskStack[PLAYBACK_TASK_STACK_BYTES] = {};
+// ESP-IDF task stack depths are bytes. CELT synthesis uses sizeable variable
+// arrays, so retain measured headroom beyond the 4 KiB stack that overflowed.
+constexpr uint32_t PLAYBACK_TASK_STACK_BYTES = 12 * 1024;
+static_assert(PLAYBACK_TASK_STACK_BYTES % sizeof(StackType_t) == 0,
+              "Task stack must contain complete StackType_t entries");
+StackType_t playbackTaskStack[PLAYBACK_TASK_STACK_BYTES / sizeof(StackType_t)] = {};
 StaticTask_t playbackTaskBuffer = {};
 
 class Es8311AudioOutput final : public AudioOutput {
@@ -267,6 +270,16 @@ bool play(const char *path) {
         Serial.printf("[OPUS] Cannot play path=%s codec=%s\n",
                       path ? path : "(null)",
                       codec && codec->isInitialized() ? "ready" : "not-ready");
+        return false;
+    }
+
+    // The decoder workspace is static, but the PCM buffer, SD object, and task
+    // bookkeeping still need a contiguous internal-RAM margin.
+    // The task stack and decoder state are static. Dynamic use is the 4 KiB PCM
+    // buffer plus the small decoder/file/output objects.
+    constexpr size_t PLAYBACK_DYNAMIC_BYTES = 6 * 1024;
+    if (!MemoryBudget::canAllocate(PLAYBACK_DYNAMIC_BYTES)) {
+        MemoryBudget::log("opus-skip");
         return false;
     }
 

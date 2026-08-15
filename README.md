@@ -26,12 +26,10 @@ Wi-Fi network every 15 seconds and probes ML307 registration/PDP state with
 soon as either Wi-Fi or a real 4G PDP context is connected, and resumes if that
 active connection drops. The ML307 probe runs in a low-priority task so touch
 and e-paper UI processing are not blocked by AT-command timeouts.
-At present, `epaper_v1` has a complete Wi-Fi TCP/IP client and ML307R
-power/registration/PDP-state management, but application HTTP requests are not
-yet routed through the modem's AT HTTP commands. Font and Book HTTP downloads
-therefore still use Wi-Fi sockets. True 4G downloading requires adding that
-AT-based HTTP transport rather than treating PDP readiness alone as an ESP32
-socket interface.
+Application text requests and SD asset downloads use Wi-Fi sockets when Wi-Fi is
+connected and the ML307 `MHTTP` AT commands when 4G is active. Live radio remains
+a Wi-Fi-only feature because its decoder consumes a continuous TCP stream rather
+than a finite HTTP response.
 
 # ESP32-S3 3.7-inch e-paper bring-up
 

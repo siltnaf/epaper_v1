@@ -16,6 +16,6 @@ namespace Topbar {
 void drawHome(uint8_t*f,int x,int y){bitmap(f,x,y,TopbarBitmap::HOME);}
 void drawWifi(uint8_t*f,int x,int y){bitmap(f,x,y,TopbarBitmap::WIFI);}
 void drawBle(uint8_t*f,int x,int y){line(f,x+8,y,1);line(f,x+8,y+15,1);line(f,x+4,y+4,8);line(f,x+4,y+12,8);line(f,x+4,y+4,1);line(f,x+4,y+12,1);line(f,x+8,y+7,1);}
-void draw4G(uint8_t*f,int x,int y){line(f,x+1,y+3,3);line(f,x+1,y+3,1);line(f,x+1,y+3,1);line(f,x+1,y+8,3);line(f,x+4,y+3,1);line(f,x+4,y+8,1);line(f,x+7,y+3,1);line(f,x+7,y+3,5);line(f,x+7,y+8,1);line(f,x+10,y+3,1);line(f,x+10,y+8,1);line(f,x+10,y+3,4);line(f,x+10,y+6,3);line(f,x+15,y+3,1);line(f,x+15,y+8,1);line(f,x+15,y+3,1);}
+void draw4G(uint8_t*f,int x,int y){bitmap(f,x,y,TopbarBitmap::CELLULAR_4G);}
 void drawBattery(uint8_t*f,int x,int y){bitmap(f,x,y,TopbarBitmap::BATTERY);}
 }

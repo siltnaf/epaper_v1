@@ -8,6 +8,7 @@
 #include <cstring>
 
 #include "devices/sd_card/sd_card.h"
+#include "devices/ml307/ml307.h"
 
 namespace {
 
@@ -199,11 +200,11 @@ void provisionTask(void *) {
     SD_MMC.remove(FONT_CACHE_PATH);
 
     Serial.println("[FONT] Cache missing; waiting for the preferred usable Internet transport");
-    while (WiFi.status() != WL_CONNECTED) {
+    while (WiFi.status() != WL_CONNECTED && !cellularModem.isConnected()) {
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    Serial.printf("[FONT] Internet ready through WiFi, IP=%s\n",
-                  WiFi.localIP().toString().c_str());
+    Serial.printf("[FONT] Internet ready through %s\n",
+                  WiFi.status() == WL_CONNECTED ? "WiFi" : "4G");
 
     const String remembered = rememberedDownloadUrl();
     bool downloaded = SdCard::downloadFile(remembered.c_str(), FONT_CACHE_PATH,

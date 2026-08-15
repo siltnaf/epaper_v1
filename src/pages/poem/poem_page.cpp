@@ -682,7 +682,7 @@ bool cachedOpusPath(int32_t poemId, char *path, size_t pathSize) {
 }
 
 bool downloadFile(const String &url, const char *path) {
-    if (!path || !SdCard::isMounted() || WiFi.status() != WL_CONNECTED) return false;
+    if (!path || !SdCard::isMounted()) return false;
     UiLoadingIndicator::Scope loadingIndicator;
     if (!SdCard::downloadFile(url.c_str(), path, 1024) || !SdCard::isValidOggOpus(path)) {
         SD_MMC.remove(path);
@@ -702,7 +702,7 @@ bool ensurePoemOpus(char *path, size_t pathSize) {
                       static_cast<long>(selectedPoemId), selectedVoice, path);
         return true;
     }
-    if (WiFi.status() != WL_CONNECTED || !SdCard::isMounted()) {
+    if (!SdCard::isMounted()) {
         std::strcpy(audioStatus, UiLocalization::isChinese() ? "没有音频" : "NO AUDIO");
         return false;
     }

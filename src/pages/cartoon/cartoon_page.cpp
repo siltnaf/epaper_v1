@@ -12,8 +12,10 @@
 #include <memory>
 
 #include "devices/epd_xingtai/epd_xingtai.h"
+#include "devices/ml307/ml307.h"
 #include "devices/sd_card/sd_card.h"
 #include "font/xiaozhi_font.h"
+#include "memory_budget.h"
 #include "pages/playlist_cache.h"
 #include "ui/loading_indicator.h"
 #include "ui/localization.h"
@@ -218,7 +220,8 @@ void drawCenteredTitle(uint8_t *frame, int x, int y, int width, int height,
 bool httpGetText(const String &url, String &payload, uint32_t timeout = 20000) {
     UiLoadingIndicator::Scope loading;
     if (WiFi.status() != WL_CONNECTED) {
-        copyText(statusText, sizeof(statusText), "WIFI NOT CONNECTED");
+        if (cellularModem.httpGet(url.c_str(), payload, timeout)) return true;
+        copyText(statusText, sizeof(statusText), "NETWORK NOT CONNECTED");
         return false;
     }
     payload = static_cast<const char *>(nullptr);
@@ -1063,6 +1066,11 @@ bool downloadJpeg(const String &url, const char *destinationPath) {
     UiLoadingIndicator::Scope loading;
     imageReady = false;
     jpegSize = 0;
+    if (!MemoryBudget::canAllocate(1024)) {
+        copyText(statusText, sizeof(statusText), "LOW MEMORY, RETRY IMAGE");
+        MemoryBudget::log("jpeg-skip");
+        return false;
+    }
     if (WiFi.status() != WL_CONNECTED ||
         !ensureCacheDirectory(selectedSlug, selectedChapterId)) {
         copyText(statusText, sizeof(statusText), "SD OR WIFI NOT READY");
@@ -1274,7 +1282,8 @@ void renderReader(uint8_t *frame) {
     else UiLocalization::drawText(frame, 14, 47, "RETURN");
     drawTitle(frame, 66, 39, 164, 24, selectedChapterTitle);
     line(frame, 8, 72, 231, 72);
-    if (imageReady && jpegSize && SD_MMC.exists(readerJpegPath)) {
+    if (imageReady && jpegSize && SD_MMC.exists(readerJpegPath) &&
+        MemoryBudget::canAllocate(4 * 1024)) {
         uint16_t sourceWidth = 0, sourceHeight = 0;
         const JRESULT sizeResult = TJpgDec.getFsJpgSize(
             &sourceWidth, &sourceHeight, readerJpegPath, SD_MMC);

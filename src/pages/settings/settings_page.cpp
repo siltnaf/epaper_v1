@@ -8,7 +8,7 @@
 
 namespace {
 
-SettingsPage::State state = {true, true, 60, 0};
+SettingsPage::State state = {true, true, false, 60, 0};
 bool sdMounted = false;
 bool audioTestActive = false;
 
@@ -250,39 +250,37 @@ void renderSettings(uint8_t *frame) {
     const bool cn = UiLocalization::isChinese();
     centeredText(frame, 40, cn ? "设置" : "SETTINGS", 1);
 
-    constexpr int rowTop = 58;
-    constexpr int rowHeight = 40;
-    constexpr int rowGap = 4;
-    const auto rowY = [](int index) { return 58 + index * 44; };
+    constexpr int rowHeight = 32;
+    const auto rowY = [](int index) { return 58 + index * 36; };
 
     rect(frame, 16, rowY(0), 208, rowHeight);
-    text(frame, 28, rowY(0) + 13, cn ? "内容网址" : "CONTENT URL", cn ? 1 : 2);
+    text(frame, 28, rowY(0) + 9, cn ? "内容网址" : "CONTENT URL", cn ? 1 : 2);
 
     rect(frame, 16, rowY(1), 208, rowHeight);
-    text(frame, 28, rowY(1) + 13, cn ? "无线网络" : "WIFI", cn ? 1 : 2);
-    toggle(frame, 156, rowY(1) + 7, state.wifiEnabled);
+    text(frame, 28, rowY(1) + 9, cn ? "无线网络" : "WIFI", cn ? 1 : 2);
+    toggle(frame, 156, rowY(1) + 3, state.wifiEnabled);
 
     rect(frame, 16, rowY(2), 208, rowHeight);
-    text(frame, 28, rowY(2) + 13, "4G", 2);
-    toggle(frame, 156, rowY(2) + 7, state.cellularEnabled);
+    text(frame, 28, rowY(2) + 9, "4G", 2);
+    toggle(frame, 156, rowY(2) + 3, state.cellularEnabled);
 
     rect(frame, 16, rowY(3), 208, rowHeight);
-    text(frame, 28, rowY(3) + 13, cn ? "存储卡" : "SD CARD", cn ? 1 : 2);
-    text(frame, 154, rowY(3) + 14, cn ? (sdMounted ? "就绪" : "未找到") : (sdMounted ? "READY" : "NONE"), 1);
+    text(frame, 28, rowY(3) + 9, cn ? "存储卡" : "SD CARD", cn ? 1 : 2);
+    text(frame, 154, rowY(3) + 10, cn ? (sdMounted ? "就绪" : "未找到") : (sdMounted ? "READY" : "NONE"), 1);
 
     rect(frame, 16, rowY(4), 208, rowHeight);
-    text(frame, 28, rowY(4) + 13, cn ? "语言" : "LANGUAGE", cn ? 1 : 2);
-    text(frame, 166, rowY(4) + 14, cn ? "中文" : "EN", 1);
+    text(frame, 28, rowY(4) + 9, cn ? "语言" : "LANGUAGE", cn ? 1 : 2);
+    text(frame, 166, rowY(4) + 10, cn ? "中文" : "EN", 1);
 
     rect(frame, 16, rowY(5), 208, rowHeight);
-    text(frame, 28, rowY(5) + 13, cn ? "语音" : "TTS VOICE", cn ? 1 : 2);
-    text(frame, 220 - textWidth(VOICES[selectedVoice], 2), rowY(5) + 13,
+    text(frame, 28, rowY(5) + 9, cn ? "语音" : "TTS VOICE", cn ? 1 : 2);
+    text(frame, 220 - textWidth(VOICES[selectedVoice], 2), rowY(5) + 9,
          VOICES[selectedVoice], 2);
 
     rect(frame, 16, rowY(6), 208, rowHeight);
-    text(frame, 28, rowY(6) + 13, cn ? "音量" : "AUDIO", cn ? 1 : 2);
-    button(frame, 132, rowY(6) + 4, 28, 32, "-");
-    button(frame, 188, rowY(6) + 4, 28, 32, "+");
+    text(frame, 28, rowY(6) + 9, cn ? "音量" : "AUDIO", cn ? 1 : 2);
+    button(frame, 132, rowY(6) + 2, 28, 28, "-");
+    button(frame, 188, rowY(6) + 2, 28, 28, "+");
 
     char volume[5] = {};
     const uint8_t value = state.volumePercent;
@@ -291,11 +289,15 @@ void renderSettings(uint8_t *frame) {
         volume[0] = static_cast<char>('0' + value / 10);
         volume[1] = static_cast<char>('0' + value % 10);
     } else volume[0] = static_cast<char>('0' + value);
-    text(frame, 181 - textWidth(volume, 1), rowY(6) + 16, volume, 1);
+    text(frame, 181 - textWidth(volume, 1), rowY(6) + 12, volume, 1);
 
     rect(frame, 16, rowY(7), 208, rowHeight);
-    text(frame, 28, rowY(7) + 13, cn ? "声音测试" : "AUDIO TEST", cn ? 1 : 2);
-    button(frame, 164, rowY(7) + 4, 52, 32, cn ? "测试" : "TEST", audioTestActive);
+    text(frame, 28, rowY(7) + 9, cn ? "声音测试" : "AUDIO TEST", cn ? 1 : 2);
+    button(frame, 164, rowY(7) + 2, 52, 28, cn ? "测试" : "TEST", audioTestActive);
+
+    rect(frame, 16, rowY(8), 208, rowHeight);
+    text(frame, 28, rowY(8) + 9, cn ? "缓存" : "CACHE", cn ? 1 : 2);
+    toggle(frame, 156, rowY(8) + 3, state.playlistCacheEnabled);
 }
 
 void renderVoices(uint8_t *frame) {
@@ -339,9 +341,7 @@ void renderSd(uint8_t *frame) {
     if (sdCount == 0) centeredText(frame, 92, cn ? "空" : "EMPTY", cn ? 1 : 2);
     for (uint8_t i = 0; i < sdCount; ++i) {
         const int y = 74 + i * 30;
-        clippedText(frame, 20, y, sdNames[i], 30, 1);
-        if (sdDirectories[i]) text(frame, UiLocalization::isChinese() ? 174 : 190, y,
-                                   UiLocalization::isChinese() ? "文件夹" : "DIR", 1);
+        clippedText(frame, 20, y, sdNames[i], 38, 1);
     }
     if (formatPending) {
         centeredText(frame, 300, cn ? "擦除存储卡" : "ERASE SD?", cn ? 1 : 2);
@@ -478,10 +478,8 @@ Action actionAt(int16_t x, int16_t y) {
         return voiceIndexAt(x, y) < VOICE_COUNT ? Action::SelectVoice : Action::None;
     }
     if (view != View::Settings) return Action::None;
-    constexpr int rowTop = 58;
-    constexpr int rowHeight = 40;
-    constexpr int rowGap = 4;
-    const auto rowY = [](int index) { return 58 + index * 44; };
+    constexpr int rowHeight = 32;
+    const auto rowY = [](int index) { return 58 + index * 36; };
     if (inRect(x, y, 16, rowY(0), 208, rowHeight)) return Action::OpenContentUrl;
     if (inRect(x, y, 16, rowY(1), 125, rowHeight)) return Action::OpenWifiSetup;
     if (inRect(x, y, 141, rowY(1), 83, rowHeight)) return Action::ToggleWifi;
@@ -492,6 +490,7 @@ Action actionAt(int16_t x, int16_t y) {
     if (inRect(x, y, 116, rowY(6), 56, rowHeight)) return Action::VolumeDown;
     if (inRect(x, y, 172, rowY(6), 52, rowHeight)) return Action::VolumeUp;
     if (inRect(x, y, 16, rowY(7), 208, rowHeight)) return Action::TestAudio;
+    if (inRect(x, y, 16, rowY(8), 208, rowHeight)) return Action::TogglePlaylistCache;
     return Action::None;
 }
 

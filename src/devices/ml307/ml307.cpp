@@ -1,5 +1,25 @@
 #include "devices/ml307/ml307.h"
 
+namespace {
+constexpr char ML307_SERVER[] = "43.133.150.106";
+constexpr uint16_t ML307_SERVER_PORT = 8081;
+
+class ModemLock {
+public:
+    explicit ModemLock(SemaphoreHandle_t mutex) : mutex_(mutex) {
+        locked_ = mutex_ && xSemaphoreTake(mutex_, portMAX_DELAY) == pdTRUE;
+    }
+    ~ModemLock() {
+        if (locked_) xSemaphoreGive(mutex_);
+    }
+    bool locked() const { return locked_; }
+
+private:
+    SemaphoreHandle_t mutex_;
+    bool locked_ = false;
+};
+}
+
 Ml307::Ml307(HardwareSerial &serial, int rxPin, int txPin, int powerPin,
              uint32_t baud)
     : serial_(serial), rxPin_(rxPin), txPin_(txPin), powerPin_(powerPin),
@@ -7,6 +27,12 @@ Ml307::Ml307(HardwareSerial &serial, int rxPin, int txPin, int powerPin,
 
 void Ml307::begin() {
     if (started_) return;
+
+    commandMutex_ = xSemaphoreCreateMutex();
+    if (!commandMutex_) {
+        Serial.println("[ML307] Could not create UART mutex");
+        return;
+    }
 
     pinMode(powerPin_, OUTPUT);
     // GPIO11 is the board's modem power-enable line. The ML307 reference code
@@ -37,6 +63,9 @@ void Ml307::setPowered(bool powered) {
 }
 
 bool Ml307::probeConnection() {
+    begin();
+    ModemLock lock(commandMutex_);
+    if (!lock.locked()) return false;
     if (!powered_) {
         connected_ = false;
         return false;
@@ -83,9 +112,88 @@ bool Ml307::probeConnection() {
         ready = mipCallIsActive(response);
     }
 
-    connected_ = ready;
-    Serial.printf("[ML307] modem=AT OK network=%s\n", ready ? "READY" : "NOT READY");
-    return ready;
+    if (!ready) {
+        connected_ = false;
+        Serial.println("[ML307] modem=AT OK network=NOT READY");
+        return false;
+    }
+
+    connected_ = ensureTcpConnection();
+    Serial.printf("[ML307] modem=AT OK network=READY tcp=%s:%u %s\n",
+                  ML307_SERVER, ML307_SERVER_PORT,
+                  connected_ ? "CONNECTED" : "NOT CONNECTED");
+    return connected_;
+}
+
+bool Ml307::ensureTcpConnection() {
+    String response;
+    if (sendCommand("AT+MIPSTATE=0", 5000, response) &&
+        mipStateIsConnected(response)) {
+        Serial.printf("[ML307] TCP already connected: %s:%u\n",
+                      ML307_SERVER, ML307_SERVER_PORT);
+        return true;
+    }
+
+    sendCommand("AT+MIPCLOSE=0", 5000, response);
+    if (!sendCommand("AT+MIPCFG=\"encoding\",0,1,1", 5000, response)) {
+        Serial.println("[ML307] Failed to configure TCP receive encoding");
+        return false;
+    }
+
+    char command[128] = {};
+    snprintf(command, sizeof(command), "AT+MIPOPEN=0,\"TCP\",\"%s\",%u,,0",
+             ML307_SERVER, ML307_SERVER_PORT);
+    if (!sendCommand(command, 5000, response)) {
+        Serial.println("[ML307] Failed to request TCP connection");
+        return false;
+    }
+
+    int connectionId = -1;
+    int errorCode = -1;
+    if (parseMipOpen(response, connectionId, errorCode)) {
+        if (connectionId == 0 && errorCode == 0) {
+            Serial.printf("[ML307] TCP connected: %s:%u\n",
+                          ML307_SERVER, ML307_SERVER_PORT);
+            return true;
+        }
+        Serial.printf("[ML307] TCP open failed id=%d error=%d\n",
+                      connectionId, errorCode);
+        return false;
+    }
+
+    return waitForTcpOpen(15000);
+}
+
+bool Ml307::waitForTcpOpen(uint32_t timeoutMs) {
+    String response;
+    const uint32_t started = millis();
+    while (millis() - started < timeoutMs) {
+        while (serial_.available() > 0) {
+            response += static_cast<char>(serial_.read());
+            if (response.indexOf("ERROR") >= 0) {
+                Serial.printf("[ML307] TCP open response: %s\n", response.c_str());
+                return false;
+            }
+
+            int connectionId = -1;
+            int errorCode = -1;
+            if (parseMipOpen(response, connectionId, errorCode)) {
+                Serial.printf("[ML307] << %s\n", response.c_str());
+                if (connectionId == 0 && errorCode == 0) {
+                    Serial.printf("[ML307] TCP connected: %s:%u\n",
+                                  ML307_SERVER, ML307_SERVER_PORT);
+                    return true;
+                }
+                Serial.printf("[ML307] TCP open failed id=%d error=%d\n",
+                              connectionId, errorCode);
+                return false;
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    Serial.println("[ML307] Timed out waiting for +MIPOPEN");
+    return false;
 }
 
 bool Ml307::waitForSimReady() {
@@ -155,6 +263,20 @@ bool Ml307::isConnected() const {
 
 bool Ml307::httpGet(const char *url, String &payload, uint32_t timeoutMs) {
     payload = "";
+    return httpGetInternal(url, &payload, nullptr, nullptr, timeoutMs);
+}
+
+bool Ml307::httpGet(const char *url, Print &output, size_t &bytesWritten,
+                    uint32_t timeoutMs) {
+    bytesWritten = 0;
+    return httpGetInternal(url, nullptr, &output, &bytesWritten, timeoutMs);
+}
+
+bool Ml307::httpGetInternal(const char *url, String *payload, Print *output,
+                            size_t *bytesWritten, uint32_t timeoutMs) {
+    begin();
+    ModemLock lock(commandMutex_);
+    if (!lock.locked()) return false;
     if (!url || !connected_) return false;
 
     const char *schemeEnd = strstr(url, "://");
@@ -173,27 +295,29 @@ bool Ml307::httpGet(const char *url, String &payload, uint32_t timeoutMs) {
     host[hostLength] = '\0';
     if (pathStart) snprintf(path, sizeof(path), "%s", pathStart);
 
-    sendCommand("AT+MHTTPDEL=0", 1000, payload);
+    String response;
+    sendCommand("AT+MHTTPDEL=0", 1000, response);
     char command[384] = {};
     snprintf(command, sizeof(command), "AT+MHTTPCREATE=\"%s://%s\"", protocol, host);
-    if (!sendCommand(command, 5000, payload)) return false;
+    if (!sendCommand(command, 5000, response)) return false;
     if (strcmp(protocol, "https") == 0) {
-        sendCommand("AT+MHTTPCFG=\"ssl\",0,1,0", 2000, payload);
+        sendCommand("AT+MHTTPCFG=\"ssl\",0,1,0", 2000, response);
     }
-    sendCommand("AT+MHTTPCFG=\"encoding\",0,0,0", 2000, payload);
+    sendCommand("AT+MHTTPCFG=\"encoding\",0,0,0", 2000, response);
 
     String hexPath;
     appendHex(hexPath, path, strlen(path));
-    sendCommand("AT+MHTTPCFG=\"encoding\",0,1,1", 1000, payload);
+    sendCommand("AT+MHTTPCFG=\"encoding\",0,1,1", 1000, response);
     snprintf(command, sizeof(command), "AT+MHTTPREQUEST=0,1,0,\"%s\"", hexPath.c_str());
-    if (!sendCommand(command, 10000, payload)) {
-        sendCommand("AT+MHTTPDEL=0", 1000, payload);
+    if (!sendCommand(command, 10000, response)) {
+        sendCommand("AT+MHTTPDEL=0", 1000, response);
         return false;
     }
 
     String pending;
     const uint32_t deadline = millis() + timeoutMs;
     bool finished = false;
+    bool writeFailed = false;
     while (static_cast<int32_t>(millis() - deadline) < 0) {
         while (serial_.available() > 0) pending += static_cast<char>(serial_.read());
         int newline = pending.indexOf('\n');
@@ -211,9 +335,19 @@ bool Ml307::httpGet(const char *url, String &payload, uint32_t timeoutMs) {
                 for (int i = 0; i + 1 < hex.length(); i += 2) {
                     const int high = hexValue(hex[i]);
                     const int low = hexValue(hex[i + 1]);
-                    if (high >= 0 && low >= 0) payload += static_cast<char>((high << 4) | low);
+                    if (high < 0 || low < 0) continue;
+                    const uint8_t value = static_cast<uint8_t>((high << 4) | low);
+                    if (payload) *payload += static_cast<char>(value);
+                    if (output) {
+                        if (output->write(value) != 1) {
+                            writeFailed = true;
+                            break;
+                        }
+                        if (bytesWritten) ++*bytesWritten;
+                    }
                 }
             }
+            if (writeFailed) break;
             int commaCount = 0;
             int contentLength = -1;
             int totalLength = -1;
@@ -239,7 +373,8 @@ bool Ml307::httpGet(const char *url, String &payload, uint32_t timeoutMs) {
         if (finished) break;
     }
     sendCommand("AT+MHTTPDEL=0", 1500, pending);
-    return payload.length() > 0;
+    return !writeFailed && finished && ((payload && payload->length() > 0) ||
+                        (bytesWritten && *bytesWritten > 0));
 }
 
 String Ml307::readResponse(uint32_t timeoutMs, const char *tokenA, const char *tokenB) {
@@ -286,6 +421,23 @@ bool Ml307::mipCallIsActive(const String &response) {
         secondComma >= 0 ? secondComma : lineEnd >= 0 ? lineEnd : response.length());
     state.trim();
     return state == "1";
+}
+
+bool Ml307::mipStateIsConnected(const String &response) {
+    const int marker = response.indexOf("+MIPSTATE:");
+    if (marker < 0) return false;
+    const String state = response.substring(marker);
+    return state.indexOf("\"TCP\"") >= 0 &&
+           state.indexOf(ML307_SERVER) >= 0 &&
+           state.indexOf(String(ML307_SERVER_PORT)) >= 0 &&
+           state.indexOf("\"CONNECTED\"") >= 0;
+}
+
+bool Ml307::parseMipOpen(const String &response, int &connectionId, int &errorCode) {
+    const int marker = response.indexOf("+MIPOPEN:");
+    if (marker < 0) return false;
+    return sscanf(response.c_str() + marker, "+MIPOPEN: %d , %d",
+                  &connectionId, &errorCode) == 2;
 }
 
 bool Ml307::simIsReady(const String &response) {

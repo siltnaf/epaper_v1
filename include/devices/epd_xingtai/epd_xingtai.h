@@ -28,6 +28,7 @@ private:
     void command(uint8_t value);
     void data(uint8_t value);
     void data(const uint8_t *buffer, size_t length);
+    void dataReversedRows(const uint8_t *buffer);
     void waitBusy(uint32_t timeoutMs = 15000);
     void controllerSetup();
     void refresh(const uint8_t *buffer);

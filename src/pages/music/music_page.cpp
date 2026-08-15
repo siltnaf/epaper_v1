@@ -7,6 +7,7 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
+#include <esp_heap_caps.h>
 
 #include <cstdlib>
 #include <cstring>
@@ -16,6 +17,7 @@
 #include "devices/ml307/ml307.h"
 #include "devices/sd_card/sd_card.h"
 #include "font/xiaozhi_font.h"
+#include "memory_budget.h"
 #include "pages/playlist_cache.h"
 #include "ui/loading_indicator.h"
 #include "ui/localization.h"
@@ -23,6 +25,9 @@
 namespace {
 
 constexpr uint8_t ITEMS_PER_PAGE = 10;
+constexpr size_t MAX_PLAYLIST_RESPONSE_BYTES = MemoryBudget::MAX_JSON_PAYLOAD;
+constexpr uint32_t MIN_PLAYLIST_REQUEST_HEAP = 16 * 1024;
+constexpr uint32_t MIN_PLAYLIST_REQUEST_BLOCK = 8 * 1024;
 constexpr int LIST_TOP = 82;
 constexpr int ROW_HEIGHT = 30;
 constexpr int ROW_GAP = 2;
@@ -317,9 +322,17 @@ String endpointBase() {
 
 bool httpGet(const String &url, String &payload, bool showLoading = true) {
     OptionalLoadingScope loadingIndicator(showLoading);
+    const uint32_t freeHeap = ESP.getFreeHeap();
+    const uint32_t largestBlock = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
     Serial.printf("[MUSIC API] request method=GET url=%s wifi_status=%d ip=%s heap=%u\n",
                   url.c_str(), static_cast<int>(WiFi.status()),
-                  WiFi.localIP().toString().c_str(), static_cast<unsigned>(ESP.getFreeHeap()));
+                  WiFi.localIP().toString().c_str(), static_cast<unsigned>(freeHeap));
+    if (freeHeap < MIN_PLAYLIST_REQUEST_HEAP || largestBlock < MIN_PLAYLIST_REQUEST_BLOCK) {
+        Serial.printf("[MUSIC API] skipped low memory heap=%u largest=%u\n",
+                      static_cast<unsigned>(freeHeap), static_cast<unsigned>(largestBlock));
+        std::strcpy(statusText, UiLocalization::isChinese() ? "内存不足，使用SD卡" : "LOW MEMORY, USING SD");
+        return false;
+    }
     if (WiFi.status() != WL_CONNECTED) {
         if (cellularModem.httpGet(url.c_str(), payload)) return true;
         std::strcpy(statusText, UiLocalization::isChinese() ? "网络未连接" : "WIFI NOT CONNECTED");
@@ -340,7 +353,18 @@ bool httpGet(const String &url, String &payload, bool showLoading = true) {
     http.addHeader("Connection", "close");
     http.addHeader("User-Agent", "ESP32-ePaper-Music/1.0");
     const int code = http.GET();
-    if (code >= 200 && code < 300) payload = http.getString();
+    if (code >= 200 && code < 300) {
+        payload = http.getString();
+        if (payload.length() > MAX_PLAYLIST_RESPONSE_BYTES) {
+            Serial.printf("[MUSIC API] response too large bytes=%u limit=%u\n",
+                          static_cast<unsigned>(payload.length()),
+                          static_cast<unsigned>(MAX_PLAYLIST_RESPONSE_BYTES));
+            payload = String();
+            http.end();
+            std::strcpy(statusText, "PLAYLIST TOO LARGE");
+            return false;
+        }
+    }
     const String error = code < 0 ? http.errorToString(code) : String();
     http.end();
     Serial.printf("[MUSIC API] response code=%d%s%s bytes=%u url=%s\n",
@@ -388,7 +412,7 @@ bool ensureSongDirectory(int32_t songId, char *directory, size_t directorySize) 
 }
 
 bool downloadSong(const String &url, const char *path) {
-    if (!path || WiFi.status() != WL_CONNECTED || !SdCard::isMounted()) return false;
+    if (!path || !SdCard::isMounted()) return false;
     UiLoadingIndicator::Scope loadingIndicator;
     if (!SdCard::downloadFile(url.c_str(), path, 1024) || !SdCard::isValidOggOpus(path)) {
         SD_MMC.remove(path);
@@ -411,7 +435,7 @@ bool ensureSongOpus(uint8_t index, char *path, size_t pathSize) {
                       static_cast<long>(song.id), path);
         return true;
     }
-    if (WiFi.status() != WL_CONNECTED || !SdCard::isMounted()) return false;
+    if (!SdCard::isMounted()) return false;
     char directory[48] = {};
     if (!ensureSongDirectory(song.id, directory, sizeof(directory))) return false;
     snprintf(path, pathSize, "%s/song.opus", directory);
@@ -458,6 +482,9 @@ bool startSongAudio() {
 
 bool loadSavedSongs() {
     if (!SdCard::isMounted()) return false;
+    Serial.printf("[MUSIC SD] Loading fallback heap=%u largest=%u\n",
+                  static_cast<unsigned>(ESP.getFreeHeap()),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
     File root = SD_MMC.open(MUSIC_SD_FOLDER);
     if (!root || !root.isDirectory()) return false;
     songCount = 0;
@@ -511,7 +538,9 @@ bool loadSavedSongs() {
     songTotal = songCount;
     if (songCount == 0) return false;
     snprintf(statusText, sizeof(statusText), "%u SAVED SONGS", songCount);
-    Serial.printf("[MUSIC SD] Offline playlist items=%u\n", songCount);
+    Serial.printf("[MUSIC SD] Offline playlist items=%u heap=%u largest=%u\n",
+                  songCount, static_cast<unsigned>(ESP.getFreeHeap()),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
     return true;
 }
 
@@ -553,6 +582,8 @@ bool loadLibrary(bool showLoading = true, bool forceRemote = false,
     const DeserializationError error = deserializeJson(
         document, payload, DeserializationOption::Filter(filter));
     if (error) {
+        document.clear();
+        filter.clear();
         if (fetchedRemote) return loadLibrary(showLoading, false, true);
         snprintf(statusText, sizeof(statusText), "JSON %s", error.c_str());
         return loadSavedSongs();
@@ -560,6 +591,8 @@ bool loadLibrary(bool showLoading = true, bool forceRemote = false,
     songTotal = document["total"] | 0;
     JsonArray items = document["items"].as<JsonArray>();
     if (items.isNull()) {
+        document.clear();
+        filter.clear();
         if (fetchedRemote) return loadLibrary(showLoading, false, true);
         std::strcpy(statusText, "NO ITEMS IN JSON");
         return loadSavedSongs();

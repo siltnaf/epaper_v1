@@ -6,6 +6,7 @@ namespace SettingsPage {
 struct State {
     bool wifiEnabled;
     bool cellularEnabled;
+    bool playlistCacheEnabled;
     uint8_t volumePercent;
     uint8_t language;
 };
@@ -16,6 +17,7 @@ enum class Action : uint8_t {
     OpenWifiSetup,
     ToggleWifi,
     ToggleCellular,
+    TogglePlaylistCache,
     RefreshSdCard,
     CycleLanguage,
     OpenVoiceSelection,

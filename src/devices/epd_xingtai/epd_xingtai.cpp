@@ -59,6 +59,20 @@ void XingtaiEpd::data(const uint8_t *buffer, size_t length) {
     _spi.endTransaction();
 }
 
+void XingtaiEpd::dataReversedRows(const uint8_t *buffer) {
+    if (!buffer) return;
+    constexpr size_t ROW_BYTES = WIDTH / 8;
+    _spi.beginTransaction(SPISettings(EPD_SPI_HZ, MSBFIRST, SPI_MODE0));
+    digitalWrite(BoardPins::EP_DC, HIGH);
+    digitalWrite(BoardPins::EP_CS, LOW);
+    for (int row = HEIGHT - 1; row >= 0; --row) {
+        _spi.transferBytes(const_cast<uint8_t *>(buffer +
+                          static_cast<size_t>(row) * ROW_BYTES), nullptr, ROW_BYTES);
+    }
+    digitalWrite(BoardPins::EP_CS, HIGH);
+    _spi.endTransaction();
+}
+
 void XingtaiEpd::waitBusy(uint32_t timeoutMs) {
     // The UC8253 vendor driver treats BUSY HIGH as ready. In particular, do not
     // reset the controller for the next frame while the previous waveform is
@@ -87,14 +101,9 @@ void XingtaiEpd::refresh(const uint8_t *buffer) {
     // page framebuffer upside down (180 degrees), send its rows bottom-to-top
     // without the usual horizontal pre-mirror: the panel's native mirror then
     // supplies the remaining horizontal part of the rotation.
-    static uint8_t rotated[FRAME_BYTES];
-    constexpr size_t ROW_BYTES = WIDTH / 8;
-    for (uint16_t y = 0; y < HEIGHT; ++y) {
-        const size_t destinationRow = static_cast<size_t>(y) * ROW_BYTES;
-        const size_t sourceRow = static_cast<size_t>(HEIGHT - 1 - y) * ROW_BYTES;
-        memcpy(rotated + destinationRow, buffer + sourceRow, ROW_BYTES);
-    }
-    data(rotated, FRAME_BYTES);
+    // Transfer rows in reverse order directly. This avoids a permanent full
+    // framebuffer-sized rotation scratch buffer in internal RAM.
+    dataReversedRows(buffer);
 
     command(0x04); // power on
     waitBusy();

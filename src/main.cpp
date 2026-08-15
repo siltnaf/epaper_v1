@@ -15,6 +15,7 @@
 #include "devices/ml307/ml307.h"
 #include "devices/sd_card/sd_card.h"
 #include "font/xiaozhi_font.h"
+#include "memory_budget.h"
 #include "pages/asundar/asundar_page.h"
 #include "pages/book/book_page.h"
 #include "pages/calendar/calendar_page.h"
@@ -25,6 +26,7 @@
 #include "pages/main/main_page.h"
 #include "pages/music/music_page.h"
 #include "pages/poem/poem_page.h"
+#include "pages/playlist_cache.h"
 #include "pages/recording/recording_page.h"
 #include "pages/radio/radio_page.h"
 #include "pages/settings/settings_page.h"
@@ -69,7 +71,6 @@ struct TouchAction {
 
 static uint8_t frame[XingtaiEpd::FRAME_BYTES];
 static uint8_t transitionFrame[XingtaiEpd::FRAME_BYTES];
-static uint8_t mainPageFrame[XingtaiEpd::FRAME_BYTES];
 static uint8_t whiteFrame[XingtaiEpd::FRAME_BYTES] = {};
 static uint8_t calculatorRefreshFrame[XingtaiEpd::FRAME_BYTES];
 Preferences touchPreferences;
@@ -93,7 +94,7 @@ TouchAction touchAction;
 bool initialEs8311Present = false;
 uint8_t initialEs8311Address = 0;
 bool initialFt6x36Present = false;
-SettingsPage::State settingsState = {true, true, 60, 0};
+SettingsPage::State settingsState = {true, true, false, 60, 0};
 MainPage::NetworkMode lastNetworkMode = MainPage::NetworkMode::None;
 volatile bool cellularProbeRunning = false;
 TaskHandle_t audioTestTaskHandle = nullptr;
@@ -147,6 +148,7 @@ int16_t priorityControlWidth = 0;
 int16_t priorityControlHeight = 0;
 volatile bool calculatorRefreshRunning = false;
 volatile bool calculatorRefreshPending = false;
+TaskHandle_t uiTaskHandle = nullptr;
 bool calculatorPressHandled = false;
 bool immediateControlPressHandled = false;
 
@@ -176,6 +178,10 @@ void showTopbarLoading(bool visible);
 void processOpeningLibraryLoads();
 void startOpeningLibraryLoad(PageId page);
 void refreshOpeningLibraryContent(PageId page);
+
+void onRecordingTimerEvent() {
+    if (uiTaskHandle) xTaskNotifyGive(uiTaskHandle);
+}
 
 void IRAM_ATTR onTouchInterruptSignal() {
     touchInterruptPending = true;
@@ -270,6 +276,7 @@ void saveSettings() {
     }
     settingsPreferences.putBool("wifi", settingsState.wifiEnabled);
     settingsPreferences.putBool("cellular", settingsState.cellularEnabled);
+    settingsPreferences.putBool("playlistCache", settingsState.playlistCacheEnabled);
     settingsPreferences.putUChar("volume", settingsState.volumePercent);
     settingsPreferences.putUChar("language", settingsState.language);
     settingsPreferences.putString("contentUrl", contentUrl);
@@ -278,11 +285,18 @@ void saveSettings() {
 }
 
 bool contentUrlReachable(const char *url) {
-    if (!url || std::strlen(url) <= CONTENT_URL_PREFIX_LENGTH || WiFi.status() != WL_CONNECTED) {
+    if (!url || std::strlen(url) <= CONTENT_URL_PREFIX_LENGTH) {
         return false;
     }
 
     UiLoadingIndicator::Scope loadingIndicator;
+    if (WiFi.status() != WL_CONNECTED) {
+        String payload;
+        const bool reachable = cellularModem.httpGet(url, payload, 10000);
+        Serial.printf("[CONTENT URL] 4G validation %s %s\n", url,
+                      reachable ? "succeeded" : "failed");
+        return reachable;
+    }
     HTTPClient http;
     http.setConnectTimeout(5000);
     http.setTimeout(5000);
@@ -312,27 +326,30 @@ void copyAsciiUpper(char *destination, size_t destinationSize, const String &sou
 }
 
 bool fetchClockWeather() {
+    constexpr char WEATHER_URL[] =
+        "http://wttr.in/?format=%25l%7C%25C%7C%25t%7C%25h%7C%25w";
+    String response;
     if (WiFi.status() != WL_CONNECTED) {
-        return false;
+        if (!cellularModem.httpGet(WEATHER_URL, response, 15000)) return false;
+    } else {
+        HTTPClient http;
+        http.setConnectTimeout(7000);
+        http.setTimeout(7000);
+        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        http.setUserAgent("ESP32-ePaper-Clock/1.0");
+        if (!http.begin(WEATHER_URL)) return false;
+        const int responseCode = http.GET();
+        response = responseCode > 0 ? http.getString() : String();
+        http.end();
+        if (responseCode < 200 || responseCode >= 400) {
+            Serial.printf("[CLOCK] Weather request failed with HTTP code %d\n", responseCode);
+            return false;
+        }
     }
 
-    HTTPClient http;
-    http.setConnectTimeout(7000);
-    http.setTimeout(7000);
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    http.setUserAgent("ESP32-ePaper-Clock/1.0");
     // wttr.in resolves the public IP to a location and returns a deliberately
     // compact, pipe-separated response:
     // location|condition|temperature|humidity|wind.
-    if (!http.begin("http://wttr.in/?format=%25l%7C%25C%7C%25t%7C%25h%7C%25w")) return false;
-    const int responseCode = http.GET();
-    const String response = responseCode > 0 ? http.getString() : String();
-    http.end();
-    if (responseCode < 200 || responseCode >= 400) {
-        Serial.printf("[CLOCK] Weather request failed with HTTP code %d\n", responseCode);
-        return false;
-    }
-
     const int firstSeparator = response.indexOf('|');
     const int secondSeparator = response.indexOf('|', firstSeparator + 1);
     const int thirdSeparator = response.indexOf('|', secondSeparator + 1);
@@ -556,7 +573,7 @@ void playAudioTestBeep() {
         // The beep task clears the active flag on exit; repaint the settings
         // test-button row so the label is no longer bold.
         if (!audioTestTaskHandle && currentPage == PageId::Settings) {
-            refreshCurrentRegion(16, 58 + 7 * 44, 208, 40);
+            refreshCurrentRegion(16, 58 + 7 * 36, 208, 32);
         }
         return;
     }
@@ -578,7 +595,7 @@ void playAudioTestBeep() {
     SettingsPage::setAudioTestActive(true);
     if (currentPage == PageId::Settings) {
         // Bold the settings test button while the beep is playing.
-        refreshCurrentRegion(16, 58 + 7 * 44, 208, 40);
+        refreshCurrentRegion(16, 58 + 7 * 36, 208, 32);
     }
     Serial.printf("[AUDIO TEST] Continuous beep toggled on at %u%% volume\n",
                   settingsState.volumePercent);
@@ -589,6 +606,7 @@ void loadSettings() {
     if (settingsPreferences.begin("settings", true)) {
         settingsState.wifiEnabled = settingsPreferences.getBool("wifi", true);
         settingsState.cellularEnabled = settingsPreferences.getBool("cellular", true);
+        settingsState.playlistCacheEnabled = settingsPreferences.getBool("playlistCache", false);
         settingsState.volumePercent = settingsPreferences.getUChar("volume", 60);
         settingsState.language = settingsPreferences.getUChar("language", 0);
         const String savedContentUrl = settingsPreferences.getString("contentUrl", "");
@@ -615,6 +633,7 @@ void loadSettings() {
         settingsPreferences.end();
     }
     if (settingsState.volumePercent > 100) settingsState.volumePercent = 100;
+    PlaylistCache::setEnabled(settingsState.playlistCacheEnabled);
     SettingsPage::setState(settingsState);
     UiLocalization::setLanguage(settingsState.language);
     loadWifiCredentials();
@@ -1443,13 +1462,23 @@ void showHomePressedOutline() {
     constexpr int top = 0;
     constexpr int width = 32;
     constexpr int height = 32;
-    std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
     constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
-    // Rebuild this tile from the cached normal top bar because content-page
-    // framebuffers may not contain the Home glyph even while it is physically
-    // visible. Keep the icon black on white and use only a bold frame as the
-    // pressed indication.
-    copyFrameRegion(transitionFrame, mainPageFrame, left, top, width, height);
+    constexpr size_t tileRowBytes = width / 8;
+    uint8_t homeTile[tileRowBytes * height] = {};
+    // Render Home only as a source for this tile. The rest of transitionFrame
+    // must continue to describe the physically displayed content page.
+    MainPage::render(transitionFrame);
+    for (int row = 0; row < height; ++row) {
+        std::memcpy(homeTile + static_cast<size_t>(row) * tileRowBytes,
+                    transitionFrame + static_cast<size_t>(top + row) * rowBytes,
+                    tileRowBytes);
+    }
+    std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
+    for (int row = 0; row < height; ++row) {
+        std::memcpy(transitionFrame + static_cast<size_t>(top + row) * rowBytes,
+                    homeTile + static_cast<size_t>(row) * tileRowBytes,
+                    tileRowBytes);
+    }
     for (int inset = 0; inset < 1; ++inset) {
         const int frameLeft = left + inset;
         const int frameTop = top + inset;
@@ -1482,8 +1511,21 @@ void restoreHomeIcon() {
     constexpr uint16_t top = 0;
     constexpr uint16_t width = 32;
     constexpr uint16_t height = 32;
+    constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
+    constexpr size_t tileRowBytes = width / 8;
+    uint8_t homeTile[tileRowBytes * height] = {};
+    MainPage::render(transitionFrame);
+    for (int row = 0; row < height; ++row) {
+        std::memcpy(homeTile + static_cast<size_t>(row) * tileRowBytes,
+                    transitionFrame + static_cast<size_t>(top + row) * rowBytes,
+                    tileRowBytes);
+    }
     std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
-    copyFrameRegion(transitionFrame, mainPageFrame, left, top, width, height);
+    for (int row = 0; row < height; ++row) {
+        std::memcpy(transitionFrame + static_cast<size_t>(top + row) * rowBytes,
+                    homeTile + static_cast<size_t>(row) * tileRowBytes,
+                    tileRowBytes);
+    }
     epaper.displayPartial(frame, transitionFrame, left, top, width, height);
     std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
     epaper.sleep();
@@ -1520,8 +1562,7 @@ void showTopbarLoading(bool visible) {
 
 void refreshNetworkTopbar(MainPage::NetworkMode mode) {
     MainPage::setNetworkMode(mode);
-    // Keep the persistent Home framebuffer ready for instant navigation.
-    MainPage::render(mainPageFrame);
+    MainPage::render(transitionFrame);
     std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
     clearFrameRegion(transitionFrame, 178, 0, 28, 32);
     if (mode == MainPage::NetworkMode::Wifi) {
@@ -1788,7 +1829,7 @@ bool isImmediateTouchControl(int16_t x, int16_t y) {
                RecordingPage::tagItemBoundsAt(x, y, left, top, width, height) ||
                RecordingPage::pagerControlBoundsAt(x, y, left, top, width, height) ||
                inRect(x, y, 80, 320, 80, 81) ||
-               inRect(x, y, 204, 108, 28, 8 * 32 - 2);
+               inRect(x, y, 204, 108, 28, 10 * 30 - 2);
     }
     if (currentPage == PageId::Cartoon) {
         int16_t left = 0;
@@ -2164,6 +2205,12 @@ void handleTouch(TPoint point, TEvent event) {
         case SettingsPage::Action::ToggleCellular:
             settingsState.cellularEnabled = !settingsState.cellularEnabled;
             applyCellularSetting();
+            break;
+        case SettingsPage::Action::TogglePlaylistCache:
+            settingsState.playlistCacheEnabled = !settingsState.playlistCacheEnabled;
+            PlaylistCache::setEnabled(settingsState.playlistCacheEnabled);
+            Serial.printf("[SETTINGS] Playlist cache %s\n",
+                          settingsState.playlistCacheEnabled ? "enabled" : "disabled");
             break;
         case SettingsPage::Action::VolumeDown:
             settingsState.volumePercent = settingsState.volumePercent >= 10
@@ -2732,7 +2779,7 @@ void processTouchAction() {
         // Clear only the function area below the fixed top bar before drawing
         // the cached Home menu with the partial waveform.
         wipeContentAreaWhite(false);
-        std::memcpy(transitionFrame, mainPageFrame, XingtaiEpd::FRAME_BYTES);
+        MainPage::render(transitionFrame);
     } else {
         rendererFor(nextPage)(transitionFrame);
     }
@@ -2780,6 +2827,7 @@ void setup() {
     Serial.println("[BOOT] ESP32-S3 e-paper startup");
     UiLoadingIndicator::setHandler(showTopbarLoading);
     Serial.printf("[BOOT] Serial ready: %lu baud\n", 115200UL);
+    MemoryBudget::log("boot");
     Serial.println("[BOOT] Firmware: 3.7-inch e-paper portrait test");
     Serial.printf("[BOOT] EPD pins: DIN=%d CLK=%d CS=%d DC=%d RST=%d BUSY=%d\n",
                   BoardPins::EP_DIN, BoardPins::EP_CLK, BoardPins::EP_CS,
@@ -2808,6 +2856,8 @@ void setup() {
     PoemPage::setAudio(&audio);
     PoemPage::setVoice(SettingsPage::voiceName());
     RecordingPage::setAudio(&audio);
+    uiTaskHandle = xTaskGetCurrentTaskHandle();
+    RecordingPage::setTimerEventHandler(onRecordingTimerEvent);
     RadioPage::setAudio(&audio);
     applyAudioSetting();
     Serial.println("[BOOT] ES8311 audio initialization complete");
@@ -2854,8 +2904,7 @@ void setup() {
     // has been observed in the normal event loop.
     lastNetworkMode = MainPage::NetworkMode::None;
     MainPage::setNetworkMode(MainPage::NetworkMode::None);
-    MainPage::render(mainPageFrame);
-    std::memcpy(transitionFrame, mainPageFrame, XingtaiEpd::FRAME_BYTES);
+    MainPage::render(transitionFrame);
     Serial.println("[BOOT] Transitioning to main page...");
     epaper.displayPartial(frame, transitionFrame, 0, 0,
                           XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT);
@@ -2875,11 +2924,21 @@ void setup() {
     Serial.printf("[STATUS] AUDIO online=%s initialized=%s; TOUCH online=%s INT=%d\n",
                   audio.isOnline() ? "yes" : "no", audio.isInitialized() ? "yes" : "no",
                   touch.isOnline() ? "yes" : "no", digitalRead(BoardPins::TOUCH_INT));
+    MemoryBudget::log("ready");
     Serial.println("[BOOT] Startup sequence complete; entering touch monitoring");
     Serial.println("========================================");
 }
 
 void loop() {
+    // Consume one counting notification per EPD update. Partial refresh can
+    // exceed one second, so clearing the full count would skip timer labels.
+    const bool recordingTimerEvent = ulTaskNotifyTake(pdFALSE, 0) > 0;
+    if (recordingTimerEvent && currentPage == PageId::Recording &&
+        RecordingPage::takeTimerEvent()) {
+        // The timer callback wakes this EPD-owning task. Keep all framebuffer
+        // and SPI work here so timer refreshes cannot race another display job.
+        refreshCurrentRegion(24, 116, 192, 36);
+    }
     serviceTouchInterruptBeforeI2c();
     touch.loop();
     processTouchAction();

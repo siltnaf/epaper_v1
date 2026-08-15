@@ -10,6 +10,7 @@
 #include <cstring>
 
 #include "board_pins.h"
+#include "devices/ml307/ml307.h"
 #include "ui/loading_indicator.h"
 
 namespace SdCard {
@@ -40,7 +41,8 @@ bool isValidOggOpus(const char *path, uint32_t minimumBytes) {
 }
 
 bool downloadFile(const char *url, const char *path, uint32_t minimumBytes) {
-    if (!url || !path || !isMounted() || WiFi.status() != WL_CONNECTED) return false;
+    if (!url || !path || !isMounted() ||
+        (WiFi.status() != WL_CONNECTED && !cellularModem.isConnected())) return false;
     UiLoadingIndicator::Scope loadingIndicator;
 
     const String destination(path);
@@ -59,6 +61,29 @@ bool downloadFile(const char *url, const char *path, uint32_t minimumBytes) {
     if (!output) {
         Serial.printf("[SD] Could not open %s for writing\n", temporary.c_str());
         return false;
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        size_t written = 0;
+        Serial.printf("[SD] Downloading through 4G: %s\n", url);
+        const bool downloaded = cellularModem.httpGet(url, output, written);
+        output.flush();
+        output.close();
+        if (!downloaded || written < minimumBytes) {
+            Serial.printf("[SD] 4G download failed bytes=%u minimum=%lu\n",
+                          static_cast<unsigned>(written),
+                          static_cast<unsigned long>(minimumBytes));
+            SD_MMC.remove(temporary);
+            return false;
+        }
+        SD_MMC.remove(destination);
+        if (!SD_MMC.rename(temporary, destination)) {
+            SD_MMC.remove(temporary);
+            return false;
+        }
+        Serial.printf("[SD] 4G download complete: %u bytes at %s\n",
+                      static_cast<unsigned>(written), destination.c_str());
+        return true;
     }
 
     HTTPClient http;

@@ -29,6 +29,9 @@ constexpr int ROW_GAP = 2;
 constexpr int PAGER_TOP = 52;
 constexpr int PAGER_HEIGHT = 25;
 constexpr int PAGER_BUTTON_WIDTH = 34;
+static_assert(LIST_TOP + ITEMS_PER_PAGE * ROW_HEIGHT +
+                  (ITEMS_PER_PAGE - 1) * ROW_GAP <= XingtaiEpd::HEIGHT,
+              "Voice playlist rows must fit on the display");
 constexpr char STORY_SD_FOLDER[] = "/voice";
 constexpr int READER_CONTENT_X = 10;
 constexpr int READER_CONTENT_Y = 82;
@@ -664,7 +667,7 @@ bool cachedOpusPath(int32_t storyId, char *path, size_t pathSize) {
 }
 
 bool downloadFile(const String &url, const char *path) {
-    if (!path || !SdCard::isMounted() || WiFi.status() != WL_CONNECTED) return false;
+    if (!path || !SdCard::isMounted()) return false;
     UiLoadingIndicator::Scope loadingIndicator;
     if (!SdCard::downloadFile(url.c_str(), path, 1024) || !SdCard::isValidOggOpus(path)) {
         SD_MMC.remove(path);
@@ -684,7 +687,7 @@ bool ensureStoryOpus(char *path, size_t pathSize) {
                       static_cast<long>(selectedStoryId), selectedVoice, path);
         return true;
     }
-    if (WiFi.status() != WL_CONNECTED || !SdCard::isMounted()) {
+    if (!SdCard::isMounted()) {
         std::strcpy(audioStatus, UiLocalization::isChinese() ? "没有音频" : "NO AUDIO");
         return false;
     }
@@ -800,7 +803,10 @@ bool loadLibrary(bool showLoading = true, bool forceRemote = false,
     bool remoteLoaded = false;
     bool fetchedRemote = false;
     char cacheSlot[20] = {};
-    snprintf(cacheSlot, sizeof(cacheSlot), "page-%ld", static_cast<long>(libraryPage));
+    // Include page size in the key so a cache created by an older layout cannot
+    // silently return fewer rows than this ten-item playlist page expects.
+    snprintf(cacheSlot, sizeof(cacheSlot), "page-%u-%ld",
+             static_cast<unsigned>(ITEMS_PER_PAGE), static_cast<long>(libraryPage));
     const String endpoint = endpointBase();
     if (!forceRemote) remoteLoaded = PlaylistCache::load(
         STORY_SD_FOLDER, endpoint, cacheSlot, payload);

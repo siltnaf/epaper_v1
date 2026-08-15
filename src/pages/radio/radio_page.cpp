@@ -17,6 +17,7 @@
 #include "devices/audio/opus_player.h"
 #include "devices/epd_xingtai/epd_xingtai.h"
 #include "devices/es8311/es8311.h"
+#include "devices/ml307/ml307.h"
 #include "font/xiaozhi_font.h"
 #include "ui/loading_indicator.h"
 #include "ui/localization.h"
@@ -253,23 +254,27 @@ uint8_t pageCount() {
 
 bool loadStations() {
     UiLoadingIndicator::Scope loading;
-    if (WiFi.status() != WL_CONNECTED) {
-        copyText(statusText, sizeof(statusText), UiLocalization::isChinese() ? "网络未连接" : "WIFI NOT CONNECTED");
-        return false;
-    }
-    HTTPClient http;
-    WiFiClient client;
     const String url = apiBase() + "/list";
-    http.setConnectTimeout(7000);
-    http.setTimeout(20000);
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    if (!http.begin(client, url)) return false;
-    http.addHeader("Connection", "close");
-    const int code = http.GET();
-    const String payload = code >= 200 && code < 300 ? http.getString() : String();
-    http.end();
-    Serial.printf("[RADIO API] GET code=%d bytes=%u url=%s\n", code, payload.length(), url.c_str());
-    if (code < 200 || code >= 300) return false;
+    String payload;
+    if (WiFi.status() != WL_CONNECTED) {
+        if (!cellularModem.httpGet(url.c_str(), payload)) {
+            copyText(statusText, sizeof(statusText), UiLocalization::isChinese() ? "网络未连接" : "NETWORK NOT CONNECTED");
+            return false;
+        }
+    } else {
+        HTTPClient http;
+        WiFiClient client;
+        http.setConnectTimeout(7000);
+        http.setTimeout(20000);
+        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        if (!http.begin(client, url)) return false;
+        http.addHeader("Connection", "close");
+        const int code = http.GET();
+        payload = code >= 200 && code < 300 ? http.getString() : String();
+        http.end();
+        Serial.printf("[RADIO API] GET code=%d bytes=%u url=%s\n", code, payload.length(), url.c_str());
+        if (code < 200 || code >= 300) return false;
+    }
     JsonDocument document;
     if (deserializeJson(document, payload)) {
         copyText(statusText, sizeof(statusText), "RADIO JSON FAILED");

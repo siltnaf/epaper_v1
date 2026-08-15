@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <SD_MMC.h>
+#include <esp_timer.h>
 
 #include <cstring>
 #include <ctime>
@@ -11,6 +12,7 @@
 #include "devices/audio/opus_player.h"
 #include "devices/es8311/es8311.h"
 #include "devices/sd_card/sd_card.h"
+#include "memory_budget.h"
 #include "ui/localization.h"
 
 namespace {
@@ -22,7 +24,7 @@ constexpr uint16_t I2S_CHANNELS = 2;
 constexpr uint16_t BITS_PER_SAMPLE = 16;
 constexpr uint32_t BYTE_RATE = SAMPLE_RATE * RECORDING_CHANNELS * BITS_PER_SAMPLE / 8;
 constexpr uint8_t TAG_COUNT = 6;
-constexpr uint8_t MAX_FILES = 8;
+constexpr uint8_t MAX_FILES = 10;
 constexpr int HEADER_X = 62;
 constexpr int HEADER_Y = 40;
 constexpr int HEADER_W = 136;
@@ -36,8 +38,11 @@ constexpr int DROPDOWN_ITEM_H = 38;
 constexpr int DROPDOWN_COLUMN_GAP = 8;
 constexpr int DROPDOWN_ROW_GAP = 10;
 constexpr int FILE_LIST_TOP = 108;
-constexpr int FILE_ROW_HEIGHT = 30;
+constexpr int FILE_ROW_HEIGHT = 28;
 constexpr int FILE_ROW_GAP = 2;
+static_assert(FILE_LIST_TOP + MAX_FILES * FILE_ROW_HEIGHT +
+                  (MAX_FILES - 1) * FILE_ROW_GAP <= XingtaiEpd::HEIGHT,
+              "Recording file rows must fit on the display");
 constexpr int FILE_MARQUEE_X = 43;
 constexpr int FILE_MARQUEE_WIDTH = 125;
 constexpr int FILE_MARQUEE_HEIGHT = FILE_ROW_HEIGHT - 2;
@@ -70,7 +75,10 @@ volatile uint32_t recordedDataBytes = 0;
 uint32_t recordingStartedMs = 0;
 uint32_t pauseStartedMs = 0;
 uint32_t pausedTotalMs = 0;
-uint32_t lastRenderedSecond = UINT32_MAX;
+uint32_t displayedRecordingSecond = 0;
+esp_timer_handle_t recordingSecondTimer = nullptr;
+bool recordingSecondTimerRunning = false;
+RecordingPage::TimerEventHandler timerEventHandler = nullptr;
 char statusText[48] = "READY";
 TaskHandle_t playbackTaskHandle = nullptr;
 volatile bool playbackActive = false;
@@ -371,6 +379,10 @@ bool startPlayback() {
         return false;
     }
     OpusPlayer::stop();
+    // playbackInput/playbackOutput are static, so only the task stack needs a
+    // dynamic allocation. Let FreeRTOS perform the authoritative allocation;
+    // the generic decoder reserve is too strict for this lightweight WAV path.
+    constexpr uint32_t WAV_PLAYBACK_STACK_BYTES = 8 * 1024;
     snprintf(playbackPath, sizeof(playbackPath), "%s/%s/%s", ROOT_FOLDER,
              TAG_FOLDERS[selectedTag], fileNames[activeFileIndex]);
     if (!SD_MMC.exists(playbackPath)) return false;
@@ -380,10 +392,14 @@ bool startPlayback() {
     playbackActive = true;
     marqueeReady = false;
     marqueeOffset = 0;
-    if (xTaskCreatePinnedToCore(playbackTask, "wav-playback", 8192, nullptr, 2,
+    MemoryBudget::log("wav-start");
+    if (xTaskCreatePinnedToCore(playbackTask, "wav-playback", WAV_PLAYBACK_STACK_BYTES,
+                                nullptr, 2,
                                 &playbackTaskHandle, 0) != pdPASS) {
         playbackActive = false;
         playbackTaskHandle = nullptr;
+        std::strcpy(statusText, "WAV TASK FAILED");
+        MemoryBudget::log("wav-task-failed");
         return false;
     }
     return true;
@@ -429,6 +445,44 @@ uint32_t elapsedSeconds() {
     return (now - recordingStartedMs - pausedTotalMs) / 1000;
 }
 
+void recordingSecondTimerCallback(void *) {
+    if (timerEventHandler) timerEventHandler();
+}
+
+bool ensureRecordingSecondTimer() {
+    if (recordingSecondTimer) return true;
+    const esp_timer_create_args_t timerArgs = {
+        .callback = recordingSecondTimerCallback,
+        .arg = nullptr,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "rec-second",
+        .skip_unhandled_events = false,
+    };
+    const esp_err_t result = esp_timer_create(&timerArgs, &recordingSecondTimer);
+    if (result != ESP_OK) {
+        Serial.printf("[RECORDING] Timer create failed err=%d\n", static_cast<int>(result));
+        recordingSecondTimer = nullptr;
+        return false;
+    }
+    return true;
+}
+
+void startRecordingSecondTimer() {
+    if (!ensureRecordingSecondTimer()) return;
+    if (recordingSecondTimerRunning) esp_timer_stop(recordingSecondTimer);
+    const esp_err_t result = esp_timer_start_periodic(recordingSecondTimer, 1000000);
+    recordingSecondTimerRunning = result == ESP_OK;
+    if (result != ESP_OK) {
+        Serial.printf("[RECORDING] Timer start failed err=%d\n", static_cast<int>(result));
+    }
+}
+
+void stopRecordingSecondTimer() {
+    if (!recordingSecondTimer || !recordingSecondTimerRunning) return;
+    esp_timer_stop(recordingSecondTimer);
+    recordingSecondTimerRunning = false;
+}
+
 void recordingTask(void *) {
     int16_t i2sSamples[480] = {};
     int16_t monoSamples[240] = {};
@@ -464,6 +518,7 @@ void recordingTask(void *) {
     recordingActive = false;
     recordingPaused = false;
     recordingStopRequested = false;
+    stopRecordingSecondTimer();
     recordingCompleted = true;
     Serial.printf("[RECORDING] Capture peak=%u empty_reads=%lu\n", recordingPeak,
                   static_cast<unsigned long>(emptyReads));
@@ -478,6 +533,7 @@ bool startRecording() {
         std::strcpy(statusText, "RECORDING UNAVAILABLE");
         return false;
     }
+    constexpr uint32_t WAV_RECORDING_STACK_BYTES = 4096;
     buildRecordingPath(selectedTag, activePath, sizeof(activePath));
     recordingFile = SD_MMC.open(activePath, FILE_WRITE);
     if (!recordingFile) { std::strcpy(statusText, "FILE OPEN FAILED"); return false; }
@@ -489,11 +545,13 @@ bool startRecording() {
     recordingStartedMs = millis();
     pauseStartedMs = 0;
     pausedTotalMs = 0;
+    displayedRecordingSecond = 0;
     recordingActive = true;
-    lastRenderedSecond = UINT32_MAX;
+    startRecordingSecondTimer();
     std::strcpy(statusText, "RECORDING");
     if (!codec->prepareRecording(30)) {
         recordingActive = false;
+        stopRecordingSecondTimer();
         recordingFile.close();
         SD_MMC.remove(activePath);
         std::strcpy(statusText, "RECORDING UNAVAILABLE");
@@ -508,9 +566,12 @@ bool startRecording() {
     codec->readRegister(0x17, adcVolume);
     Serial.printf("[RECORDING] ES8311 ADC reg14=0x%02X reg16=0x%02X reg17=0x%02X\n",
                   microphoneMode, microphoneGain, adcVolume);
-    if (xTaskCreatePinnedToCore(recordingTask, "wav-recording", 4096, nullptr, 2,
+    MemoryBudget::log("wav-record-start");
+    if (xTaskCreatePinnedToCore(recordingTask, "wav-recording", WAV_RECORDING_STACK_BYTES,
+                                nullptr, 2,
                                 &recordingTaskHandle, 0) != pdPASS) {
         recordingActive = false;
+        stopRecordingSecondTimer();
         recordingFile.close();
         SD_MMC.remove(activePath);
         std::strcpy(statusText, "RECORD TASK FAILED");
@@ -524,6 +585,7 @@ void stopRecording() {
     if (!recordingActive && !recordingTaskHandle) return;
     recordingStopRequested = true;
     recordingPaused = false;
+    stopRecordingSecondTimer();
     std::strcpy(statusText, "SAVING");
     Serial.printf("[RECORDING] Stop requested path=%s\n", activePath);
 }
@@ -533,10 +595,12 @@ void togglePause() {
     if (!recordingPaused) {
         recordingPaused = true;
         pauseStartedMs = millis();
+        stopRecordingSecondTimer();
         std::strcpy(statusText, "PAUSED");
     } else {
         pausedTotalMs += millis() - pauseStartedMs;
         recordingPaused = false;
+        startRecordingSecondTimer();
         std::strcpy(statusText, "RECORDING");
     }
 }
@@ -649,8 +713,8 @@ void drawTagDropdown(uint8_t *frame) {
 
 void drawPlayPause(uint8_t *frame, int centerX, int centerY, bool pause) {
     if (pause) {
-        rect(frame, centerX - 18, centerY - 21, 12, 43);
-        rect(frame, centerX + 7, centerY - 21, 12, 43);
+        rect(frame, centerX - 15, centerY - 17, 10, 35);
+        rect(frame, centerX + 5, centerY - 17, 10, 35);
         return;
     }
     line(frame, centerX - 15, centerY - 22, centerX - 15, centerY + 22);
@@ -688,7 +752,7 @@ void drawRecordButton(uint8_t *frame) {
 void drawRecorder(uint8_t *frame) {
     drawBack(frame);
     drawTagHeader(frame);
-    const uint32_t seconds = elapsedSeconds();
+    const uint32_t seconds = displayedRecordingSecond;
     char timer[20] = {};
     snprintf(timer, sizeof(timer), "%02lu:%02lu:%02lu",
              static_cast<unsigned long>(seconds / 3600),
@@ -756,6 +820,8 @@ void drawFiles(uint8_t *frame) {
 namespace RecordingPage {
 
 void setAudio(Es8311 *audio) { codec = audio; }
+
+void setTimerEventHandler(TimerEventHandler handler) { timerEventHandler = handler; }
 
 void open() {
     stopRecording();
@@ -975,14 +1041,15 @@ bool process() {
         marqueeOffset = 0;
         return true;
     }
-    if (view == View::Recorder && recordingActive) {
-        const uint32_t second = elapsedSeconds();
-        if (second != lastRenderedSecond) {
-            lastRenderedSecond = second;
-            return true;
-        }
-    }
     return false;
+}
+
+bool takeTimerEvent() {
+    if (view != View::Recorder || !recordingActive || recordingPaused) {
+        return false;
+    }
+    ++displayedRecordingSecond;
+    return true;
 }
 
 bool advanceMarquee(int16_t &rowTop) {

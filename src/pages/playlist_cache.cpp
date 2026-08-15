@@ -3,10 +3,12 @@
 #include <SD_MMC.h>
 
 #include "devices/sd_card/sd_card.h"
+#include "memory_budget.h"
 
 namespace {
 
-constexpr size_t MAX_PLAYLIST_BYTES = 128 * 1024;
+constexpr size_t MAX_PLAYLIST_BYTES = MemoryBudget::MAX_JSON_PAYLOAD;
+bool cacheEnabled = false;
 
 uint32_t endpointHash(const String &endpoint) {
     uint32_t hash = 2166136261UL;
@@ -40,14 +42,21 @@ bool cachePath(const char *folder, const String &endpoint, const char *slot,
 
 namespace PlaylistCache {
 
+void setEnabled(bool enabled) { cacheEnabled = enabled; }
+
+bool isEnabled() { return cacheEnabled; }
+
 bool load(const char *folder, const String &endpoint, const char *slot, String &payload) {
+    if (!cacheEnabled) return false;
     char path[128] = {};
     if (!cachePath(folder, endpoint, slot, path, sizeof(path))) return false;
     File file = SD_MMC.open(path, FILE_READ);
-    if (!file || file.size() == 0 || file.size() > MAX_PLAYLIST_BYTES) {
+    if (!file || file.size() == 0 || file.size() > MAX_PLAYLIST_BYTES ||
+        !MemoryBudget::canAllocate(static_cast<size_t>(file.size()))) {
         if (file) file.close();
         return false;
     }
+    payload.reserve(static_cast<unsigned>(file.size()));
     payload = file.readString();
     file.close();
     Serial.printf("[PLAYLIST CACHE] hit path=%s bytes=%u\n", path,
@@ -57,6 +66,7 @@ bool load(const char *folder, const String &endpoint, const char *slot, String &
 
 bool save(const char *folder, const String &endpoint, const char *slot,
           const String &payload) {
+    if (!cacheEnabled) return false;
     if (payload.isEmpty() || payload.length() > MAX_PLAYLIST_BYTES) return false;
     char path[128] = {};
     if (!cachePath(folder, endpoint, slot, path, sizeof(path))) return false;
