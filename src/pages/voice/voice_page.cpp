@@ -612,8 +612,23 @@ String contentHostBase() {
 String absoluteAudioUrl(const char *value) {
     String url(value ? value : "");
     url.trim();
-    if (url.startsWith("http://") || url.startsWith("https://")) return url;
     const String host = contentHostBase();
+    if (url.startsWith("http://") || url.startsWith("https://")) {
+        const int urlScheme = url.indexOf("://");
+        const int urlPath = url.indexOf('/', urlScheme + 3);
+        const String urlAuthority = url.substring(
+            urlScheme + 3, urlPath >= 0 ? urlPath : static_cast<int>(url.length()));
+        const int hostScheme = host.indexOf("://");
+        const String hostAuthority = host.substring(hostScheme + 3);
+        const String urlName = urlAuthority.substring(0, urlAuthority.indexOf(':') >= 0
+            ? urlAuthority.indexOf(':') : static_cast<int>(urlAuthority.length()));
+        const String hostName = hostAuthority.substring(0, hostAuthority.indexOf(':') >= 0
+            ? hostAuthority.indexOf(':') : static_cast<int>(hostAuthority.length()));
+        if (urlName == hostName && hostAuthority.indexOf(':') >= 0) {
+            return host + (urlPath >= 0 ? url.substring(urlPath) : String());
+        }
+        return url;
+    }
     if (url.startsWith("/")) return host + url;
     return host + "/" + url;
 }
