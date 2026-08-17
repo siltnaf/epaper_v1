@@ -3088,8 +3088,8 @@ void loop() {
     }
     if (RadioPage::advanceMarquee(marqueeTop) && currentPage == PageId::Radio) {
         RadioPage::renderMarquee(transitionFrame, frame);
-        epaper.displayPartial(frame, transitionFrame, 40, marqueeTop + 1, 132, 28);
-        copyFrameRegion(frame, transitionFrame, 40, marqueeTop + 1, 132, 28);
+        epaper.displayPartial(frame, transitionFrame, 40, marqueeTop + 1, 164, 28);
+        copyFrameRegion(frame, transitionFrame, 40, marqueeTop + 1, 164, 28);
         epaper.sleep();
     }
     updateNetworkPriority();

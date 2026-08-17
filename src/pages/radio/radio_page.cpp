@@ -3,15 +3,19 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <AudioFileSourceBuffer.h>
-#include <AudioFileSourceHTTPStream.h>
+#include <AudioFileSource.h>
 #include <AudioGeneratorMP3.h>
 #include <AudioOutput.h>
 #include <HTTPClient.h>
+#include <SD_MMC.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <esp_heap_caps.h>
 
+#include <cctype>
 #include <cstring>
+#include <cstdlib>
+#include <strings.h>
 
 #include "board_pins.h"
 #include "devices/audio/opus_player.h"
@@ -26,8 +30,17 @@
 namespace {
 
 constexpr uint8_t ITEMS_PER_PAGE = 10;
-constexpr uint16_t STREAM_BUFFER_BYTES = 2048;
-constexpr uint16_t PLAYBACK_TASK_STACK_BYTES = 4096;
+// The measured proxy stream is about 140 kbit/s. A two-second compressed prefix
+// is therefore roughly 35 KiB, which cannot coexist in internal RAM with the
+// 29 KiB MP3 workspace. Stage it on SD and retain a small RAM refill buffer.
+constexpr size_t STREAM_PREFETCH_BYTES = 36 * 1024;
+constexpr uint16_t STREAM_BUFFER_BYTES = 4 * 1024;
+constexpr char STREAM_PREFETCH_PATH[] = "/radio/.stream-prefetch.mp3";
+constexpr uint32_t STREAM_PREFETCH_TIMEOUT_MS = 30000;
+constexpr uint16_t PLAYBACK_TASK_STACK_BYTES = 5 * 1024;
+constexpr uint16_t PRODUCER_TASK_STACK_BYTES = 6 * 1024;
+static_assert(PRODUCER_TASK_STACK_BYTES % sizeof(StackType_t) == 0,
+              "Producer stack byte count must contain whole StackType_t words");
 constexpr int LIST_TOP = 82;
 constexpr int ROW_HEIGHT = 30;
 constexpr int ROW_GAP = 2;
@@ -36,13 +49,345 @@ constexpr int BUTTON_WIDTH = 34;
 constexpr int BUTTON_HEIGHT = 25;
 constexpr char RADIO_SD_FOLDER[] = "/radio";
 constexpr int MARQUEE_X = 40;
-constexpr int MARQUEE_WIDTH = 132;
+constexpr int MARQUEE_WIDTH = 164;
 constexpr int MARQUEE_HEIGHT = ROW_HEIGHT - 2;
 
 struct Station {
     char name[80] = {};
-    char codec[12] = {};
     char streamPath[320] = {};
+};
+
+StackType_t producerTaskStack[PRODUCER_TASK_STACK_BYTES / sizeof(StackType_t)] = {};
+StaticTask_t producerTaskBuffer = {};
+
+class RadioHttpSource final : public AudioFileSource {
+public:
+    bool open(const char *url) override {
+        close();
+        if (!url || std::strncmp(url, "http://", 7) != 0) return false;
+        const char *authority = url + 7;
+        const char *path = std::strchr(authority, '/');
+        const size_t authorityLength = path
+            ? static_cast<size_t>(path - authority) : std::strlen(authority);
+        if (authorityLength == 0 || authorityLength >= sizeof(host_)) return false;
+        std::memcpy(host_, authority, authorityLength);
+        host_[authorityLength] = '\0';
+        char *portSeparator = std::strrchr(host_, ':');
+        if (portSeparator) {
+            *portSeparator++ = '\0';
+            port_ = static_cast<uint16_t>(std::atoi(portSeparator));
+            if (port_ == 0) port_ = 80;
+        }
+        std::strncpy(path_, path ? path : "/", sizeof(path_) - 1);
+        path_[sizeof(path_) - 1] = '\0';
+        client_.setTimeout(2);
+        if (!client_.connect(host_, port_)) return false;
+        client_.printf("GET %s HTTP/1.1\r\nHost: %s\r\n"
+                       "User-Agent: ESP32-ePaper-Radio/1.0\r\n"
+                       "Accept: audio/mpeg\r\nConnection: close\r\n\r\n",
+                       path_, host_);
+        char line[160] = {};
+        if (!readLine(line, sizeof(line), 5000)) return close(), false;
+        int status = 0;
+        if (std::sscanf(line, "HTTP/%*s %d", &status) != 1 || status != 200) {
+            Serial.printf("[RADIO HTTP] status line=%s\n", line);
+            return close(), false;
+        }
+        while (readLine(line, sizeof(line), 5000)) {
+            if (!line[0]) break;
+            if (startsWithIgnoreCase(line, "Transfer-Encoding:") &&
+                containsIgnoreCase(line, "chunked")) chunked_ = true;
+            if (startsWithIgnoreCase(line, "Content-Length:")) {
+                contentLength_ = std::strtol(line + 15, nullptr, 10);
+            }
+        }
+        opened_ = true;
+        Serial.printf("[RADIO HTTP] connected host=%s port=%u chunked=%s length=%ld\n",
+                      host_, port_, chunked_ ? "yes" : "no",
+                      static_cast<long>(contentLength_));
+        return true;
+    }
+
+    uint32_t read(void *data, uint32_t len) override {
+        if (!opened_ || !data || len == 0) return 0;
+        uint8_t *output = static_cast<uint8_t *>(data);
+        uint32_t total = 0;
+        const uint32_t started = millis();
+        while (total < len && millis() - started < 5000) {
+            if (chunked_ && chunkRemaining_ == 0) {
+                if (chunkNeedsCrlf_ && !consumeCrlf()) break;
+                char line[32] = {};
+                if (!readLine(line, sizeof(line), 5000)) {
+                    readFailure_ = "chunk header timeout";
+                    break;
+                }
+                chunkRemaining_ = std::strtoul(line, nullptr, 16);
+                if (chunkRemaining_ == 0) {
+                    readFailure_ = "chunked stream ended";
+                    opened_ = false;
+                    break;
+                }
+                chunkNeedsCrlf_ = true;
+            }
+            const int available = client_.available();
+            if (available <= 0) {
+                if (!client_.connected()) {
+                    readFailure_ = "socket closed";
+                    opened_ = false;
+                    break;
+                }
+                vTaskDelay(1);
+                continue;
+            }
+            uint32_t requested = min<uint32_t>(len - total, static_cast<uint32_t>(available));
+            if (chunked_) requested = min<uint32_t>(requested, chunkRemaining_);
+            const int received = client_.read(output + total, requested);
+            if (received <= 0) {
+                readFailure_ = "socket read failed";
+                break;
+            }
+            total += received;
+            position_ += received;
+            if (chunked_) chunkRemaining_ -= received;
+        }
+        return total;
+    }
+
+    uint32_t readNonBlock(void *data, uint32_t len) override {
+        if (!opened_ || client_.available() <= 0) return 0;
+        return read(data, len);
+    }
+    bool close() override { client_.stop(); reset(); return true; }
+    bool isOpen() override { return opened_ && (client_.connected() || client_.available()); }
+    uint32_t getSize() override { return contentLength_ > 0 ? contentLength_ : 0; }
+    uint32_t getPos() override { return position_; }
+    const char *readFailure() const { return readFailure_; }
+
+private:
+    void reset() {
+        opened_ = false;
+        chunked_ = false;
+        chunkNeedsCrlf_ = false;
+        chunkRemaining_ = 0;
+        contentLength_ = -1;
+        position_ = 0;
+        readFailure_ = "";
+        port_ = 80;
+        host_[0] = '\0';
+        path_[0] = '\0';
+    }
+    bool readLine(char *line, size_t size, uint32_t timeoutMs) {
+        if (!line || size == 0) return false;
+        size_t used = 0;
+        const uint32_t started = millis();
+        while (millis() - started < timeoutMs) {
+            if (client_.available() <= 0) {
+                if (!client_.connected()) break;
+                vTaskDelay(1);
+                continue;
+            }
+            const int value = client_.read();
+            if (value < 0) continue;
+            if (value == '\n') { line[used] = '\0'; return true; }
+            if (value != '\r' && used + 1 < size) line[used++] = static_cast<char>(value);
+        }
+        line[used] = '\0';
+        return false;
+    }
+    bool consumeCrlf() {
+        char line[4] = {};
+        chunkNeedsCrlf_ = false;
+        return readLine(line, sizeof(line), 2000);
+    }
+    static bool startsWithIgnoreCase(const char *value, const char *prefix) {
+        while (*prefix) {
+            if (std::tolower(static_cast<unsigned char>(*value++)) !=
+                std::tolower(static_cast<unsigned char>(*prefix++))) return false;
+        }
+        return true;
+    }
+    static bool containsIgnoreCase(const char *value, const char *needle) {
+        const size_t needleLength = std::strlen(needle);
+        for (; *value; ++value) {
+            if (strncasecmp(value, needle, needleLength) == 0) return true;
+        }
+        return false;
+    }
+
+    WiFiClient client_;
+    char host_[96] = {};
+    char path_[384] = {};
+    uint16_t port_ = 80;
+    bool opened_ = false;
+    bool chunked_ = false;
+    bool chunkNeedsCrlf_ = false;
+    uint32_t chunkRemaining_ = 0;
+    int32_t contentLength_ = -1;
+    uint32_t position_ = 0;
+    const char *readFailure_ = "";
+};
+
+class RadioPrefetchSource final : public AudioFileSource {
+public:
+    explicit RadioPrefetchSource(AudioFileSource *network) : network_(network) {}
+
+    bool prefetch(const volatile bool *cancelRequested) {
+        cancelRequested_ = cancelRequested;
+        if (!network_ || !network_->isOpen() || SD_MMC.cardType() == CARD_NONE) return false;
+        if (!SD_MMC.exists(RADIO_SD_FOLDER) && !SD_MMC.mkdir(RADIO_SD_FOLDER)) return false;
+        SD_MMC.remove(STREAM_PREFETCH_PATH);
+        writer_ = SD_MMC.open(STREAM_PREFETCH_PATH, FILE_WRITE);
+        if (!writer_) return false;
+        uint8_t chunk[1024] = {};
+        const uint32_t started = millis();
+        while (prefetchedBytes_ < STREAM_PREFETCH_BYTES &&
+               millis() - started < STREAM_PREFETCH_TIMEOUT_MS &&
+               !(cancelRequested && *cancelRequested)) {
+            const size_t requested = min<size_t>(sizeof(chunk),
+                STREAM_PREFETCH_BYTES - prefetchedBytes_);
+            const uint32_t received = network_->read(chunk, requested);
+            if (received == 0 || writer_.write(chunk, received) != received) break;
+            prefetchedBytes_ += received;
+            producedBytes_ = prefetchedBytes_;
+            vTaskDelay(1);
+        }
+        writer_.flush();
+        writtenBytes_ = prefetchedBytes_;
+        lastFlushMs_ = millis();
+        const bool cancelled = cancelRequested && *cancelRequested;
+        Serial.printf("[RADIO PREFETCH] bytes=%u target=%u elapsed=%lums result=%s\n",
+                      static_cast<unsigned>(producedBytes_),
+                      static_cast<unsigned>(STREAM_PREFETCH_BYTES),
+                      static_cast<unsigned long>(millis() - started),
+                      cancelled ? "cancelled" :
+                      producedBytes_ >= STREAM_PREFETCH_BYTES ? "ok" : "partial");
+        if (cancelled || producedBytes_ < STREAM_PREFETCH_BYTES) {
+            Serial.printf("[RADIO PREFETCH] rejected partial cache bytes=%u target=%u "
+                          "http_reason=%s\n",
+                          static_cast<unsigned>(producedBytes_),
+                          static_cast<unsigned>(STREAM_PREFETCH_BYTES),
+                          network_ ? static_cast<RadioHttpSource *>(network_)->readFailure()
+                                   : "none");
+            writer_.close();
+            SD_MMC.remove(STREAM_PREFETCH_PATH);
+            return false;
+        }
+        producerRunning_ = true;
+        producerTaskHandle_ = xTaskCreateStaticPinnedToCore(
+            producerTaskThunk, "radio-fetch", PRODUCER_TASK_STACK_BYTES, this, 1,
+            producerTaskStack, &producerTaskBuffer, 1);
+        if (!producerTaskHandle_) {
+            producerRunning_ = false;
+            return false;
+        }
+        return true;
+    }
+
+    uint32_t read(void *data, uint32_t len) override {
+        if (!data || len == 0) return 0;
+        const uint32_t started = millis();
+        // AudioFileSourceBuffer treats a short source read as an underflow.
+        // Wait for the complete request while the SD producer is still able to
+        // extend the file, except when cancellation or a real stream end occurs.
+        while (producedBytes_ - consumedBytes_ < len && producerRunning_ &&
+               !(cancelRequested_ && *cancelRequested_) && millis() - started < 1000) {
+            vTaskDelay(1);
+        }
+        const size_t available = producedBytes_ > consumedBytes_
+            ? producedBytes_ - consumedBytes_ : 0;
+        if (available == 0) return 0;
+        if (!reader_) reader_ = SD_MMC.open(STREAM_PREFETCH_PATH, FILE_READ);
+        if (!reader_ || !reader_.seek(consumedBytes_)) return 0;
+        const uint32_t requested = min<uint32_t>(len, available);
+        const uint32_t received = reader_.read(static_cast<uint8_t *>(data), requested);
+        consumedBytes_ += received;
+        return received;
+    }
+
+    uint32_t readNonBlock(void *data, uint32_t len) override {
+        if (producedBytes_ <= consumedBytes_) return 0;
+        return read(data, len);
+    }
+
+    bool close() override {
+        producerRunning_ = false;
+        const uint32_t started = millis();
+        // RadioHttpSource::read can remain in its socket loop for two seconds.
+        // Do not destroy this source until the producer has left that call and
+        // stopped using this object and its File handles.
+        while (producerTaskHandle_ && millis() - started < 3000) vTaskDelay(1);
+        if (producerTaskHandle_) {
+            Serial.println("[RADIO PREFETCH] forcing producer shutdown after timeout");
+            vTaskDelete(producerTaskHandle_);
+            producerTaskHandle_ = nullptr;
+        }
+        if (reader_) reader_.close();
+        if (writer_) writer_.close();
+        const bool closed = network_ ? network_->close() : true;
+        SD_MMC.remove(STREAM_PREFETCH_PATH);
+        return closed;
+    }
+
+    bool isOpen() override {
+        return producedBytes_ > consumedBytes_ || producerRunning_;
+    }
+
+    uint32_t getSize() override { return 0; }
+    uint32_t getPos() override { return consumedBytes_; }
+    bool loop() override { return true; }
+
+    size_t leadBytes() const {
+        return producedBytes_ > consumedBytes_ ? producedBytes_ - consumedBytes_ : 0;
+    }
+
+private:
+    static void producerTaskThunk(void *context) {
+        static_cast<RadioPrefetchSource *>(context)->producerLoop();
+    }
+
+    void producerLoop() {
+        uint8_t chunk[1024] = {};
+        while (producerRunning_ && !(cancelRequested_ && *cancelRequested_)) {
+            if (writtenBytes_ > consumedBytes_ &&
+                writtenBytes_ - consumedBytes_ >= STREAM_PREFETCH_BYTES) {
+                vTaskDelay(pdMS_TO_TICKS(5));
+                continue;
+            }
+            const uint32_t received = network_->read(chunk, sizeof(chunk));
+            if (received == 0 || writer_.write(chunk, received) != received) {
+                vTaskDelay(1);
+                continue;
+            }
+            writtenBytes_ += received;
+            // Publish data to the reader only after it has been flushed. This
+            // reduces SD synchronization overhead while keeping file visibility
+            // and the advertised producer position consistent.
+            if (writtenBytes_ - producedBytes_ >= 4 * 1024 ||
+                millis() - lastFlushMs_ >= 50) {
+                writer_.flush();
+                producedBytes_ = writtenBytes_;
+                lastFlushMs_ = millis();
+            }
+            vTaskDelay(1);
+        }
+        writer_.flush();
+        producedBytes_ = writtenBytes_;
+        producerRunning_ = false;
+        producerTaskHandle_ = nullptr;
+        vTaskDelete(nullptr);
+    }
+
+    AudioFileSource *network_ = nullptr;
+    File reader_;
+    File writer_;
+    const volatile bool *cancelRequested_ = nullptr;
+    TaskHandle_t producerTaskHandle_ = nullptr;
+    volatile bool producerRunning_ = false;
+    size_t prefetchedBytes_ = 0;
+    size_t writtenBytes_ = 0;
+    volatile size_t producedBytes_ = 0;
+    volatile size_t consumedBytes_ = 0;
+    uint32_t lastFlushMs_ = 0;
 };
 
 class RadioAudioOutput final : public AudioOutput {
@@ -76,7 +421,9 @@ public:
         return (channels == 1 || channels == 2) && AudioOutput::SetChannels(channels);
     }
 
-    void resetQuota() { sourceFramesRemaining_ = 1024; }
+    // Keep decoder bursts short so the HTTP source and Wi-Fi tasks are serviced
+    // frequently instead of alternating between long decode and refill stalls.
+    void resetQuota() { sourceFramesRemaining_ = 384; }
 
     bool ConsumeSample(int16_t sample[2]) override {
         if (!active_ || sourceFramesRemaining_ == 0) return false;
@@ -145,7 +492,6 @@ int8_t selectedIndex = -1;
 int8_t activeIndex = -1;
 int8_t pendingIndex = -1;
 char contentBaseUrl[128] = "http://";
-char locatedCity[48] = {};
 char statusText[64] = {};
 Es8311 *codec = nullptr;
 
@@ -155,6 +501,7 @@ volatile bool playbackActive = false;
 volatile bool playbackEnded = false;
 char requestedUrl[384] = {};
 void *decoderWorkspace = nullptr;
+void *streamBufferWorkspace = nullptr;
 uint16_t marqueeOffset = 0;
 uint32_t nextMarqueeMs = 0;
 bool marqueeReady = false;
@@ -399,15 +746,12 @@ bool loadStations(uint16_t requestedOffset = 0) {
     const uint16_t responseOffset = document["offset"] | requestedOffset;
     const uint16_t responseTotal = document["total"] | 0;
     stationCount = 0;
-    locatedCity[0] = '\0';
     for (JsonObject item : document["radio"].as<JsonArray>()) {
         if (stationCount >= ITEMS_PER_PAGE) break;
         Station &station = stations[stationCount];
         station = Station();
         copyText(station.name, sizeof(station.name), item["name"] | "", "UNTITLED");
-        copyText(station.codec, sizeof(station.codec), item["codec"] | "MP3");
         copyText(station.streamPath, sizeof(station.streamPath), item["esp32_url"] | "");
-        if (!locatedCity[0]) copyText(locatedCity, sizeof(locatedCity), item["city"] | "");
         if (station.streamPath[0]) ++stationCount;
     }
     stationOffset = responseOffset;
@@ -428,6 +772,11 @@ void libraryLoadTask(void *) {
     vTaskDelete(nullptr);
 }
 
+void radioBufferStatus(void *, int code, const char *message) {
+    if (code != AudioFileSourceBuffer::STATUS_UNDERFLOW) return;
+    Serial.printf("[RADIO BUFFER] underflow %s\n", message ? message : "");
+}
+
 void playbackTask(void *) {
     pinMode(BoardPins::PA_EN, OUTPUT);
     digitalWrite(BoardPins::PA_EN, HIGH);
@@ -445,53 +794,97 @@ void playbackTask(void *) {
     };
 
     logMemory("before allocations");
-    AudioFileSourceHTTPStream *source = new AudioFileSourceHTTPStream();
+    constexpr size_t decoderBytes = AudioGeneratorMP3::preAllocSize();
+    decoderWorkspace = heap_caps_malloc(decoderBytes, MALLOC_CAP_8BIT);
+    AudioGeneratorMP3 *decoder = decoderWorkspace
+        ? new AudioGeneratorMP3(decoderWorkspace, decoderBytes) : nullptr;
+    Serial.printf("[RADIO] Decoder workspace bytes=%u allocation=%s heap=%u largest=%u\n",
+                  static_cast<unsigned>(decoderBytes), decoder ? "ok" : "failed",
+                  static_cast<unsigned>(ESP.getFreeHeap()),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+    RadioHttpSource *source = new RadioHttpSource();
+    RadioPrefetchSource *prefetchSource = nullptr;
     AudioFileSourceBuffer *buffer = nullptr;
-    AudioGeneratorMP3 *decoder = nullptr;
     RadioAudioOutput *output = new RadioAudioOutput(codec);
-    const bool objectsReady = source && output;
+    const bool objectsReady = decoder && source && output;
     logMemory(objectsReady ? "objects allocated" : "object allocation failed");
-    const bool httpOpen = objectsReady && source->open(requestedUrl);
-    logMemory(httpOpen ? "HTTP stream opened" : "HTTP stream open failed");
-    if (httpOpen) {
-        constexpr size_t decoderBytes = AudioGeneratorMP3::preAllocSize();
-        decoderWorkspace = heap_caps_malloc(decoderBytes, MALLOC_CAP_8BIT);
-        decoder = decoderWorkspace
-            ? new AudioGeneratorMP3(decoderWorkspace, decoderBytes) : nullptr;
-        Serial.printf("[RADIO] Decoder workspace bytes=%u allocation=%s heap=%u largest=%u\n",
-                      static_cast<unsigned>(decoderBytes), decoder ? "ok" : "failed",
-                      static_cast<unsigned>(ESP.getFreeHeap()),
-                      static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+    if (objectsReady) {
+        // Reserve every remaining heap-backed playback object before connecting.
+        // lwIP allocations would otherwise fragment the refill-sized block.
+        if (decoder) {
+            streamBufferWorkspace = heap_caps_malloc(STREAM_BUFFER_BYTES, MALLOC_CAP_8BIT);
+            Serial.printf("[RADIO BUFFER] reserve bytes=%u allocation=%s heap=%u largest=%u\n",
+                          static_cast<unsigned>(STREAM_BUFFER_BYTES),
+                          streamBufferWorkspace ? "ok" : "failed",
+                          static_cast<unsigned>(ESP.getFreeHeap()),
+                          static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+            if (streamBufferWorkspace) {
+                prefetchSource = new RadioPrefetchSource(source);
+                buffer = prefetchSource
+                    ? new AudioFileSourceBuffer(prefetchSource, streamBufferWorkspace,
+                                                STREAM_BUFFER_BYTES)
+                    : nullptr;
+                if (buffer) buffer->RegisterStatusCB(radioBufferStatus, nullptr);
+                Serial.printf("[RADIO BUFFER] wrappers preallocated prefetch=%s buffer=%s "
+                              "heap=%u largest=%u\n",
+                              prefetchSource ? "ok" : "failed",
+                              buffer ? "ok" : "failed",
+                              static_cast<unsigned>(ESP.getFreeHeap()),
+                              static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+            }
+        }
     }
-    bool bufferReady = false;
+    const bool heapReady = decoder && streamBufferWorkspace && prefetchSource && buffer;
+    const bool httpOpen = heapReady && source->open(requestedUrl);
+    logMemory(httpOpen ? "HTTP stream opened" : "HTTP stream open failed");
+    bool prefetchReady = false;
+    if (httpOpen) {
+        prefetchReady = prefetchSource->prefetch(&stopRequested);
+    }
+    const bool bufferReady = buffer != nullptr && streamBufferWorkspace != nullptr;
     bool decoderReady = false;
-    bool started = httpOpen && decoder;
+    bool started = httpOpen && prefetchReady && decoder && bufferReady;
     if (started) {
-        buffer = new AudioFileSourceBuffer(source, STREAM_BUFFER_BYTES);
-        bufferReady = buffer != nullptr;
         logMemory(bufferReady ? "stream buffer allocated" : "stream buffer allocation failed");
         decoderReady = bufferReady && decoder->begin(buffer, output);
         started = decoderReady;
         logMemory(decoderReady ? "MP3 decoder started" : "MP3 decoder begin failed");
     }
-    Serial.printf("[RADIO] Stream %s objects=%s http=%s buffer=%s decoder=%s url=%s\n",
+    Serial.printf("[RADIO] Stream %s objects=%s http=%s prefetch=%s buffer=%s decoder=%s url=%s\n",
                   started ? "started" : "failed", objectsReady ? "ok" : "failed",
-                  httpOpen ? "ok" : "failed", bufferReady ? "ok" : "failed",
+                  httpOpen ? "ok" : "failed", prefetchReady ? "ok" : "failed",
+                  bufferReady ? "ok" : "failed",
                   decoderReady ? "ok" : "failed", requestedUrl);
+    uint32_t nextBufferLogMs = millis() + 5000;
     while (started && !stopRequested && decoder->isRunning()) {
         output->resetQuota();
         if (!decoder->loop()) break;
+        if (buffer && millis() >= nextBufferLogMs) {
+            Serial.printf("[RADIO BUFFER] ram=%u/%u sd_lead=%u/%u heap=%u largest=%u\n",
+                          static_cast<unsigned>(buffer->getFillLevel()),
+                          static_cast<unsigned>(STREAM_BUFFER_BYTES),
+                          static_cast<unsigned>(prefetchSource ? prefetchSource->leadBytes() : 0),
+                          static_cast<unsigned>(STREAM_PREFETCH_BYTES),
+                          static_cast<unsigned>(ESP.getFreeHeap()),
+                          static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+            nextBufferLogMs = millis() + 5000;
+        }
         vTaskDelay(pdMS_TO_TICKS(1));
     }
     if (decoder && decoder->isRunning()) decoder->stop();
     if (buffer) buffer->close();
+    else if (prefetchSource) prefetchSource->close();
     else if (source) source->close();
     delete decoder;
     delete buffer;
+    delete prefetchSource;
     delete source;
     delete output;
+    free(streamBufferWorkspace);
+    streamBufferWorkspace = nullptr;
     free(decoderWorkspace);
     decoderWorkspace = nullptr;
+    streamBufferWorkspace = nullptr;
     digitalWrite(BoardPins::PA_EN, LOW);
     playbackActive = false;
     playbackEnded = !stopRequested;
@@ -501,7 +894,16 @@ void playbackTask(void *) {
 
 bool startStream(uint8_t index) {
     if (!codec || !codec->isInitialized() || index >= stationCount ||
-        playbackTaskHandle || playbackActive) return false;
+        playbackTaskHandle || playbackActive) {
+        Serial.printf("[RADIO] Start rejected codec=%s initialized=%s index=%u count=%u "
+                      "task=%p active=%s stop=%s\n",
+                      codec ? "yes" : "no",
+                      codec && codec->isInitialized() ? "yes" : "no",
+                      index, stationCount, playbackTaskHandle,
+                      playbackActive ? "yes" : "no",
+                      stopRequested ? "yes" : "no");
+        return false;
+    }
     OpusPlayer::stop();
     const String url = absoluteStreamUrl(stations[index].streamPath);
     copyText(requestedUrl, sizeof(requestedUrl), url.c_str());
@@ -509,7 +911,8 @@ bool startStream(uint8_t index) {
     stopRequested = false;
     playbackEnded = false;
     playbackActive = true;
-    if (xTaskCreatePinnedToCore(playbackTask, "radio-playback", PLAYBACK_TASK_STACK_BYTES, nullptr, 2,
+    if (xTaskCreatePinnedToCore(playbackTask, "radio-playback",
+                                PLAYBACK_TASK_STACK_BYTES, nullptr, 2,
                                 &playbackTaskHandle, 0) != pdPASS) {
         Serial.printf("[RADIO] Playback task creation failed stack=%u heap=%u largest=%u\n",
                       static_cast<unsigned>(PLAYBACK_TASK_STACK_BYTES),
@@ -542,7 +945,6 @@ void open() {
     activeIndex = -1;
     pendingIndex = -1;
     stationCount = 0;
-    locatedCity[0] = '\0';
     copyText(statusText, sizeof(statusText), UiLocalization::isChinese()
         ? "正在获取电台" : "LOADING RADIO");
     libraryLoadCompleted = false;
@@ -635,13 +1037,15 @@ bool process() {
         if (started) {
             activeIndex = index;
             selectedIndex = -1;
-            marqueeReady = false;
             marqueeOffset = 0;
         } else {
             selectedIndex = -1;
             activeIndex = -1;
         }
-        return true;
+        // The tap refresh already rendered the pending row as active and
+        // captured its SD-backed title glyphs. Avoid a second full-page render
+        // while the radio producer is writing the stream cache on SD.
+        return !started;
     }
     if (playbackEnded) {
         playbackEnded = false;
@@ -692,10 +1096,14 @@ void stop() {
     if (playbackTaskHandle || playbackActive) {
         stopRequested = true;
         const uint32_t started = millis();
-        // A stream read can remain inside WiFiClient until its socket timeout.
-        // Wait beyond that interval so switching stations cannot create two MP3
-        // tasks writing to the shared ES8311 I2S port at the same time.
-        while (playbackTaskHandle && millis() - started < 7000) vTaskDelay(pdMS_TO_TICKS(5));
+        // Prefetch observes stopRequested between each 1 KiB chunk. Retain a
+        // ceiling beyond the HTTP read timeout for a chunk already in progress.
+        while (playbackTaskHandle && millis() - started < 13000) {
+            vTaskDelay(pdMS_TO_TICKS(5));
+        }
+        Serial.printf("[RADIO] Stop cleanup elapsed=%lums task=%p active=%s\n",
+                      static_cast<unsigned long>(millis() - started),
+                      playbackTaskHandle, playbackActive ? "yes" : "no");
     }
     if (!playbackTaskHandle) playbackActive = false;
     activeIndex = -1;
@@ -706,14 +1114,7 @@ void stop() {
 
 void render(uint8_t *frame) {
     std::memset(frame, 0x00, XingtaiEpd::FRAME_BYTES);
-    char heading[96] = {};
-    if (locatedCity[0]) {
-        snprintf(heading, sizeof(heading), UiLocalization::isChinese()
-            ? "收音机 (%s)" : "RADIO (%s)", locatedCity);
-    } else {
-        copyText(heading, sizeof(heading), UiLocalization::isChinese() ? "收音机" : "RADIO");
-    }
-    drawCenteredTitle(frame, 34, 18, heading);
+    drawCenteredTitle(frame, 34, 18, UiLocalization::isChinese() ? "收音机" : "RADIO");
     rect(frame, 4, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT);
     drawDoubleArrow(frame, 21, PAGER_TOP + BUTTON_HEIGHT / 2, false);
     rect(frame, 42, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT);
@@ -737,14 +1138,16 @@ void render(uint8_t *frame) {
         char number[8] = {};
         snprintf(number, sizeof(number), "%u", stationOffset + index + 1);
         UiLocalization::drawText(frame, 18, top + 9, number);
-        drawTitle(frame, 40, top + 1, 132, ROW_HEIGHT - 2, stations[index].name);
-        UiLocalization::drawText(frame, 174, top + 9, stations[index].codec);
-        if (index == activeIndex && playbackActive) drawPlay(frame, 215, top + ROW_HEIGHT / 2);
+        drawTitle(frame, MARQUEE_X, top + 1, MARQUEE_WIDTH,
+                  ROW_HEIGHT - 2, stations[index].name);
+        const bool activeOrPending =
+            (index == activeIndex && playbackActive) || index == pendingIndex;
+        if (activeOrPending) drawPlay(frame, 215, top + ROW_HEIGHT / 2);
         else drawArrow(frame, 215, top + ROW_HEIGHT / 2, true);
         // Capture the normal black title glyphs before the active row is
         // inverted. The marquee renderer uses this mask to cut white letters
         // into a solid black strip during each scrolling partial refresh.
-        if (index == activeIndex && playbackActive && !marqueeReady) captureMarquee(frame, top);
+        if (activeOrPending && !marqueeReady) captureMarquee(frame, top);
         if (index == activeIndex || index == selectedIndex) invertRect(frame, 12, top, 216, ROW_HEIGHT);
     }
 }

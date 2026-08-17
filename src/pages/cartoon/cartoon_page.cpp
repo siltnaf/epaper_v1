@@ -35,6 +35,7 @@ constexpr char CARTOON_SD_FOLDER[] = "/cartoon-v4";
 constexpr int READER_TOP = 32;
 constexpr int READER_HEIGHT = XingtaiEpd::HEIGHT - READER_TOP;
 constexpr int READER_BACK_HEIGHT = 48;
+constexpr size_t MAX_CARTOON_LIST_BYTES = 64 * 1024;
 
 struct ListItem {
     char id[64] = {};
@@ -230,7 +231,7 @@ bool httpGetText(const String &url, String &payload, uint32_t timeout = 20000) {
         copyText(statusText, sizeof(statusText), "NETWORK NOT CONNECTED");
         return false;
     }
-    payload = static_cast<const char *>(nullptr);
+        payload = String();
     for (uint8_t attempt = 1; attempt <= 2; ++attempt) {
         HTTPClient http;
         WiFiClient client;
@@ -246,14 +247,55 @@ bool httpGetText(const String &url, String &payload, uint32_t timeout = 20000) {
         http.addHeader("Connection", "close");
         http.addHeader("User-Agent", "ESP32-ePaper-Cartoon/1.0");
         const int code = http.GET();
-        if (code >= 200 && code < 300) payload = http.getString();
         const int contentLength = http.getSize();
+            size_t receivedBytes = 0;
+            if (code >= 200 && code < 300) {
+                WiFiClient *stream = http.getStreamPtr();
+                const bool lengthKnown = contentLength >= 0;
+                const size_t expectedBytes = lengthKnown
+                    ? static_cast<size_t>(contentLength) : 0;
+                if (lengthKnown && expectedBytes <= MAX_CARTOON_LIST_BYTES) {
+                    payload.reserve(expectedBytes);
+                }
+                uint8_t buffer[1024] = {};
+                const uint32_t started = millis();
+                uint32_t lastDataMs = started;
+                while (millis() - started < timeout &&
+                       receivedBytes < MAX_CARTOON_LIST_BYTES &&
+                       (!lengthKnown || receivedBytes < expectedBytes)) {
+                    const int available = stream->available();
+                    if (available <= 0) {
+                        if (!stream->connected()) break;
+                        if (millis() - lastDataMs >= min<uint32_t>(timeout, 5000)) break;
+                        delay(2);
+                        continue;
+                    }
+                    size_t requested = min<size_t>(sizeof(buffer),
+                        static_cast<size_t>(available));
+                    if (lengthKnown) {
+                        requested = min<size_t>(requested, expectedBytes - receivedBytes);
+                    }
+                    const int count = stream->read(buffer, requested);
+                    if (count <= 0) {
+                        delay(2);
+                        continue;
+                    }
+                    payload.concat(reinterpret_cast<const char *>(buffer), count);
+                    receivedBytes += static_cast<size_t>(count);
+                    lastDataMs = millis();
+                }
+                const bool complete = lengthKnown
+                    ? receivedBytes == expectedBytes
+                    : receivedBytes > 0 && !stream->connected();
+                if (!complete && receivedBytes == 0) payload = String();
+            }
         const String error = code < 0 ? http.errorToString(code) : String();
         http.end();
         Serial.printf("[CARTOON API] GET attempt=%u/2 code=%d%s%s bytes=%u "
                       "content_length=%d heap=%u largest=%u url=%s\n",
                       attempt, code, error.isEmpty() ? "" : " ", error.c_str(),
-                      payload.length(), contentLength, static_cast<unsigned>(ESP.getFreeHeap()),
+                       static_cast<unsigned>(receivedBytes), contentLength,
+                       static_cast<unsigned>(ESP.getFreeHeap()),
                       static_cast<unsigned>(ESP.getMaxAllocHeap()), url.c_str());
         if (code >= 200 && code < 300 && !payload.isEmpty()) return true;
         if (code >= 0 || attempt == 2) break;
