@@ -223,6 +223,27 @@ bool Es8311::prepareRecording(uint8_t gainDb) {
            setMicrophoneGain(gainDb);
 }
 
+bool Es8311::preparePlayback() {
+    if (!_initialized) return false;
+    // Recording changes the ES8311 ADC path and can leave the DAC output muted
+    // after a page transition. Restore the DAC/I2S path before radio or cached
+    // Opus playback starts, without resetting the I2S driver.
+    const RegisterValue sequence[] = {
+        {REG_SDP_IN, 0x0C},
+        {REG_SDP_OUT, 0x0C},
+        {REG_SYSTEM_0D, 0x01},
+        {REG_SYSTEM_0E, 0x02},
+        {REG_SYSTEM_12, 0x00},
+        {REG_SYSTEM_13, 0x10},
+        {REG_DAC_31, 0x00},
+        {REG_DAC_33, 0x10},
+        {REG_DAC_34, 0x10},
+        {REG_DAC_35, 0x00},
+        {REG_DAC_37, 0x08},
+    };
+    return writeSequence(sequence, sizeof(sequence) / sizeof(sequence[0]));
+}
+
 void Es8311::setSpeakerEnabled(bool enabled) {
     if (_pins.paEnable < 0) return;
     digitalWrite(_pins.paEnable, enabled ? HIGH : LOW);

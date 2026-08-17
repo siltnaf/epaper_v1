@@ -884,7 +884,6 @@ void openLibrary() {
     bookTotal = 0;
     libraryLoadCompleted = false;
     libraryAwaitingContent = true;
-    if (loadLibrary(false, false, true)) libraryAwaitingContent = false;
 }
 
 bool startLibraryLoad() {

@@ -126,7 +126,13 @@ retry:
 
   if (!nonBlock) {
     int start = millis();
-    while ((stream->available() < (int)len) && (millis() - start < 500)) yield();
+    while ((stream->available() < (int)len) && (millis() - start < 500)) {
+#ifdef ESP32
+      vTaskDelay(1);
+#else
+      yield();
+#endif
+    }
   }
 
   size_t avail = stream->available();

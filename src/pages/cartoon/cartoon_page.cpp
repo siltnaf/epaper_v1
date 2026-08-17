@@ -29,7 +29,12 @@ constexpr int ROW_GAP = 2;
 constexpr int PAGER_TOP = 52;
 constexpr int BUTTON_WIDTH = 34;
 constexpr int BUTTON_HEIGHT = 25;
-constexpr char CARTOON_SD_FOLDER[] = "/cartoon";
+// Version the cache when server-side image preprocessing changes so stale
+// progressive or non-dithered JPEGs are not reused indefinitely.
+constexpr char CARTOON_SD_FOLDER[] = "/cartoon-v4";
+constexpr int READER_TOP = 32;
+constexpr int READER_HEIGHT = XingtaiEpd::HEIGHT - READER_TOP;
+constexpr int READER_BACK_HEIGHT = 48;
 
 struct ListItem {
     char id[64] = {};
@@ -78,6 +83,7 @@ bool ensureCacheDirectory(const char *slug, const char *chapterId = nullptr);
 bool loadChapterRowsFromSd(const char *slug);
 bool loadSavedCartoonsFromSd();
 bool loadSavedChapterPageFromSd(const char *slug, int32_t requestedOffset);
+bool parseChapterObject(const String &object, uint16_t firstVisible);
 void saveCartoonTitleToSd(const char *slug, const char *title);
 void saveChapterTitleToSd(const char *slug, const char *chapterId, const char *title);
 void safePathComponent(const char *value, char *output, size_t outputSize);
@@ -241,19 +247,127 @@ bool httpGetText(const String &url, String &payload, uint32_t timeout = 20000) {
         http.addHeader("User-Agent", "ESP32-ePaper-Cartoon/1.0");
         const int code = http.GET();
         if (code >= 200 && code < 300) payload = http.getString();
+        const int contentLength = http.getSize();
         const String error = code < 0 ? http.errorToString(code) : String();
         http.end();
         Serial.printf("[CARTOON API] GET attempt=%u/2 code=%d%s%s bytes=%u "
-                      "heap=%u largest=%u url=%s\n",
+                      "content_length=%d heap=%u largest=%u url=%s\n",
                       attempt, code, error.isEmpty() ? "" : " ", error.c_str(),
-                      payload.length(), static_cast<unsigned>(ESP.getFreeHeap()),
+                      payload.length(), contentLength, static_cast<unsigned>(ESP.getFreeHeap()),
                       static_cast<unsigned>(ESP.getMaxAllocHeap()), url.c_str());
-        if (code >= 200 && code < 300) return true;
+        if (code >= 200 && code < 300 && !payload.isEmpty()) return true;
         if (code >= 0 || attempt == 2) break;
         delay(350);
     }
     copyText(statusText, sizeof(statusText), "CARTOON NETWORK ERROR");
     return false;
+}
+
+// The chapter endpoint currently returns the complete chapter array even when
+// limit/offset are supplied.  That response can exceed the largest available
+// heap block, so do not use HTTPClient::getString() here.  Keep only one JSON
+// object at a time and retain the requested page of rows.
+bool httpGetChapterStream(const String &url, uint16_t firstVisible, uint32_t timeout) {
+    UiLoadingIndicator::Scope loading;
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    HTTPClient http;
+    WiFiClient client;
+    http.setConnectTimeout(10000);
+    http.setTimeout(min<uint32_t>(timeout, 65000));
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    http.setReuse(false);
+    client.setTimeout((timeout + 999) / 1000);
+    if (!http.begin(client, url)) {
+        copyText(statusText, sizeof(statusText), "INVALID CARTOON URL");
+        return false;
+    }
+    http.addHeader("Connection", "close");
+    http.addHeader("User-Agent", "ESP32-ePaper-Cartoon/1.0");
+    const int code = http.GET();
+    const int contentLength = http.getSize();
+    bool parsed = false;
+    chapterRowCount = 0;
+    chapterTotal = 0;
+    if (code >= 200 && code < 300) {
+        WiFiClient *stream = http.getStreamPtr();
+        String marker;
+        String object;
+        bool chaptersKeyFound = false;
+        bool inArray = false;
+        bool inObject = false;
+        bool inString = false;
+        bool escaped = false;
+        uint16_t depth = 0;
+        const uint32_t started = millis();
+        while (millis() - started < timeout) {
+            if (stream->available() <= 0) {
+                if (!stream->connected()) break;
+                delay(2);
+                continue;
+            }
+            const char character = static_cast<char>(stream->read());
+            if (!inArray) {
+                if (!chaptersKeyFound) {
+                    marker += character;
+                    if (marker.length() > 12) marker.remove(0, marker.length() - 12);
+                    chaptersKeyFound = marker.endsWith("\"chapters\"");
+                } else if (character == '[') {
+                    inArray = true;
+                }
+                continue;
+            }
+            if (!inObject) {
+                if (character == ']') {
+                    parsed = true;
+                    break;
+                }
+                if (character == '{') {
+                    inObject = true;
+                    depth = 1;
+                    object = "{";
+                    inString = false;
+                    escaped = false;
+                }
+                continue;
+            }
+            object += character;
+            if (inString) {
+                if (escaped) escaped = false;
+                else if (character == '\\') escaped = true;
+                else if (character == '"') inString = false;
+            } else if (character == '"') {
+                inString = true;
+            } else if (character == '{') {
+                ++depth;
+            } else if (character == '}' && depth > 0 && --depth == 0) {
+                parseChapterObject(object, firstVisible);
+                inObject = false;
+                object = "";
+                // The current server ignores limit/offset and continues with
+                // the complete chapter array. Stop after this page instead of
+                // reading the remaining potentially very large response.
+                if (chapterTotal >= firstVisible + ROWS_PER_PAGE) {
+                    parsed = true;
+                    break;
+                }
+            }
+        }
+        if (parsed) {
+            chapterOffset = firstVisible;
+            chapterHasMore = chapterRowCount == ROWS_PER_PAGE;
+            chapterTotal = firstVisible + chapterRowCount + (chapterHasMore ? 1 : 0);
+            chapterPage = max<uint16_t>(1, firstVisible / ROWS_PER_PAGE + 1);
+        }
+    }
+    const String error = code < 0 ? http.errorToString(code) : String();
+    http.end();
+    Serial.printf("[CARTOON API] stream code=%d%s%s content_length=%d chapters=%u visible=%u "
+                  "heap=%u largest=%u url=%s\n",
+                  code, error.isEmpty() ? "" : " ", error.c_str(), contentLength,
+                  chapterTotal, chapterRowCount, static_cast<unsigned>(ESP.getFreeHeap()),
+                  static_cast<unsigned>(ESP.getMaxAllocHeap()), url.c_str());
+    return parsed && chapterRowCount > 0;
 }
 
 bool loadCartoons(int32_t requestedOffset, bool forceRemote = false,
@@ -459,9 +573,18 @@ bool loadChapterPageFromApi(const char *slug, int32_t requestedOffset) {
     const String url = endpoint + "?limit=" + String(ROWS_PER_PAGE) +
                        "&offset=" + String(requestedOffset);
     if (!loaded) {
-        loaded = httpGetText(url, payload, 30000);
-        if (loaded) PlaylistCache::save(
-            CARTOON_SD_FOLDER, endpoint, cacheSlot, payload);
+        const uint16_t firstVisible = static_cast<uint16_t>(
+            requestedOffset < 0 ? 0 : requestedOffset);
+        if (WiFi.status() == WL_CONNECTED &&
+            httpGetChapterStream(url, firstVisible, 30000)) {
+            copyText(statusText, sizeof(statusText), "");
+            return true;
+        }
+        if (WiFi.status() != WL_CONNECTED) {
+            loaded = httpGetText(url, payload, 30000);
+            if (loaded) PlaylistCache::save(
+                CARTOON_SD_FOLDER, endpoint, cacheSlot, payload);
+        }
     }
     if (!loaded) {
         if (requestedOffset >= 0) {
@@ -739,12 +862,13 @@ bool drawProgressiveGrayscalePreview(uint8_t *frame, const char *path,
                 !quantDc[quantTableId]) break;
 
             outputScale = 1;
-            while ((sourceWidth / outputScale > 240 || sourceHeight / outputScale > 300) &&
+            while ((sourceWidth / outputScale > XingtaiEpd::WIDTH ||
+                    sourceHeight / outputScale > READER_HEIGHT) &&
                    outputScale < 8) outputScale <<= 1;
             const int outputWidth = max<int>(1, sourceWidth / outputScale);
             const int outputHeight = max<int>(1, sourceHeight / outputScale);
             const int drawX = max(0, (XingtaiEpd::WIDTH - outputWidth) / 2);
-            const int drawY = 76 + max(0, (300 - outputHeight) / 2);
+            const int drawY = READER_TOP + max(0, (READER_HEIGHT - outputHeight) / 2);
             const uint16_t blockColumns = (sourceWidth + 7) / 8;
             const uint16_t blockRows = (sourceHeight + 7) / 8;
             JpegBitReader bits(file);
@@ -1277,22 +1401,21 @@ void renderList(uint8_t *frame, const ListItem *items, uint8_t count,
 }
 
 void renderReader(uint8_t *frame) {
-    rect(frame, 8, 38, 50, 26);
-    if (UiLocalization::isChinese()) drawTitle(frame, 12, 39, 42, 24, "返回");
-    else UiLocalization::drawText(frame, 14, 47, "RETURN");
-    drawTitle(frame, 66, 39, 164, 24, selectedChapterTitle);
-    line(frame, 8, 72, 231, 72);
     if (imageReady && jpegSize && SD_MMC.exists(readerJpegPath) &&
         MemoryBudget::canAllocate(4 * 1024)) {
         uint16_t sourceWidth = 0, sourceHeight = 0;
         const JRESULT sizeResult = TJpgDec.getFsJpgSize(
             &sourceWidth, &sourceHeight, readerJpegPath, SD_MMC);
         if (sizeResult == JDR_OK) {
-            const uint8_t scale = sourceWidth > 240 || sourceHeight > 300 ? 2 : 1;
+            uint8_t scale = 1;
+            while ((sourceWidth / scale > XingtaiEpd::WIDTH ||
+                    sourceHeight / scale > READER_HEIGHT) && scale < 8) {
+                scale <<= 1;
+            }
             const int imageWidth = sourceWidth / scale;
             const int imageHeight = sourceHeight / scale;
             const int drawX = max(0, (XingtaiEpd::WIDTH - imageWidth) / 2);
-            const int drawY = 76 + max(0, (300 - imageHeight) / 2);
+            const int drawY = READER_TOP + max(0, (READER_HEIGHT - imageHeight) / 2);
             decodeFrame = frame;
             TJpgDec.setSwapBytes(false);
             TJpgDec.setJpgScale(scale);
@@ -1313,22 +1436,15 @@ void renderReader(uint8_t *frame) {
                           previewReady ? "ok" : "failed", sourceWidth, sourceHeight,
                           previewScale, static_cast<unsigned>(jpegSize));
             if (!previewReady)
-                UiLocalization::drawCentered(frame, 210, "UNSUPPORTED JPEG");
+                UiLocalization::drawCentered(frame, 204, "UNSUPPORTED JPEG");
         } else {
             Serial.printf("[CARTOON JPEG] Decode failed size_result=%d file=%u\n",
                           static_cast<int>(sizeResult), static_cast<unsigned>(jpegSize));
-            UiLocalization::drawCentered(frame, 210, "JPEG DECODE FAILED");
+            UiLocalization::drawCentered(frame, 204, "JPEG DECODE FAILED");
         }
     } else {
-        UiLocalization::drawCentered(frame, 210, statusText);
+        UiLocalization::drawCentered(frame, 204, statusText);
     }
-    rect(frame, 8, 386, 34, 24);
-    drawArrow(frame, 25, 398, false);
-    rect(frame, 198, 386, 34, 24);
-    drawArrow(frame, 215, 398, true);
-    char counter[20] = {};
-    snprintf(counter, sizeof(counter), "%u/%u", readerPage, readerPageTotal);
-    UiLocalization::drawCentered(frame, 394, counter);
 }
 
 } // namespace
@@ -1354,8 +1470,10 @@ void open() {
     cartoonCount = 0;
     cartoonTotal = 0;
     libraryLoadCompleted = false;
-    loadCartoons(0, false, true);
+    copyText(statusText, sizeof(statusText), "LOADING CARTOONS");
 }
+
+bool isReader() { return view == View::Reader; }
 
 bool startLibraryLoad() {
     if (libraryLoadRunning) return false;
@@ -1380,16 +1498,27 @@ bool takeLibraryLoadCompleted() {
 bool controlBoundsAt(int16_t x, int16_t y, int16_t &left, int16_t &top,
                      int16_t &width, int16_t &height) {
     if (view == View::Reader) {
-        if (inRect(x, y, 0, 32, 70, 42)) {
-            left = 8; top = 38; width = 50; height = 26;
+        if (inRect(x, y, 0, READER_TOP, XingtaiEpd::WIDTH, READER_BACK_HEIGHT)) {
+            left = 0; top = READER_TOP; width = XingtaiEpd::WIDTH;
+            height = READER_BACK_HEIGHT;
             return true;
         }
-        if (readerPage > 1 && inRect(x, y, 0, 374, 60, 42)) {
-            left = 8; top = 386; width = 34; height = 24;
+        if (readerPage > 1 && inRect(x, y, 0, READER_TOP + READER_BACK_HEIGHT,
+                                     XingtaiEpd::WIDTH / 2,
+                                     READER_HEIGHT - READER_BACK_HEIGHT)) {
+            left = 0; top = READER_TOP + READER_BACK_HEIGHT;
+            width = XingtaiEpd::WIDTH / 2;
+            height = READER_HEIGHT - READER_BACK_HEIGHT;
             return true;
         }
-        if (readerPage < readerPageTotal && inRect(x, y, 180, 374, 60, 42)) {
-            left = 198; top = 386; width = 34; height = 24;
+        if (readerPage < readerPageTotal &&
+            inRect(x, y, XingtaiEpd::WIDTH / 2, READER_TOP + READER_BACK_HEIGHT,
+                   XingtaiEpd::WIDTH / 2,
+                   READER_HEIGHT - READER_BACK_HEIGHT)) {
+            left = XingtaiEpd::WIDTH / 2;
+            top = READER_TOP + READER_BACK_HEIGHT;
+            width = XingtaiEpd::WIDTH / 2;
+            height = READER_HEIGHT - READER_BACK_HEIGHT;
             return true;
         }
         return false;
@@ -1440,7 +1569,7 @@ bool rowBoundsAt(int16_t x, int16_t y, int16_t &left, int16_t &top,
 bool handleTap(int16_t x, int16_t y) {
     refreshMode = RefreshMode::Layout;
     if (view == View::Reader) {
-        if (inRect(x, y, 0, 32, 70, 42)) {
+        if (inRect(x, y, 0, READER_TOP, XingtaiEpd::WIDTH, READER_BACK_HEIGHT)) {
             view = View::Chapters;
             imageReady = false;
             jpegSize = 0;
@@ -1458,13 +1587,18 @@ bool handleTap(int16_t x, int16_t y) {
             }
             return true;
         }
-        if (inRect(x, y, 0, 374, 60, 42) && readerPage > 1) {
+        if (inRect(x, y, 0, READER_TOP + READER_BACK_HEIGHT,
+                   XingtaiEpd::WIDTH / 2, READER_HEIGHT - READER_BACK_HEIGHT) &&
+            readerPage > 1) {
             --readerPage;
             loadReaderPage();
             refreshMode = RefreshMode::ImageContent;
             return true;
         }
-        if (inRect(x, y, 180, 374, 60, 42) && readerPage < readerPageTotal) {
+        if (inRect(x, y, XingtaiEpd::WIDTH / 2, READER_TOP + READER_BACK_HEIGHT,
+                   XingtaiEpd::WIDTH / 2,
+                   READER_HEIGHT - READER_BACK_HEIGHT) &&
+            readerPage < readerPageTotal) {
             ++readerPage;
             loadReaderPage();
             refreshMode = RefreshMode::ImageContent;

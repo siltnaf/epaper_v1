@@ -573,6 +573,8 @@ bool loadPage(bool showLoading = true) {
 
 void libraryLoadTask(void *) {
     loadPage(false);
+    Serial.printf("[WORD] Library worker stack_free=%u\n",
+                  static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
     libraryAwaitingContent = false;
     libraryLoadRunning = false;
     libraryLoadCompleted = true;
@@ -955,7 +957,9 @@ bool startLibraryLoad() {
     if (libraryLoadRunning) return false;
     libraryLoadRunning = true;
     libraryLoadCompleted = false;
-    if (xTaskCreate(libraryLoadTask, "word-library", 4096, nullptr, 1, nullptr) != pdPASS) {
+    constexpr uint32_t WORD_LIBRARY_STACK_BYTES = 8 * 1024;
+    if (xTaskCreatePinnedToCore(libraryLoadTask, "word-library",
+                                WORD_LIBRARY_STACK_BYTES, nullptr, 1, nullptr, 1) != pdPASS) {
         libraryLoadRunning = false;
         libraryAwaitingContent = false;
         std::strcpy(statusText, "WORD TASK FAILED");

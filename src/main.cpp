@@ -71,16 +71,17 @@ struct TouchAction {
 
 static uint8_t frame[XingtaiEpd::FRAME_BYTES];
 static uint8_t transitionFrame[XingtaiEpd::FRAME_BYTES];
-static uint8_t whiteFrame[XingtaiEpd::FRAME_BYTES] = {};
-static uint8_t calculatorRefreshFrame[XingtaiEpd::FRAME_BYTES];
+static uint8_t *calculatorRefreshFrame = nullptr;
 Preferences touchPreferences;
 Preferences settingsPreferences;
 Preferences wifiPreferences;
 bool calibrationActive = false;
 uint8_t calibrationCount = 0;
-TPoint calibrationRaw[3] = {};
-constexpr int16_t calibrationTargetX[3] = {20, 220, 120};
-constexpr int16_t calibrationTargetY[3] = {40, 40, 380};
+TPoint calibrationRaw[4] = {};
+// Keep the targets a few pixels inside the physical edges so the crosshair is
+// fully visible and the user can touch its center without hitting the bezel.
+constexpr int16_t calibrationTargetX[4] = {20, 220, 220, 20};
+constexpr int16_t calibrationTargetY[4] = {40, 40, 376, 376};
 constexpr float defaultTouchTransform[6] = {
     static_cast<float>(XingtaiEpd::WIDTH - 1) / 299.0f, 0.0f, 0.0f,
     0.0f, static_cast<float>(XingtaiEpd::HEIGHT - 1) / 479.0f, 0.0f,
@@ -772,8 +773,8 @@ void wipeContentAreaWhite(bool sleepAfter) {
     constexpr uint16_t topBarHeight = 32;
     constexpr size_t topBarBytes = static_cast<size_t>(topBarHeight) *
                                    (XingtaiEpd::WIDTH / 8);
-    epaper.displayPartial(frame, whiteFrame, 0, 32,
-                          XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT - 32);
+    epaper.displayPartialFill(frame, 0x00, 0, 32,
+                              XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT - 32);
     // Keep software state synchronized with the physical white pre-drive so
     // the following partial update compares against the panel's actual pixels.
     std::memset(frame + topBarBytes, 0x00,
@@ -801,6 +802,8 @@ void calculatorRefreshTask(void *) {
     copyFrameRegion(frame, calculatorRefreshFrame, displayX, displayY,
                     displayWidth, displayHeight);
     epaper.sleep();
+    free(calculatorRefreshFrame);
+    calculatorRefreshFrame = nullptr;
     calculatorRefreshRunning = false;
     vTaskDelete(nullptr);
 }
@@ -812,12 +815,22 @@ void startCalculatorRefresh() {
     }
 
     calculatorRefreshPending = false;
+    calculatorRefreshFrame = static_cast<uint8_t *>(malloc(XingtaiEpd::FRAME_BYTES));
+    if (!calculatorRefreshFrame) {
+        calculatorRefreshPending = true;
+        Serial.printf("[CALCULATOR] Refresh buffer allocation failed; free_heap=%u largest_block=%u\n",
+                      static_cast<unsigned>(ESP.getFreeHeap()),
+                      static_cast<unsigned>(ESP.getMaxAllocHeap()));
+        return;
+    }
     CalculatorPage::render(calculatorRefreshFrame);
     calculatorRefreshRunning = true;
     if (xTaskCreate(calculatorRefreshTask, "calculator-epd", 4096,
                     nullptr, 1, nullptr) != pdPASS) {
         calculatorRefreshRunning = false;
         calculatorRefreshPending = true;
+        free(calculatorRefreshFrame);
+        calculatorRefreshFrame = nullptr;
         Serial.printf("[CALCULATOR] Display worker start failed; free_heap=%u largest_block=%u\n",
                       static_cast<unsigned>(ESP.getFreeHeap()),
                       static_cast<unsigned>(ESP.getMaxAllocHeap()));
@@ -825,6 +838,23 @@ void startCalculatorRefresh() {
 }
 
 void refreshCartoonLayout() {
+    if (CartoonPage::isReader()) {
+        CartoonPage::render(transitionFrame);
+        constexpr uint16_t contentTop = 32;
+        constexpr size_t topBarBytes = static_cast<size_t>(contentTop) *
+                                       (XingtaiEpd::WIDTH / 8);
+        std::memcpy(transitionFrame, frame, topBarBytes);
+        epaper.displayPartialFill(frame, 0x00, 0, contentTop,
+                                  XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT - contentTop);
+        std::memset(frame + topBarBytes, 0x00,
+                    XingtaiEpd::FRAME_BYTES - topBarBytes);
+        epaper.sleep();
+        epaper.displayPartial(frame, transitionFrame, 0, contentTop,
+                              XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT - contentTop);
+        std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+        epaper.sleep();
+        return;
+    }
     // Cartoon playlist, chapter list, and reader use different controls and
     // borders. White-drive their complete shared layout area before drawing the
     // destination view so no rows or image pixels remain underneath it. Keep
@@ -838,13 +868,16 @@ void refreshCartoonLayout() {
     constexpr uint16_t contentHeight = contentBottom - contentY;
 
     CartoonPage::render(transitionFrame);
-    copyFrameRegion(transitionFrame, frame, 0, 0,
-                    XingtaiEpd::WIDTH, contentY);
+    clearFrameRegion(transitionFrame, 0, 0, XingtaiEpd::WIDTH, contentY);
+    Topbar::drawHome(transitionFrame, 4, 2);
+    if (WiFi.status() == WL_CONNECTED) Topbar::drawWifi(transitionFrame, 181, 2);
+    else if (cellularModem.isConnected()) Topbar::draw4G(transitionFrame, 184, 2);
+    Topbar::drawBattery(transitionFrame, 209, 2);
     copyFrameRegion(transitionFrame, frame, 0, contentBottom,
                     XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT - contentBottom);
 
-    epaper.displayPartial(frame, whiteFrame, contentX, contentY,
-                          contentWidth, contentHeight);
+    epaper.displayPartialFill(frame, 0x00, contentX, contentY,
+                              contentWidth, contentHeight);
     clearFrameRegion(frame, contentX, contentY, contentWidth, contentHeight);
     epaper.sleep();
     epaper.displayPartial(frame, transitionFrame, contentX, contentY,
@@ -866,8 +899,8 @@ void refreshCartoonListContent(int controlLeft, int controlTop,
     constexpr uint16_t counterHeight = 20;
 
     CartoonPage::render(transitionFrame);
-    epaper.displayPartial(frame, whiteFrame, contentX, contentY,
-                          contentWidth, contentHeight);
+    epaper.displayPartialFill(frame, 0x00, contentX, contentY,
+                              contentWidth, contentHeight);
     clearFrameRegion(frame, contentX, contentY, contentWidth, contentHeight);
     epaper.sleep();
     epaper.displayPartial(frame, transitionFrame, contentX, contentY,
@@ -890,28 +923,19 @@ void refreshCartoonListContent(int controlLeft, int controlTop,
 }
 
 void refreshCartoonImageContent() {
-    constexpr uint16_t contentX = 0;
-    constexpr uint16_t contentY = 76;
-    constexpr uint16_t contentWidth = XingtaiEpd::WIDTH;
-    constexpr uint16_t contentHeight = 300;
-    constexpr uint16_t counterX = 50;
-    constexpr uint16_t counterY = 390;
-    constexpr uint16_t counterWidth = 140;
-    constexpr uint16_t counterHeight = 18;
-
+    constexpr uint16_t contentTop = 32;
+    constexpr size_t topBarBytes = static_cast<size_t>(contentTop) *
+                                   (XingtaiEpd::WIDTH / 8);
     CartoonPage::render(transitionFrame);
-    epaper.displayPartial(frame, whiteFrame, contentX, contentY,
-                          contentWidth, contentHeight);
-    clearFrameRegion(frame, contentX, contentY, contentWidth, contentHeight);
+    std::memcpy(transitionFrame, frame, topBarBytes);
+    epaper.displayPartialFill(frame, 0x00, 0, contentTop,
+                              XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT - contentTop);
+    std::memset(frame + topBarBytes, 0x00,
+                XingtaiEpd::FRAME_BYTES - topBarBytes);
     epaper.sleep();
-    epaper.displayPartial(frame, transitionFrame, contentX, contentY,
-                          contentWidth, contentHeight);
-    epaper.displayPartial(frame, transitionFrame, counterX, counterY,
-                          counterWidth, counterHeight);
-    copyFrameRegion(frame, transitionFrame, contentX, contentY,
-                    contentWidth, contentHeight);
-    copyFrameRegion(frame, transitionFrame, counterX, counterY,
-                    counterWidth, counterHeight);
+    epaper.displayPartial(frame, transitionFrame, 0, contentTop,
+                          XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT - contentTop);
+    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
     epaper.sleep();
 }
 
@@ -926,8 +950,8 @@ void refreshBookReaderContent() {
     constexpr uint16_t counterWidth = 140;
     constexpr uint16_t counterHeight = 18;
     BookPage::render(transitionFrame);
-    epaper.displayPartial(frame, whiteFrame, contentX, contentY,
-                          contentWidth, contentHeight);
+    epaper.displayPartialFill(frame, 0x00, contentX, contentY,
+                              contentWidth, contentHeight);
     clearFrameRegion(frame, contentX, contentY, contentWidth, contentHeight);
     epaper.sleep();
     epaper.displayPartial(frame, transitionFrame, contentX, contentY,
@@ -949,8 +973,8 @@ void openLocalBookReaderFast() {
 
     // The first partial refresh powers the UC8253 off, so the black reader phase
     // must perform a normal initialized refresh or its pigment is not driven.
-    epaper.displayPartial(frame, whiteFrame, 0, contentTop,
-                          XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT - contentTop);
+    epaper.displayPartialFill(frame, 0x00, 0, contentTop,
+                              XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT - contentTop);
     std::memset(frame + topBarBytes, 0x00,
                 XingtaiEpd::FRAME_BYTES - topBarBytes);
     delay(whiteSettleMs);
@@ -1067,6 +1091,7 @@ void startOpeningLibraryLoad(PageId page) {
     case PageId::Poem: started = PoemPage::startLibraryLoad(); break;
     case PageId::Word: started = WordPage::startLibraryLoad(); break;
     case PageId::Cartoon: started = CartoonPage::startLibraryLoad(); break;
+    case PageId::Radio: started = RadioPage::startLibraryLoad(); break;
     default: return;
     }
     openingLoadPage = page;
@@ -1091,6 +1116,7 @@ void processOpeningLibraryLoads() {
         {PageId::Poem, PoemPage::takeLibraryLoadCompleted()},
         {PageId::Word, WordPage::takeLibraryLoadCompleted()},
         {PageId::Cartoon, CartoonPage::takeLibraryLoadCompleted()},
+        {PageId::Radio, RadioPage::takeLibraryLoadCompleted()},
     };
     for (const Completion &completion : completions) {
         if (!completion.complete) continue;
@@ -1113,8 +1139,8 @@ void refreshPoemDisplay() {
 
     // The poem reader is an in-place window. Only scrub and redraw the window
     // rectangle; leave the playlist and the rest of the page untouched.
-    epaper.displayPartial(frame, whiteFrame, popupX, popupY,
-                          popupWidth, popupHeight);
+    epaper.displayPartialFill(frame, 0x00, popupX, popupY,
+                              popupWidth, popupHeight);
     std::memset(frame + popupY * (XingtaiEpd::WIDTH / 8), 0x00,
                 static_cast<size_t>(popupHeight) * (XingtaiEpd::WIDTH / 8));
     epaper.sleep();
@@ -1173,8 +1199,8 @@ void refreshPlaylistRows(PageRenderer renderer, int8_t firstRow, int8_t secondRo
     const uint16_t previousTop = rowTop(firstRow);
     Serial.printf("[PLAYLIST] Row refresh previous=%d next=%d white_wipe=yes\n",
                   firstRow, secondRow);
-    epaper.displayPartial(frame, whiteFrame, listLeft, previousTop,
-                          rowWidth, rowHeight);
+    epaper.displayPartialFill(frame, 0x00, listLeft, previousTop,
+                              rowWidth, rowHeight);
     clearFrameRegion(frame, listLeft, previousTop, rowWidth, rowHeight);
     epaper.sleep();
     delay(300);
@@ -1228,8 +1254,8 @@ void refreshWordStrokeWindow(bool wipeFirst) {
 
     WordPage::render(transitionFrame);
     if (wipeFirst) {
-        epaper.displayPartial(frame, whiteFrame, strokeLeft, strokeTop,
-                              strokeWidth, strokeHeight);
+        epaper.displayPartialFill(frame, 0x00, strokeLeft, strokeTop,
+                                  strokeWidth, strokeHeight);
         clearFrameRegion(frame, strokeLeft, strokeTop, strokeWidth, strokeHeight);
         epaper.sleep();
     }
@@ -1717,42 +1743,78 @@ void renderCalibrationTarget(uint8_t *buffer, uint8_t target) {
     }
 }
 
-bool solveCalibration() {
-    const float x0 = calibrationRaw[0].x;
-    const float y0 = calibrationRaw[0].y;
-    const float x1 = calibrationRaw[1].x;
-    const float y1 = calibrationRaw[1].y;
-    const float x2 = calibrationRaw[2].x;
-    const float y2 = calibrationRaw[2].y;
-    const float determinant = x0 * (y1 - y2) + x1 * (y2 - y0) + x2 * (y0 - y1);
-    if (fabsf(determinant) < 1.0f) return false;
-
-    const float targetsX[3] = {calibrationTargetX[0], calibrationTargetX[1], calibrationTargetX[2]};
-    const float targetsY[3] = {calibrationTargetY[0], calibrationTargetY[1], calibrationTargetY[2]};
-    for (int axis = 0; axis < 2; ++axis) {
-        const float *targets = axis == 0 ? targetsX : targetsY;
-        const float a = (targets[0] * (y1 - y2) + targets[1] * (y2 - y0) + targets[2] * (y0 - y1)) / determinant;
-        const float b = (x0 * (targets[1] - targets[2]) + x1 * (targets[2] - targets[0]) + x2 * (targets[0] - targets[1])) / determinant;
-        const float c = (targets[0] * (x1 * y2 - x2 * y1) +
-                         targets[1] * (x2 * y0 - x0 * y2) +
-                         targets[2] * (x0 * y1 - x1 * y0)) / determinant;
-        touchTransform[axis * 3] = a;
-        touchTransform[axis * 3 + 1] = b;
-        touchTransform[axis * 3 + 2] = c;
+bool solveCalibrationAxis(const float normal[3][3], const float rhs[3], float result[3]) {
+    float matrix[3][4] = {};
+    for (uint8_t row = 0; row < 3; ++row) {
+        for (uint8_t column = 0; column < 3; ++column) matrix[row][column] = normal[row][column];
+        matrix[row][3] = rhs[row];
     }
+    for (uint8_t pivot = 0; pivot < 3; ++pivot) {
+        uint8_t best = pivot;
+        for (uint8_t row = pivot + 1; row < 3; ++row) {
+            if (fabsf(matrix[row][pivot]) > fabsf(matrix[best][pivot])) best = row;
+        }
+        if (fabsf(matrix[best][pivot]) < 0.0001f) return false;
+        if (best != pivot) {
+            for (uint8_t column = pivot; column < 4; ++column) {
+                const float value = matrix[pivot][column];
+                matrix[pivot][column] = matrix[best][column];
+                matrix[best][column] = value;
+            }
+        }
+        const float divisor = matrix[pivot][pivot];
+        for (uint8_t column = pivot; column < 4; ++column) matrix[pivot][column] /= divisor;
+        for (uint8_t row = 0; row < 3; ++row) {
+            if (row == pivot) continue;
+            const float factor = matrix[row][pivot];
+            for (uint8_t column = pivot; column < 4; ++column) {
+                matrix[row][column] -= factor * matrix[pivot][column];
+            }
+        }
+    }
+    for (uint8_t row = 0; row < 3; ++row) result[row] = matrix[row][3];
+    return true;
+}
+
+bool solveCalibration() {
+    // Fit display = a * raw.x + b * raw.y + c using all four corner samples.
+    // The normal equations provide a least-squares affine fit, so one slightly
+    // off-center tap does not distort the entire touch surface.
+    float normal[3][3] = {};
+    float targets[2][3] = {};
+    for (uint8_t index = 0; index < 4; ++index) {
+        const float values[3] = {
+            static_cast<float>(calibrationRaw[index].x),
+            static_cast<float>(calibrationRaw[index].y), 1.0f,
+        };
+        for (uint8_t row = 0; row < 3; ++row) {
+            for (uint8_t column = 0; column < 3; ++column) {
+                normal[row][column] += values[row] * values[column];
+            }
+            targets[0][row] += values[row] * calibrationTargetX[index];
+            targets[1][row] += values[row] * calibrationTargetY[index];
+        }
+    }
+    float coefficients[3] = {};
+    float calibratedTransform[6] = {};
+    if (!solveCalibrationAxis(normal, targets[0], coefficients)) return false;
+    for (uint8_t index = 0; index < 3; ++index) calibratedTransform[index] = coefficients[index];
+    if (!solveCalibrationAxis(normal, targets[1], coefficients)) return false;
+    for (uint8_t index = 0; index < 3; ++index) calibratedTransform[index + 3] = coefficients[index];
+    std::memcpy(touchTransform, calibratedTransform, sizeof(touchTransform));
     touchPreferences.begin("touch", false);
     touchPreferences.putBytes("matrix", touchTransform, sizeof(touchTransform));
-    touchPreferences.putUChar("version", 2);
+    touchPreferences.putUChar("version", 3);
     touchPreferences.end();
     return true;
 }
 
 void loadCalibration() {
     touchPreferences.begin("touch", true);
-    if (touchPreferences.getUChar("version", 0) == 2 &&
+    if (touchPreferences.getUChar("version", 0) == 3 &&
         touchPreferences.getBytesLength("matrix") == sizeof(touchTransform)) {
         touchPreferences.getBytes("matrix", touchTransform, sizeof(touchTransform));
-        Serial.println("[CAL] Loaded touch calibration v2");
+        Serial.println("[CAL] Loaded four-point touch calibration v3");
     } else {
         std::memcpy(touchTransform, defaultTouchTransform, sizeof(touchTransform));
         Serial.println("[CAL] Saved calibration missing or outdated; using 300x480 panel mapping");
@@ -1876,7 +1938,7 @@ void queuePage(PageId page) {
 
 void handleTouch(TPoint point, TEvent event) {
     if (calibrationActive) {
-        if (event == TEvent::Tap && calibrationCount < 3) {
+        if (event == TEvent::Tap && calibrationCount < 4) {
             calibrationRaw[calibrationCount++] = point;
             Serial.printf("[CAL] target=%u raw=(%u,%u)\n", calibrationCount, point.x, point.y);
         }
@@ -2535,7 +2597,7 @@ void handleTouch(TPoint point, TEvent event) {
             uiX, uiY, controlLeft, controlTop, controlWidth, controlHeight);
         const bool rowPressed = CartoonPage::rowBoundsAt(
             uiX, uiY, rowLeft, rowTop, rowWidth, rowHeight);
-        if (controlPressed) {
+        if (controlPressed && !CartoonPage::isReader()) {
             showPressedInversion(controlLeft, controlTop, controlWidth, controlHeight);
         } else if (rowPressed) {
             showPressedInversion(rowLeft, rowTop, rowWidth, rowHeight);
@@ -2799,7 +2861,8 @@ void processTouchAction() {
     currentPage = nextPage;
     if (nextPage == PageId::Book || nextPage == PageId::Voice ||
         nextPage == PageId::Music || nextPage == PageId::Poem ||
-        nextPage == PageId::Word || nextPage == PageId::Cartoon) {
+        nextPage == PageId::Word || nextPage == PageId::Cartoon ||
+        nextPage == PageId::Radio) {
         startOpeningLibraryLoad(nextPage);
     }
     Serial.printf("[UI] %s page ready\n", pageName(currentPage));
@@ -2873,8 +2936,8 @@ void setup() {
         calibrationActive = true;
         calibrationCount = 0;
         Serial.println("[CAL] WAKE held: touch calibration enabled");
-        Serial.println("[CAL] Tap targets: top-left, top-right, bottom-center");
-        for (uint8_t target = 0; target < 3; ++target) {
+        Serial.println("[CAL] Tap targets: top-left, top-right, bottom-right, bottom-left");
+        for (uint8_t target = 0; target < 4; ++target) {
             renderCalibrationTarget(frame, target);
             epaper.display(frame);
             // The EPD and touch controller share the board's power-up sequence;
@@ -2953,6 +3016,13 @@ void loop() {
     // foreground workflow. While a finger gesture is active, do not advance
     // saves, playback UI, animation, marquee, network indicators, or clock refreshes.
     if (touchWorkflowPriority || touchGestureActive) {
+        // Radio row taps queue playback so the audio task is not created from
+        // the touch callback. A Tap can arrive without a matching LiftUp after
+        // a long e-paper refresh, leaving touchGestureActive set; service the
+        // queued station before honoring the gesture-priority early return.
+        if (currentPage == PageId::Radio && RadioPage::process()) {
+            refreshCurrentPage();
+        }
         delay(1);
         return;
     }
@@ -3014,6 +3084,12 @@ void loop() {
         RecordingPage::renderMarquee(transitionFrame, frame);
         epaper.displayPartial(frame, transitionFrame, 43, marqueeTop + 1, 125, 28);
         copyFrameRegion(frame, transitionFrame, 43, marqueeTop + 1, 125, 28);
+        epaper.sleep();
+    }
+    if (RadioPage::advanceMarquee(marqueeTop) && currentPage == PageId::Radio) {
+        RadioPage::renderMarquee(transitionFrame, frame);
+        epaper.displayPartial(frame, transitionFrame, 40, marqueeTop + 1, 132, 28);
+        copyFrameRegion(frame, transitionFrame, 40, marqueeTop + 1, 132, 28);
         epaper.sleep();
     }
     updateNetworkPriority();

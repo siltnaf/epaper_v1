@@ -273,19 +273,10 @@ bool play(const char *path) {
         return false;
     }
 
-    // The decoder workspace is static, but the PCM buffer, SD object, and task
-    // bookkeeping still need a contiguous internal-RAM margin.
-    // The task stack and decoder state are static. Dynamic use is the 4 KiB PCM
-    // buffer plus the small decoder/file/output objects.
-    constexpr size_t PLAYBACK_DYNAMIC_BYTES = 6 * 1024;
-    if (!MemoryBudget::canAllocate(PLAYBACK_DYNAMIC_BYTES)) {
-        MemoryBudget::log("opus-skip");
-        return false;
-    }
-
     std::strncpy(requestedPath, path, sizeof(requestedPath) - 1);
     requestedPath[sizeof(requestedPath) - 1] = '\0';
     releasePlayback();
+    MemoryBudget::log("opus-start");
     decoder = new AudioGeneratorOpus();
     const bool reserved = decoder && decoder->reserveBuffers();
     Serial.printf("[OPUS] Pre-task reserve=%s decoder_state=%d pcm=%u heap_free=%u largest=%u\n",

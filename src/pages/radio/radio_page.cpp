@@ -19,13 +19,13 @@
 #include "devices/es8311/es8311.h"
 #include "devices/ml307/ml307.h"
 #include "font/xiaozhi_font.h"
+#include "pages/playlist_cache.h"
 #include "ui/loading_indicator.h"
 #include "ui/localization.h"
 
 namespace {
 
 constexpr uint8_t ITEMS_PER_PAGE = 10;
-constexpr uint8_t MAX_STATIONS = 20;
 constexpr uint16_t STREAM_BUFFER_BYTES = 2048;
 constexpr uint16_t PLAYBACK_TASK_STACK_BYTES = 4096;
 constexpr int LIST_TOP = 82;
@@ -34,6 +34,10 @@ constexpr int ROW_GAP = 2;
 constexpr int PAGER_TOP = 52;
 constexpr int BUTTON_WIDTH = 34;
 constexpr int BUTTON_HEIGHT = 25;
+constexpr char RADIO_SD_FOLDER[] = "/radio";
+constexpr int MARQUEE_X = 40;
+constexpr int MARQUEE_WIDTH = 132;
+constexpr int MARQUEE_HEIGHT = ROW_HEIGHT - 2;
 
 struct Station {
     char name[80] = {};
@@ -49,12 +53,17 @@ public:
         active_ = audio_ && audio_->isInitialized();
         phase_ = 0;
         bufferedSamples_ = 0;
+        writeCount_ = 0;
+        peak_ = 0;
+        loggedWriteFailure_ = false;
         if (active_) audio_->setSpeakerEnabled(true);
         return active_;
     }
 
     bool SetRate(int hz) override {
         sourceRate_ = hz;
+        Serial.printf("[RADIO AUDIO] source rate=%d output rate=%u\n",
+                      hz, static_cast<unsigned>(Es8311::DEFAULT_SAMPLE_RATE));
         return hz >= 8000 && hz <= 96000 && AudioOutput::SetRate(hz);
     }
 
@@ -63,20 +72,28 @@ public:
     }
 
     bool SetChannels(int channels) override {
+        Serial.printf("[RADIO AUDIO] channels=%d\n", channels);
         return (channels == 1 || channels == 2) && AudioOutput::SetChannels(channels);
     }
 
     void resetQuota() { sourceFramesRemaining_ = 1024; }
 
     bool ConsumeSample(int16_t sample[2]) override {
-        if (!active_ || sourceRate_ <= 0 || sourceFramesRemaining_ == 0) return false;
+        if (!active_ || sourceFramesRemaining_ == 0) return false;
+        // AudioGeneratorMP3 probes the output with one sample before decoding
+        // its first frame and calling SetRate(). Accept that bootstrap sample;
+        // rejecting it leaves the decoder permanently stalled at rate zero.
+        if (sourceRate_ <= 0) return true;
         --sourceFramesRemaining_;
         MakeSampleStereo16(sample);
         phase_ += Es8311::DEFAULT_SAMPLE_RATE;
         while (phase_ >= static_cast<uint32_t>(sourceRate_)) {
             phase_ -= static_cast<uint32_t>(sourceRate_);
-            pcm_[bufferedSamples_++] = Amplify(sample[LEFTCHANNEL]);
-            pcm_[bufferedSamples_++] = Amplify(sample[RIGHTCHANNEL]);
+            const int16_t left = Amplify(sample[LEFTCHANNEL]);
+            const int16_t right = Amplify(sample[RIGHTCHANNEL]);
+            peak_ = max<uint16_t>(peak_, max<uint16_t>(abs(left), abs(right)));
+            pcm_[bufferedSamples_++] = left;
+            pcm_[bufferedSamples_++] = right;
             if (bufferedSamples_ >= PCM_CAPACITY && !flushBuffer()) return false;
         }
         return true;
@@ -95,6 +112,13 @@ private:
         if (bufferedSamples_ == 0) return true;
         const bool written = audio_ &&
             audio_->write(pcm_, bufferedSamples_, 1000) == bufferedSamples_;
+        ++writeCount_;
+        if (writeCount_ == 1 || !written) {
+            Serial.printf("[RADIO AUDIO] write=%lu samples=%u peak=%u result=%s\n",
+                          static_cast<unsigned long>(writeCount_), bufferedSamples_, peak_,
+                          written ? "ok" : "failed");
+        }
+        if (!written) loggedWriteFailure_ = true;
         bufferedSamples_ = 0;
         return written;
     }
@@ -107,11 +131,16 @@ private:
     uint32_t phase_ = 0;
     int sourceRate_ = 0;
     bool active_ = false;
+    uint32_t writeCount_ = 0;
+    uint16_t peak_ = 0;
+    bool loggedWriteFailure_ = false;
 };
 
-Station stations[MAX_STATIONS] = {};
+Station stations[ITEMS_PER_PAGE] = {};
 uint8_t stationCount = 0;
-uint8_t libraryPage = 1;
+uint16_t stationTotal = 0;
+uint16_t stationOffset = 0;
+bool stationHasMore = false;
 int8_t selectedIndex = -1;
 int8_t activeIndex = -1;
 int8_t pendingIndex = -1;
@@ -126,10 +155,43 @@ volatile bool playbackActive = false;
 volatile bool playbackEnded = false;
 char requestedUrl[384] = {};
 void *decoderWorkspace = nullptr;
+uint16_t marqueeOffset = 0;
+uint32_t nextMarqueeMs = 0;
+bool marqueeReady = false;
+uint8_t marqueeBitmap[MARQUEE_HEIGHT][(MARQUEE_WIDTH + 7) / 8] = {};
+volatile bool libraryLoadRunning = false;
+volatile bool libraryLoadCompleted = false;
 
 void pixel(uint8_t *frame, int x, int y) {
     if (!frame || x < 0 || x >= XingtaiEpd::WIDTH || y < 0 || y >= XingtaiEpd::HEIGHT) return;
     frame[static_cast<size_t>(y) * (XingtaiEpd::WIDTH / 8) + x / 8] |= 0x80U >> (x % 8);
+}
+
+bool marqueePixel(int x, int y) {
+    if (x < 0 || x >= MARQUEE_WIDTH || y < 0 || y >= MARQUEE_HEIGHT) return false;
+    return marqueeBitmap[y][x / 8] & (0x80U >> (x % 8));
+}
+
+bool framePixel(const uint8_t *frame, int x, int y) {
+    if (!frame || x < 0 || x >= XingtaiEpd::WIDTH || y < 0 || y >= XingtaiEpd::HEIGHT) {
+        return false;
+    }
+    return frame[static_cast<size_t>(y) * (XingtaiEpd::WIDTH / 8) + x / 8] &
+           (0x80U >> (x % 8));
+}
+
+void captureMarquee(const uint8_t *frame, int top) {
+    std::memset(marqueeBitmap, 0x00, sizeof(marqueeBitmap));
+    for (int y = 0; y < MARQUEE_HEIGHT; ++y) {
+        for (int x = 0; x < MARQUEE_WIDTH; ++x) {
+            if (framePixel(frame, MARQUEE_X + x, top + 1 + y)) {
+                marqueeBitmap[y][x / 8] |= 0x80U >> (x % 8);
+            }
+        }
+    }
+    marqueeReady = true;
+    marqueeOffset = 0;
+    nextMarqueeMs = millis() + 900;
 }
 
 void line(uint8_t *frame, int x1, int y1, int x2, int y2) {
@@ -232,6 +294,27 @@ void drawTitle(uint8_t *frame, int x, int y, int width, int height, const char *
     }
 }
 
+int titleWidth(const char *value) {
+    const char *cursor = value ? value : "";
+    int width = 0;
+    uint32_t codepoint = 0;
+    while (nextCodepoint(cursor, codepoint)) {
+        if (codepoint < 0x80) {
+            width += codepoint == ' ' ? 5 : 7;
+        } else {
+            const XiaozhiFont::Glyph *glyph = XiaozhiFont::glyph(codepoint);
+            width += glyph ? max(1, static_cast<int>(glyph->advance)) + 1 : 17;
+        }
+    }
+    return width;
+}
+
+void drawCenteredTitle(uint8_t *frame, int y, int height, const char *value) {
+    const int width = min<int>(XingtaiEpd::WIDTH, titleWidth(value));
+    const int x = max(0, (XingtaiEpd::WIDTH - width) / 2);
+    drawTitle(frame, x, y, XingtaiEpd::WIDTH - x, height, value);
+}
+
 String apiBase() {
     String base(contentBaseUrl);
     base.trim();
@@ -248,56 +331,110 @@ String absoluteStreamUrl(const char *path) {
     return base + (value.startsWith("/") ? value : "/" + value);
 }
 
-uint8_t pageCount() {
-    return max<uint8_t>(1, (stationCount + ITEMS_PER_PAGE - 1) / ITEMS_PER_PAGE);
+uint16_t pageCount() {
+    return stationTotal > 0
+        ? (stationTotal + ITEMS_PER_PAGE - 1) / ITEMS_PER_PAGE : 1;
 }
 
-bool loadStations() {
+bool loadStations(uint16_t requestedOffset = 0) {
     UiLoadingIndicator::Scope loading;
-    const String url = apiBase() + "/list";
+    const String endpoint = apiBase() + "/list";
+    const String url = endpoint + "?limit=" + String(ITEMS_PER_PAGE) +
+                       "&offset=" + String(requestedOffset);
     String payload;
+    char cacheSlot[24] = {};
+    snprintf(cacheSlot, sizeof(cacheSlot), "offset-%u", requestedOffset);
+    bool fetchedRemote = false;
     if (WiFi.status() != WL_CONNECTED) {
         if (!cellularModem.httpGet(url.c_str(), payload)) {
-            copyText(statusText, sizeof(statusText), UiLocalization::isChinese() ? "网络未连接" : "NETWORK NOT CONNECTED");
-            return false;
+            if (!PlaylistCache::load(RADIO_SD_FOLDER, endpoint, cacheSlot, payload)) {
+                copyText(statusText, sizeof(statusText), UiLocalization::isChinese()
+                    ? "网络未连接" : "NETWORK NOT CONNECTED");
+                return false;
+            }
         }
     } else {
-        HTTPClient http;
-        WiFiClient client;
-        http.setConnectTimeout(7000);
-        http.setTimeout(20000);
-        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-        if (!http.begin(client, url)) return false;
-        http.addHeader("Connection", "close");
-        const int code = http.GET();
-        payload = code >= 200 && code < 300 ? http.getString() : String();
-        http.end();
-        Serial.printf("[RADIO API] GET code=%d bytes=%u url=%s\n", code, payload.length(), url.c_str());
-        if (code < 200 || code >= 300) return false;
+        int code = 0;
+        for (uint8_t attempt = 1; attempt <= 2 && payload.isEmpty(); ++attempt) {
+            HTTPClient http;
+            WiFiClient client;
+            http.setConnectTimeout(7000);
+            http.setTimeout(12000);
+            http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+            http.setReuse(false);
+            if (!http.begin(client, url)) break;
+            http.addHeader("Connection", "close");
+            code = http.GET();
+            if (code >= 200 && code < 300) payload = http.getString();
+            const String error = code < 0 ? http.errorToString(code) : String();
+            http.end();
+            Serial.printf("[RADIO API] GET attempt=%u/2 code=%d%s%s bytes=%u url=%s\n",
+                          attempt, code, error.isEmpty() ? "" : " ", error.c_str(),
+                          payload.length(), url.c_str());
+            if (!payload.isEmpty()) {
+                fetchedRemote = true;
+                break;
+            }
+            if (attempt < 2) delay(500);
+        }
+        if (payload.isEmpty() &&
+            !PlaylistCache::load(RADIO_SD_FOLDER, endpoint, cacheSlot, payload)) {
+            copyText(statusText, sizeof(statusText), code == HTTPC_ERROR_READ_TIMEOUT
+                ? "RADIO API TIMEOUT" : "RADIO API FAILED");
+            return false;
+        }
     }
     JsonDocument document;
     if (deserializeJson(document, payload)) {
-        copyText(statusText, sizeof(statusText), "RADIO JSON FAILED");
-        return false;
+        if (fetchedRemote &&
+            PlaylistCache::load(RADIO_SD_FOLDER, endpoint, cacheSlot, payload) &&
+            !deserializeJson(document, payload)) {
+            fetchedRemote = false;
+        } else {
+            copyText(statusText, sizeof(statusText), "RADIO JSON FAILED");
+            return false;
+        }
     }
-    copyText(locatedCity, sizeof(locatedCity), document["city"] | "");
+    if (fetchedRemote) PlaylistCache::save(RADIO_SD_FOLDER, endpoint, cacheSlot, payload);
+    const uint16_t responseOffset = document["offset"] | requestedOffset;
+    const uint16_t responseTotal = document["total"] | 0;
     stationCount = 0;
+    locatedCity[0] = '\0';
     for (JsonObject item : document["radio"].as<JsonArray>()) {
-        if (stationCount >= MAX_STATIONS) break;
+        if (stationCount >= ITEMS_PER_PAGE) break;
         Station &station = stations[stationCount];
+        station = Station();
         copyText(station.name, sizeof(station.name), item["name"] | "", "UNTITLED");
         copyText(station.codec, sizeof(station.codec), item["codec"] | "MP3");
         copyText(station.streamPath, sizeof(station.streamPath), item["esp32_url"] | "");
+        if (!locatedCity[0]) copyText(locatedCity, sizeof(locatedCity), item["city"] | "");
         if (station.streamPath[0]) ++stationCount;
     }
+    stationOffset = responseOffset;
+    stationTotal = max<uint16_t>(responseTotal, stationOffset + stationCount);
+    stationHasMore = document["has_more"] | (stationOffset + stationCount < stationTotal);
+    statusText[0] = '\0';
     if (!stationCount) copyText(statusText, sizeof(statusText), "NO RADIO STATIONS");
+    Serial.printf("[RADIO API] page offset=%u count=%u total=%u has_more=%s\n",
+                  stationOffset, stationCount, stationTotal,
+                  stationHasMore ? "true" : "false");
     return stationCount > 0;
+}
+
+void libraryLoadTask(void *) {
+    loadStations(0);
+    libraryLoadRunning = false;
+    libraryLoadCompleted = true;
+    vTaskDelete(nullptr);
 }
 
 void playbackTask(void *) {
     pinMode(BoardPins::PA_EN, OUTPUT);
     digitalWrite(BoardPins::PA_EN, HIGH);
+    const bool playbackReady = codec && codec->preparePlayback();
     if (codec) codec->setSpeakerEnabled(true);
+    Serial.printf("[RADIO AUDIO] codec playback restore=%s PA=%d\n",
+                  playbackReady ? "ok" : "failed", digitalRead(BoardPins::PA_EN));
     vTaskDelay(pdMS_TO_TICKS(60));
 
     auto logMemory = [](const char *stage) {
@@ -310,17 +447,25 @@ void playbackTask(void *) {
     logMemory("before allocations");
     AudioFileSourceHTTPStream *source = new AudioFileSourceHTTPStream();
     AudioFileSourceBuffer *buffer = nullptr;
-    AudioGeneratorMP3 *decoder = decoderWorkspace
-        ? new AudioGeneratorMP3(decoderWorkspace, AudioGeneratorMP3::preAllocSize())
-        : nullptr;
+    AudioGeneratorMP3 *decoder = nullptr;
     RadioAudioOutput *output = new RadioAudioOutput(codec);
-    const bool objectsReady = source && decoder && output;
+    const bool objectsReady = source && output;
     logMemory(objectsReady ? "objects allocated" : "object allocation failed");
     const bool httpOpen = objectsReady && source->open(requestedUrl);
     logMemory(httpOpen ? "HTTP stream opened" : "HTTP stream open failed");
+    if (httpOpen) {
+        constexpr size_t decoderBytes = AudioGeneratorMP3::preAllocSize();
+        decoderWorkspace = heap_caps_malloc(decoderBytes, MALLOC_CAP_8BIT);
+        decoder = decoderWorkspace
+            ? new AudioGeneratorMP3(decoderWorkspace, decoderBytes) : nullptr;
+        Serial.printf("[RADIO] Decoder workspace bytes=%u allocation=%s heap=%u largest=%u\n",
+                      static_cast<unsigned>(decoderBytes), decoder ? "ok" : "failed",
+                      static_cast<unsigned>(ESP.getFreeHeap()),
+                      static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+    }
     bool bufferReady = false;
     bool decoderReady = false;
-    bool started = httpOpen;
+    bool started = httpOpen && decoder;
     if (started) {
         buffer = new AudioFileSourceBuffer(source, STREAM_BUFFER_BYTES);
         bufferReady = buffer != nullptr;
@@ -360,13 +505,7 @@ bool startStream(uint8_t index) {
     OpusPlayer::stop();
     const String url = absoluteStreamUrl(stations[index].streamPath);
     copyText(requestedUrl, sizeof(requestedUrl), url.c_str());
-    constexpr size_t decoderBytes = AudioGeneratorMP3::preAllocSize();
-    decoderWorkspace = heap_caps_malloc(decoderBytes, MALLOC_CAP_8BIT);
-    Serial.printf("[RADIO] Decoder workspace bytes=%u allocation=%s heap=%u largest=%u\n",
-                  static_cast<unsigned>(decoderBytes), decoderWorkspace ? "ok" : "failed",
-                  static_cast<unsigned>(ESP.getFreeHeap()),
-                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
-    if (!decoderWorkspace) return false;
+    decoderWorkspace = nullptr;
     stopRequested = false;
     playbackEnded = false;
     playbackActive = true;
@@ -376,8 +515,6 @@ bool startStream(uint8_t index) {
                       static_cast<unsigned>(PLAYBACK_TASK_STACK_BYTES),
                       static_cast<unsigned>(ESP.getFreeHeap()),
                       static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
-        free(decoderWorkspace);
-        decoderWorkspace = nullptr;
         playbackActive = false;
         playbackTaskHandle = nullptr;
         return false;
@@ -398,22 +535,42 @@ void setAudio(Es8311 *audio) {
 
 void open() {
     stop();
-    libraryPage = 1;
+    stationTotal = 0;
+    stationOffset = 0;
+    stationHasMore = false;
     selectedIndex = -1;
     activeIndex = -1;
     pendingIndex = -1;
     stationCount = 0;
     locatedCity[0] = '\0';
-    statusText[0] = '\0';
-    loadStations();
+    copyText(statusText, sizeof(statusText), UiLocalization::isChinese()
+        ? "正在获取电台" : "LOADING RADIO");
+    libraryLoadCompleted = false;
+}
+
+bool startLibraryLoad() {
+    if (libraryLoadRunning) return false;
+    libraryLoadRunning = true;
+    libraryLoadCompleted = false;
+    if (xTaskCreate(libraryLoadTask, "radio-library", 4096,
+                    nullptr, 1, nullptr) != pdPASS) {
+        libraryLoadRunning = false;
+        copyText(statusText, sizeof(statusText), "RADIO TASK FAILED");
+        libraryLoadCompleted = true;
+        return false;
+    }
+    return true;
+}
+
+bool takeLibraryLoadCompleted() {
+    if (!libraryLoadCompleted) return false;
+    libraryLoadCompleted = false;
+    return true;
 }
 
 bool rowBoundsAt(int16_t x, int16_t y, int16_t &left, int16_t &top,
                  int16_t &width, int16_t &height) {
-    const uint8_t first = (libraryPage - 1) * ITEMS_PER_PAGE;
-    const uint8_t visible = first < stationCount
-        ? min<uint8_t>(ITEMS_PER_PAGE, stationCount - first) : 0;
-    for (uint8_t index = 0; index < visible; ++index) {
+    for (uint8_t index = 0; index < stationCount; ++index) {
         const int rowTop = LIST_TOP + index * (ROW_HEIGHT + ROW_GAP);
         if (!inRect(x, y, 12, rowTop, 216, ROW_HEIGHT)) continue;
         left = 12; top = rowTop; width = 216; height = ROW_HEIGHT;
@@ -423,26 +580,46 @@ bool rowBoundsAt(int16_t x, int16_t y, int16_t &left, int16_t &top,
 }
 
 bool handleTap(int16_t x, int16_t y) {
-    uint8_t nextPage = libraryPage;
-    if (inRect(x, y, 4, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT)) nextPage = 1;
-    else if (inRect(x, y, 42, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT) && libraryPage > 1) nextPage--;
-    else if (inRect(x, y, 164, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT) && libraryPage < pageCount()) nextPage++;
-    else if (inRect(x, y, 202, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT)) nextPage = pageCount();
-    if (nextPage != libraryPage) { libraryPage = nextPage; return true; }
+    uint16_t nextOffset = stationOffset;
+    if (inRect(x, y, 4, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT)) {
+        nextOffset = 0;
+    } else if (inRect(x, y, 42, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT) &&
+               stationOffset >= ITEMS_PER_PAGE) {
+        nextOffset = stationOffset - ITEMS_PER_PAGE;
+    } else if (inRect(x, y, 164, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT) &&
+               stationHasMore) {
+        nextOffset = stationOffset + ITEMS_PER_PAGE;
+    } else if (inRect(x, y, 202, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT) &&
+               stationTotal > 0) {
+        nextOffset = ((stationTotal - 1) / ITEMS_PER_PAGE) * ITEMS_PER_PAGE;
+    }
+    if (nextOffset != stationOffset) {
+        stop();
+        selectedIndex = -1;
+        activeIndex = -1;
+        pendingIndex = -1;
+        const bool loaded = loadStations(nextOffset);
+        Serial.printf("[RADIO API] navigate offset=%u result=%s\n",
+                      nextOffset, loaded ? "ok" : "failed");
+        return true;
+    }
 
-    const uint8_t first = (libraryPage - 1) * ITEMS_PER_PAGE;
     for (uint8_t row = 0; row < ITEMS_PER_PAGE; ++row) {
         const int top = LIST_TOP + row * (ROW_HEIGHT + ROW_GAP);
         if (!inRect(x, y, 12, top, 216, ROW_HEIGHT)) continue;
-        const uint8_t index = first + row;
+        const uint8_t index = row;
         if (index >= stationCount) return false;
         if (activeIndex == static_cast<int8_t>(index) && playbackActive) {
+            Serial.printf("[RADIO TOUCH] stop active index=%u name=%s\n",
+                          index, stations[index].name);
             stop();
             return true;
         }
         stop();
         selectedIndex = index;
         pendingIndex = index;
+        Serial.printf("[RADIO TOUCH] selected index=%u name=%s url=%s\n",
+                      index, stations[index].name, stations[index].streamPath);
         return true;
     }
     return false;
@@ -452,9 +629,14 @@ bool process() {
     if (pendingIndex >= 0) {
         const int8_t index = pendingIndex;
         pendingIndex = -1;
-        if (startStream(static_cast<uint8_t>(index))) {
+        const bool started = startStream(static_cast<uint8_t>(index));
+        Serial.printf("[RADIO] deferred start index=%d result=%s\n",
+                      index, started ? "ok" : "failed");
+        if (started) {
             activeIndex = index;
             selectedIndex = -1;
+            marqueeReady = false;
+            marqueeOffset = 0;
         } else {
             selectedIndex = -1;
             activeIndex = -1;
@@ -465,12 +647,45 @@ bool process() {
         playbackEnded = false;
         activeIndex = -1;
         selectedIndex = -1;
+        marqueeReady = false;
         return true;
     }
     return false;
 }
 
 bool isPlaying() { return playbackActive || pendingIndex >= 0; }
+
+bool advanceMarquee(int16_t &rowTop) {
+    if (!playbackActive || activeIndex < 0 || !marqueeReady || millis() < nextMarqueeMs) {
+        return false;
+    }
+    marqueeOffset = (marqueeOffset + 12) % MARQUEE_WIDTH;
+    nextMarqueeMs = millis() + 900;
+    rowTop = LIST_TOP + activeIndex * (ROW_HEIGHT + ROW_GAP);
+    return true;
+}
+
+void renderMarquee(uint8_t *destination, const uint8_t *currentFrame) {
+    if (!destination || !currentFrame) return;
+    std::memcpy(destination, currentFrame, XingtaiEpd::FRAME_BYTES);
+    if (activeIndex < 0 || !marqueeReady) return;
+    const int top = LIST_TOP + activeIndex * (ROW_HEIGHT + ROW_GAP);
+    for (int y = top + 1; y < top + 1 + MARQUEE_HEIGHT; ++y) {
+        for (int x = MARQUEE_X; x < MARQUEE_X + MARQUEE_WIDTH; ++x) {
+            destination[static_cast<size_t>(y) * (XingtaiEpd::WIDTH / 8) + x / 8] |=
+                0x80U >> (x % 8);
+        }
+    }
+    for (int y = 0; y < MARQUEE_HEIGHT; ++y) {
+        for (int x = 0; x < MARQUEE_WIDTH; ++x) {
+            if (!marqueePixel((x + marqueeOffset) % MARQUEE_WIDTH, y)) continue;
+            const int drawX = MARQUEE_X + x;
+            const int drawY = top + 1 + y;
+            destination[static_cast<size_t>(drawY) * (XingtaiEpd::WIDTH / 8) + drawX / 8] &=
+                static_cast<uint8_t>(~(0x80U >> (drawX % 8)));
+        }
+    }
+}
 
 void stop() {
     pendingIndex = -1;
@@ -485,12 +700,20 @@ void stop() {
     if (!playbackTaskHandle) playbackActive = false;
     activeIndex = -1;
     selectedIndex = -1;
+    marqueeReady = false;
+    marqueeOffset = 0;
 }
 
 void render(uint8_t *frame) {
     std::memset(frame, 0x00, XingtaiEpd::FRAME_BYTES);
-    if (UiLocalization::isChinese()) drawTitle(frame, 91, 34, 58, 18, "收音机");
-    else UiLocalization::drawCentered(frame, 36, "RADIO", 2);
+    char heading[96] = {};
+    if (locatedCity[0]) {
+        snprintf(heading, sizeof(heading), UiLocalization::isChinese()
+            ? "收音机 (%s)" : "RADIO (%s)", locatedCity);
+    } else {
+        copyText(heading, sizeof(heading), UiLocalization::isChinese() ? "收音机" : "RADIO");
+    }
+    drawCenteredTitle(frame, 34, 18, heading);
     rect(frame, 4, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT);
     drawDoubleArrow(frame, 21, PAGER_TOP + BUTTON_HEIGHT / 2, false);
     rect(frame, 42, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT);
@@ -500,26 +723,28 @@ void render(uint8_t *frame) {
     rect(frame, 202, PAGER_TOP, BUTTON_WIDTH, BUTTON_HEIGHT);
     drawDoubleArrow(frame, 219, PAGER_TOP + BUTTON_HEIGHT / 2, true);
     char pager[24] = {};
-    snprintf(pager, sizeof(pager), "%u/%u", libraryPage, pageCount());
-    if (locatedCity[0]) drawTitle(frame, 79, 52, 82, 13, locatedCity);
+    const uint16_t currentPage = stationOffset / ITEMS_PER_PAGE + 1;
+    snprintf(pager, sizeof(pager), "%u/%u", currentPage, pageCount());
     UiLocalization::drawCentered(frame, 67, pager);
     if (!stationCount) {
         UiLocalization::drawCentered(frame, 190, statusText);
         return;
     }
-    const uint8_t first = (libraryPage - 1) * ITEMS_PER_PAGE;
-    const uint8_t visible = min<uint8_t>(ITEMS_PER_PAGE, stationCount - first);
-    for (uint8_t row = 0; row < visible; ++row) {
-        const uint8_t index = first + row;
+    for (uint8_t row = 0; row < stationCount; ++row) {
+        const uint8_t index = row;
         const int top = LIST_TOP + row * (ROW_HEIGHT + ROW_GAP);
         rect(frame, 12, top, 216, ROW_HEIGHT);
         char number[8] = {};
-        snprintf(number, sizeof(number), "%u", index + 1);
+        snprintf(number, sizeof(number), "%u", stationOffset + index + 1);
         UiLocalization::drawText(frame, 18, top + 9, number);
-        drawTitle(frame, 34, top + 1, 140, ROW_HEIGHT - 2, stations[index].name);
-        UiLocalization::drawText(frame, 177, top + 9, stations[index].codec);
+        drawTitle(frame, 40, top + 1, 132, ROW_HEIGHT - 2, stations[index].name);
+        UiLocalization::drawText(frame, 174, top + 9, stations[index].codec);
         if (index == activeIndex && playbackActive) drawPlay(frame, 215, top + ROW_HEIGHT / 2);
         else drawArrow(frame, 215, top + ROW_HEIGHT / 2, true);
+        // Capture the normal black title glyphs before the active row is
+        // inverted. The marquee renderer uses this mask to cut white letters
+        // into a solid black strip during each scrolling partial refresh.
+        if (index == activeIndex && playbackActive && !marqueeReady) captureMarquee(frame, top);
         if (index == activeIndex || index == selectedIndex) invertRect(frame, 12, top, 216, ROW_HEIGHT);
     }
 }

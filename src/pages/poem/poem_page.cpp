@@ -730,7 +730,20 @@ bool ensurePoemOpus(char *path, size_t pathSize) {
                   static_cast<long>(selectedPoemId), selectedVoice, metadataUrl.c_str());
     std::strcpy(audioStatus, UiLocalization::isChinese() ? "正在生成语音" : "GENERATING AUDIO");
     String payload;
-    if (!httpGet(metadataUrl, payload, 180000)) return false;
+    bool metadataLoaded = false;
+    // HTTPClient stores its timeout in uint16_t, so a single 180000 ms timeout
+    // wraps to about 49 seconds. Use bounded attempts while the server generates
+    // the audio; a timed-out first request may still complete server-side.
+    for (uint8_t attempt = 1; attempt <= 3 && !metadataLoaded; ++attempt) {
+        payload = "";
+        metadataLoaded = httpGet(metadataUrl, payload, 60000);
+        if (!metadataLoaded && attempt < 3) {
+            Serial.printf("[POEM TTS] Metadata retry attempt=%u/3\n",
+                          static_cast<unsigned>(attempt + 1));
+            delay(500);
+        }
+    }
+    if (!metadataLoaded) return false;
     JsonDocument document;
     const DeserializationError error = deserializeJson(document, payload);
     if (error) {
@@ -1234,7 +1247,6 @@ void openLibrary() {
     poemTotal = 0;
     libraryAwaitingContent = true;
     libraryLoadCompleted = false;
-    if (loadLibrary(false, false, true)) libraryAwaitingContent = false;
 }
 
 bool startLibraryLoad() {

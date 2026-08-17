@@ -113,7 +113,16 @@ retry:
 
   if (!nonBlock) {
     int start = millis();
-    while ((stream->available() < (int)len) && (millis() - start < 500)) yield();
+    while ((stream->available() < (int)len) && (millis() - start < 500)) {
+#ifdef ESP32
+      // A runnable task pinned to CPU 0 can repeatedly yield back to itself and
+      // starve IDLE0/WiFi until the task watchdog fires. Block for one RTOS tick
+      // while waiting for socket data so lower-priority system tasks can run.
+      vTaskDelay(1);
+#else
+      yield();
+#endif
+    }
   }
 
   size_t avail = stream->available();

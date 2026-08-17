@@ -714,7 +714,6 @@ void open() {
     songTotal = 0;
     libraryAwaitingContent = true;
     libraryLoadCompleted = false;
-    if (loadLibrary(false, false, true)) libraryAwaitingContent = false;
 }
 
 bool startLibraryLoad() {

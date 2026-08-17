@@ -119,8 +119,11 @@ bool downloadFile(const char *url, const char *path, uint32_t minimumBytes) {
         written = 0;
         uint32_t lastDataMs = millis();
         uint32_t nextProgressMs = lastDataMs + 5000;
-        constexpr uint32_t idleTimeoutMs = 20000;
-        constexpr uint32_t totalTimeoutMs = 180000;
+        // Generated TTS files can pause between server chunks even while the
+        // connection remains healthy. Match the HTTP socket timeout instead of
+        // aborting after 20 seconds, and allow slow large files to finish.
+        constexpr uint32_t idleTimeoutMs = 65000;
+        constexpr uint32_t totalTimeoutMs = 600000;
 
         while ((expectedBytes < 0 && (http.connected() || stream->available())) ||
                (expectedBytes >= 0 && written < expectedBytes)) {
