@@ -231,8 +231,8 @@ bool httpGetText(const String &url, String &payload, uint32_t timeout = 20000) {
         copyText(statusText, sizeof(statusText), "NETWORK NOT CONNECTED");
         return false;
     }
-        payload = String();
     for (uint8_t attempt = 1; attempt <= 2; ++attempt) {
+        payload = String();
         HTTPClient http;
         WiFiClient client;
         http.setConnectTimeout(10000);
@@ -248,47 +248,49 @@ bool httpGetText(const String &url, String &payload, uint32_t timeout = 20000) {
         http.addHeader("User-Agent", "ESP32-ePaper-Cartoon/1.0");
         const int code = http.GET();
         const int contentLength = http.getSize();
-            size_t receivedBytes = 0;
-            if (code >= 200 && code < 300) {
-                WiFiClient *stream = http.getStreamPtr();
-                const bool lengthKnown = contentLength >= 0;
-                const size_t expectedBytes = lengthKnown
-                    ? static_cast<size_t>(contentLength) : 0;
-                if (lengthKnown && expectedBytes <= MAX_CARTOON_LIST_BYTES) {
-                    payload.reserve(expectedBytes);
-                }
-                uint8_t buffer[1024] = {};
-                const uint32_t started = millis();
-                uint32_t lastDataMs = started;
-                while (millis() - started < timeout &&
-                       receivedBytes < MAX_CARTOON_LIST_BYTES &&
-                       (!lengthKnown || receivedBytes < expectedBytes)) {
-                    const int available = stream->available();
-                    if (available <= 0) {
-                        if (!stream->connected()) break;
-                        if (millis() - lastDataMs >= min<uint32_t>(timeout, 5000)) break;
-                        delay(2);
-                        continue;
-                    }
-                    size_t requested = min<size_t>(sizeof(buffer),
-                        static_cast<size_t>(available));
-                    if (lengthKnown) {
-                        requested = min<size_t>(requested, expectedBytes - receivedBytes);
-                    }
-                    const int count = stream->read(buffer, requested);
-                    if (count <= 0) {
-                        delay(2);
-                        continue;
-                    }
-                    payload.concat(reinterpret_cast<const char *>(buffer), count);
-                    receivedBytes += static_cast<size_t>(count);
-                    lastDataMs = millis();
-                }
-                const bool complete = lengthKnown
-                    ? receivedBytes == expectedBytes
-                    : receivedBytes > 0 && !stream->connected();
-                if (!complete && receivedBytes == 0) payload = String();
+        size_t receivedBytes = 0;
+        if (code >= 200 && code < 300) {
+            WiFiClient *stream = http.getStreamPtr();
+            const bool lengthKnown = contentLength >= 0;
+            const size_t expectedBytes = lengthKnown
+                ? static_cast<size_t>(contentLength) : 0;
+            if (lengthKnown && expectedBytes <= MAX_CARTOON_LIST_BYTES) {
+                payload.reserve(expectedBytes);
             }
+            uint8_t buffer[1024] = {};
+            const uint32_t started = millis();
+            uint32_t lastDataMs = started;
+            while (millis() - started < timeout &&
+                   receivedBytes < MAX_CARTOON_LIST_BYTES &&
+                   (!lengthKnown || receivedBytes < expectedBytes)) {
+                const int available = stream->available();
+                if (available <= 0) {
+                    // HTTPClient may report the socket closed while lwIP still
+                    // has the final response bytes buffered. Drain for a short
+                    // idle period before treating the response as truncated.
+                    if (millis() - lastDataMs >= min<uint32_t>(timeout, 1000)) break;
+                    delay(2);
+                    continue;
+                }
+                size_t requested = min<size_t>(sizeof(buffer),
+                    static_cast<size_t>(available));
+                if (lengthKnown) {
+                    requested = min<size_t>(requested, expectedBytes - receivedBytes);
+                }
+                const int count = stream->read(buffer, requested);
+                if (count <= 0) {
+                    delay(2);
+                    continue;
+                }
+                payload.concat(reinterpret_cast<const char *>(buffer), count);
+                receivedBytes += static_cast<size_t>(count);
+                lastDataMs = millis();
+            }
+            const bool complete = lengthKnown
+                ? receivedBytes == expectedBytes
+                : receivedBytes > 0;
+            if (!complete) payload = String();
+        }
         const String error = code < 0 ? http.errorToString(code) : String();
         http.end();
         Serial.printf("[CARTOON API] GET attempt=%u/2 code=%d%s%s bytes=%u "

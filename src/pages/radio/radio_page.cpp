@@ -7,7 +7,6 @@
 #include <AudioGeneratorMP3.h>
 #include <AudioOutput.h>
 #include <HTTPClient.h>
-#include <SD_MMC.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <esp_heap_caps.h>
@@ -30,15 +29,18 @@
 namespace {
 
 constexpr uint8_t ITEMS_PER_PAGE = 10;
-// The measured proxy stream is about 140 kbit/s. A two-second compressed prefix
-// is therefore roughly 35 KiB, which cannot coexist in internal RAM with the
-// 29 KiB MP3 workspace. Stage it on SD and retain a small RAM refill buffer.
-constexpr size_t STREAM_PREFETCH_BYTES = 36 * 1024;
-constexpr uint16_t STREAM_BUFFER_BYTES = 4 * 1024;
-constexpr char STREAM_PREFETCH_PATH[] = "/radio/.stream-prefetch.mp3";
+// The decoder occupies about 29 KiB of the no-PSRAM ESP32-S3's internal heap.
+// Keep the live stream entirely in RAM, leaving enough contiguous heap for the
+// decoder, network stack, and the decoder's short-read adapter.
+constexpr size_t STREAM_RING_BUFFER_BYTES = 12 * 1024;
+constexpr size_t STREAM_START_BYTES = 8 * 1024;
+constexpr uint16_t STREAM_BUFFER_BYTES = 2 * 1024;
 constexpr uint32_t STREAM_PREFETCH_TIMEOUT_MS = 30000;
-constexpr uint16_t PLAYBACK_TASK_STACK_BYTES = 5 * 1024;
-constexpr uint16_t PRODUCER_TASK_STACK_BYTES = 6 * 1024;
+constexpr uint32_t STREAM_REFILL_TIMEOUT_MS = 15000;
+constexpr uint16_t PLAYBACK_TASK_STACK_BYTES = 4608;
+// ESP-IDF's task APIs use bytes for stack depth. The producer keeps its large
+// network buffer off-stack so 3 KiB is sufficient for its shallow fetch loop.
+constexpr uint16_t PRODUCER_TASK_STACK_BYTES = 3 * 1024;
 static_assert(PRODUCER_TASK_STACK_BYTES % sizeof(StackType_t) == 0,
               "Producer stack byte count must contain whole StackType_t words");
 constexpr int LIST_TOP = 82;
@@ -47,14 +49,13 @@ constexpr int ROW_GAP = 2;
 constexpr int PAGER_TOP = 52;
 constexpr int BUTTON_WIDTH = 34;
 constexpr int BUTTON_HEIGHT = 25;
-constexpr char RADIO_SD_FOLDER[] = "/radio";
 constexpr int MARQUEE_X = 40;
 constexpr int MARQUEE_WIDTH = 164;
 constexpr int MARQUEE_HEIGHT = ROW_HEIGHT - 2;
 
 struct Station {
     char name[80] = {};
-    char streamPath[320] = {};
+    char streamPath[256] = {};
 };
 
 StackType_t producerTaskStack[PRODUCER_TASK_STACK_BYTES / sizeof(StackType_t)] = {};
@@ -117,12 +118,26 @@ public:
             if (chunked_ && chunkRemaining_ == 0) {
                 if (chunkNeedsCrlf_ && !consumeCrlf()) break;
                 char line[32] = {};
-                if (!readLine(line, sizeof(line), 5000)) {
-                    readFailure_ = "chunk header timeout";
+                do {
+                    if (!readLine(line, sizeof(line), 5000)) {
+                        readFailure_ = "chunk header timeout";
+                        break;
+                    }
+                } while (!line[0]);
+                if (!line[0]) break;
+                char *end = nullptr;
+                const unsigned long chunkSize = std::strtoul(line, &end, 16);
+                while (end && std::isspace(static_cast<unsigned char>(*end))) ++end;
+                if (end == line || (end && *end && *end != ';')) {
+                    Serial.printf("[RADIO HTTP] invalid chunk header='%s' pos=%lu\n",
+                                  line, static_cast<unsigned long>(position_));
+                    readFailure_ = "invalid chunk header";
                     break;
                 }
-                chunkRemaining_ = std::strtoul(line, nullptr, 16);
+                chunkRemaining_ = static_cast<uint32_t>(chunkSize);
                 if (chunkRemaining_ == 0) {
+                    Serial.printf("[RADIO HTTP] terminal chunk pos=%lu\n",
+                                  static_cast<unsigned long>(position_));
                     readFailure_ = "chunked stream ended";
                     opened_ = false;
                     break;
@@ -146,9 +161,13 @@ public:
                 readFailure_ = "socket read failed";
                 break;
             }
+            readFailure_ = "";
             total += received;
             position_ += received;
             if (chunked_) chunkRemaining_ -= received;
+        }
+        if (total == 0 && opened_ && millis() - started >= 5000) {
+            readFailure_ = "read timeout";
         }
         return total;
     }
@@ -195,9 +214,24 @@ private:
         return false;
     }
     bool consumeCrlf() {
-        char line[4] = {};
         chunkNeedsCrlf_ = false;
-        return readLine(line, sizeof(line), 2000);
+        const int first = readByte(2000);
+        if (first == '\n') return true;
+        const int second = first == '\r' ? readByte(2000) : -1;
+        if (first == '\r' && second == '\n') return true;
+        Serial.printf("[RADIO HTTP] invalid chunk boundary first=%d second=%d pos=%lu\n",
+                      first, second, static_cast<unsigned long>(position_));
+        readFailure_ = "invalid chunk boundary";
+        return false;
+    }
+    int readByte(uint32_t timeoutMs) {
+        const uint32_t started = millis();
+        while (millis() - started < timeoutMs) {
+            if (client_.available() > 0) return client_.read();
+            if (!client_.connected()) return -1;
+            vTaskDelay(1);
+        }
+        return -1;
     }
     static bool startsWithIgnoreCase(const char *value, const char *prefix) {
         while (*prefix) {
@@ -238,7 +272,7 @@ public:
         SD_MMC.remove(STREAM_PREFETCH_PATH);
         writer_ = SD_MMC.open(STREAM_PREFETCH_PATH, FILE_WRITE);
         if (!writer_) return false;
-        uint8_t chunk[1024] = {};
+        uint8_t chunk[512] = {};
         const uint32_t started = millis();
         while (prefetchedBytes_ < STREAM_PREFETCH_BYTES &&
                millis() - started < STREAM_PREFETCH_TIMEOUT_MS &&
@@ -246,14 +280,18 @@ public:
             const size_t requested = min<size_t>(sizeof(chunk),
                 STREAM_PREFETCH_BYTES - prefetchedBytes_);
             const uint32_t received = network_->read(chunk, requested);
-            if (received == 0 || writer_.write(chunk, received) != received) break;
+            if (received == 0) {
+                if (!network_->isOpen()) break;
+                vTaskDelay(pdMS_TO_TICKS(5));
+                continue;
+            }
+            if (writer_.write(chunk, received) != received) break;
             prefetchedBytes_ += received;
             producedBytes_ = prefetchedBytes_;
             vTaskDelay(1);
         }
         writer_.flush();
         writtenBytes_ = prefetchedBytes_;
-        lastFlushMs_ = millis();
         const bool cancelled = cancelRequested && *cancelRequested;
         Serial.printf("[RADIO PREFETCH] bytes=%u target=%u elapsed=%lums result=%s\n",
                       static_cast<unsigned>(producedBytes_),
@@ -274,7 +312,7 @@ public:
         }
         producerRunning_ = true;
         producerTaskHandle_ = xTaskCreateStaticPinnedToCore(
-            producerTaskThunk, "radio-fetch", PRODUCER_TASK_STACK_BYTES, this, 1,
+            producerTaskThunk, "radio-fetch", PRODUCER_TASK_STACK_BYTES, this, 3,
             producerTaskStack, &producerTaskBuffer, 1);
         if (!producerTaskHandle_) {
             producerRunning_ = false;
@@ -286,27 +324,31 @@ public:
     uint32_t read(void *data, uint32_t len) override {
         if (!data || len == 0) return 0;
         const uint32_t started = millis();
-        // AudioFileSourceBuffer treats a short source read as an underflow.
-        // Wait for the complete request while the SD producer is still able to
-        // extend the file, except when cancellation or a real stream end occurs.
-        while (producedBytes_ - consumedBytes_ < len && producerRunning_ &&
-               !(cancelRequested_ && *cancelRequested_) && millis() - started < 1000) {
-            vTaskDelay(1);
+        uint32_t total = 0;
+        while (total < len && !(cancelRequested_ && *cancelRequested_)) {
+            const uint32_t received = readAvailable(
+                static_cast<uint8_t *>(data) + total, len - total);
+            if (received > 0) {
+                total += received;
+                continue;
+            }
+            if (!producerRunning_ || millis() - started >= STREAM_REFILL_TIMEOUT_MS) break;
+            vTaskDelay(pdMS_TO_TICKS(2));
         }
-        const size_t available = producedBytes_ > consumedBytes_
-            ? producedBytes_ - consumedBytes_ : 0;
-        if (available == 0) return 0;
-        if (!reader_) reader_ = SD_MMC.open(STREAM_PREFETCH_PATH, FILE_READ);
-        if (!reader_ || !reader_.seek(consumedBytes_)) return 0;
-        const uint32_t requested = min<uint32_t>(len, available);
-        const uint32_t received = reader_.read(static_cast<uint8_t *>(data), requested);
-        consumedBytes_ += received;
-        return received;
+        if (total < len && producerRunning_) {
+            Serial.printf("[RADIO PREFETCH] refill timeout requested=%u received=%u "
+                          "lead=%u http_reason=%s\n",
+                          static_cast<unsigned>(len), static_cast<unsigned>(total),
+                          static_cast<unsigned>(leadBytes()),
+                          network_ ? static_cast<RadioHttpSource *>(network_)->readFailure()
+                                   : "none");
+        }
+        return total;
     }
 
     uint32_t readNonBlock(void *data, uint32_t len) override {
-        if (producedBytes_ <= consumedBytes_) return 0;
-        return read(data, len);
+        if (!data || len == 0) return 0;
+        return readAvailable(data, len);
     }
 
     bool close() override {
@@ -345,8 +387,32 @@ private:
         static_cast<RadioPrefetchSource *>(context)->producerLoop();
     }
 
+    uint32_t readAvailable(void *data, uint32_t len) {
+        const size_t available = producedBytes_ > consumedBytes_
+            ? producedBytes_ - consumedBytes_ : 0;
+        if (available == 0) return 0;
+        if (!reader_) {
+            reader_ = SD_MMC.open(STREAM_PREFETCH_PATH, FILE_READ);
+            if (!reader_ || !reader_.seek(consumedBytes_)) return 0;
+        } else if (reader_.position() != consumedBytes_ && !reader_.seek(consumedBytes_)) {
+            reader_.close();
+            return 0;
+        }
+        const uint32_t requested = min<uint32_t>(len, available);
+        const uint32_t received = reader_.read(static_cast<uint8_t *>(data), requested);
+        if (received == 0) {
+            // The VFS handle can retain the file size from when it was opened.
+            // Reopen after the producer publishes appended bytes.
+            reader_.close();
+            return 0;
+        }
+        consumedBytes_ += received;
+        return received;
+    }
+
     void producerLoop() {
-        uint8_t chunk[1024] = {};
+        uint8_t chunk[512] = {};
+        uint32_t lastProgressLogMs = millis();
         while (producerRunning_ && !(cancelRequested_ && *cancelRequested_)) {
             if (writtenBytes_ > consumedBytes_ &&
                 writtenBytes_ - consumedBytes_ >= STREAM_PREFETCH_BYTES) {
@@ -354,21 +420,40 @@ private:
                 continue;
             }
             const uint32_t received = network_->read(chunk, sizeof(chunk));
-            if (received == 0 || writer_.write(chunk, received) != received) {
+            if (received == 0) {
+                if (!network_->isOpen()) {
+                    Serial.printf("[RADIO PREFETCH] producer HTTP closed bytes=%u reason=%s\n",
+                                  static_cast<unsigned>(writtenBytes_),
+                                  static_cast<RadioHttpSource *>(network_)->readFailure());
+                    break;
+                }
+                if (millis() - lastProgressLogMs >= 5000) {
+                    Serial.printf("[RADIO PREFETCH] producer waiting lead=%u written=%u "
+                                  "published=%u reason=%s\n",
+                                  static_cast<unsigned>(writtenBytes_ > consumedBytes_
+                                      ? writtenBytes_ - consumedBytes_ : 0),
+                                  static_cast<unsigned>(writtenBytes_),
+                                  static_cast<unsigned>(producedBytes_),
+                                  static_cast<RadioHttpSource *>(network_)->readFailure());
+                    lastProgressLogMs = millis();
+                }
                 vTaskDelay(1);
                 continue;
             }
+            if (writer_.write(chunk, received) != received) {
+                Serial.printf("[RADIO PREFETCH] producer SD write failed bytes=%u\n",
+                              static_cast<unsigned>(writtenBytes_));
+                break;
+            }
             writtenBytes_ += received;
-            // Publish data to the reader only after it has been flushed. This
-            // reduces SD synchronization overhead while keeping file visibility
-            // and the advertised producer position consistent.
-            if (writtenBytes_ - producedBytes_ >= 4 * 1024 ||
-                millis() - lastFlushMs_ >= 50) {
+            lastProgressLogMs = millis();
+            // Publish in SD-sized batches. Frequent flushes make the producer
+            // fall behind even when network throughput exceeds playback rate.
+            if (writtenBytes_ - producedBytes_ >= STREAM_PUBLISH_BYTES) {
                 writer_.flush();
                 producedBytes_ = writtenBytes_;
-                lastFlushMs_ = millis();
             }
-            vTaskDelay(1);
+            taskYIELD();
         }
         writer_.flush();
         producedBytes_ = writtenBytes_;
@@ -387,7 +472,6 @@ private:
     size_t writtenBytes_ = 0;
     volatile size_t producedBytes_ = 0;
     volatile size_t consumedBytes_ = 0;
-    uint32_t lastFlushMs_ = 0;
 };
 
 class RadioAudioOutput final : public AudioOutput {
@@ -470,7 +554,7 @@ private:
         return written;
     }
 
-    static constexpr uint16_t PCM_CAPACITY = 512;
+    static constexpr uint16_t PCM_CAPACITY = 256;
     Es8311 *audio_ = nullptr;
     int16_t pcm_[PCM_CAPACITY] = {};
     uint16_t bufferedSamples_ = 0;
@@ -796,54 +880,47 @@ void playbackTask(void *) {
     logMemory("before allocations");
     constexpr size_t decoderBytes = AudioGeneratorMP3::preAllocSize();
     decoderWorkspace = heap_caps_malloc(decoderBytes, MALLOC_CAP_8BIT);
-    AudioGeneratorMP3 *decoder = decoderWorkspace
-        ? new AudioGeneratorMP3(decoderWorkspace, decoderBytes) : nullptr;
+    AudioGeneratorMP3 *decoder = nullptr;
     Serial.printf("[RADIO] Decoder workspace bytes=%u allocation=%s heap=%u largest=%u\n",
-                  static_cast<unsigned>(decoderBytes), decoder ? "ok" : "failed",
+                  static_cast<unsigned>(decoderBytes), decoderWorkspace ? "ok" : "failed",
                   static_cast<unsigned>(ESP.getFreeHeap()),
                   static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
     RadioHttpSource *source = new RadioHttpSource();
-    RadioPrefetchSource *prefetchSource = nullptr;
+    RadioPrefetchSource *prefetchSource = source ? new RadioPrefetchSource(source) : nullptr;
     AudioFileSourceBuffer *buffer = nullptr;
-    RadioAudioOutput *output = new RadioAudioOutput(codec);
-    const bool objectsReady = decoder && source && output;
-    logMemory(objectsReady ? "objects allocated" : "object allocation failed");
-    if (objectsReady) {
-        // Reserve every remaining heap-backed playback object before connecting.
-        // lwIP allocations would otherwise fragment the refill-sized block.
-        if (decoder) {
-            streamBufferWorkspace = heap_caps_malloc(STREAM_BUFFER_BYTES, MALLOC_CAP_8BIT);
-            Serial.printf("[RADIO BUFFER] reserve bytes=%u allocation=%s heap=%u largest=%u\n",
-                          static_cast<unsigned>(STREAM_BUFFER_BYTES),
-                          streamBufferWorkspace ? "ok" : "failed",
-                          static_cast<unsigned>(ESP.getFreeHeap()),
-                          static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
-            if (streamBufferWorkspace) {
-                prefetchSource = new RadioPrefetchSource(source);
-                buffer = prefetchSource
-                    ? new AudioFileSourceBuffer(prefetchSource, streamBufferWorkspace,
-                                                STREAM_BUFFER_BYTES)
-                    : nullptr;
-                if (buffer) buffer->RegisterStatusCB(radioBufferStatus, nullptr);
-                Serial.printf("[RADIO BUFFER] wrappers preallocated prefetch=%s buffer=%s "
-                              "heap=%u largest=%u\n",
-                              prefetchSource ? "ok" : "failed",
-                              buffer ? "ok" : "failed",
-                              static_cast<unsigned>(ESP.getFreeHeap()),
-                              static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
-            }
-        }
-    }
-    const bool heapReady = decoder && streamBufferWorkspace && prefetchSource && buffer;
-    const bool httpOpen = heapReady && source->open(requestedUrl);
+    RadioAudioOutput *output = nullptr;
+    const bool prefetchObjectsReady = decoderWorkspace && source && prefetchSource;
+    logMemory(prefetchObjectsReady ? "prefetch objects allocated" : "prefetch allocation failed");
+    const bool httpOpen = prefetchObjectsReady && source->open(requestedUrl);
     logMemory(httpOpen ? "HTTP stream opened" : "HTTP stream open failed");
     bool prefetchReady = false;
     if (httpOpen) {
         prefetchReady = prefetchSource->prefetch(&stopRequested);
     }
+    if (prefetchReady) {
+        // The large decoder block is already reserved. Delay playback-only
+        // allocations until SD has the full lead so lwIP has maximum heap while
+        // receiving the bursty HLS-to-MP3 proxy stream.
+        decoder = new AudioGeneratorMP3(decoderWorkspace, decoderBytes);
+        output = new RadioAudioOutput(codec);
+        streamBufferWorkspace = heap_caps_malloc(STREAM_BUFFER_BYTES, MALLOC_CAP_8BIT);
+        buffer = streamBufferWorkspace
+            ? new AudioFileSourceBuffer(prefetchSource, streamBufferWorkspace,
+                                        STREAM_BUFFER_BYTES)
+            : nullptr;
+        if (buffer) buffer->RegisterStatusCB(radioBufferStatus, nullptr);
+        Serial.printf("[RADIO BUFFER] playback allocations decoder=%s output=%s reserve=%s "
+                      "buffer=%s bytes=%u heap=%u largest=%u\n",
+                      decoder ? "ok" : "failed", output ? "ok" : "failed",
+                      streamBufferWorkspace ? "ok" : "failed", buffer ? "ok" : "failed",
+                      static_cast<unsigned>(STREAM_BUFFER_BYTES),
+                      static_cast<unsigned>(ESP.getFreeHeap()),
+                      static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+    }
     const bool bufferReady = buffer != nullptr && streamBufferWorkspace != nullptr;
     bool decoderReady = false;
-    bool started = httpOpen && prefetchReady && decoder && bufferReady;
+    const bool objectsReady = decoder && source && prefetchSource && output;
+    bool started = httpOpen && prefetchReady && objectsReady && bufferReady;
     if (started) {
         logMemory(bufferReady ? "stream buffer allocated" : "stream buffer allocation failed");
         decoderReady = bufferReady && decoder->begin(buffer, output);
