@@ -285,6 +285,20 @@ void saveSettings() {
     settingsPreferences.end();
 }
 
+bool normalizeContentUrl(char *url, size_t capacity) {
+    if (!url || capacity == 0 || url[0] == '\0') return false;
+    if (std::strncmp(url, "http://", 7) == 0 ||
+        std::strncmp(url, "https://", 8) == 0) {
+        return true;
+    }
+
+    const size_t length = std::strlen(url);
+    if (length + CONTENT_URL_PREFIX_LENGTH >= capacity) return false;
+    std::memmove(url + CONTENT_URL_PREFIX_LENGTH, url, length + 1);
+    std::memcpy(url, CONTENT_URL_PREFIX, CONTENT_URL_PREFIX_LENGTH);
+    return true;
+}
+
 bool contentUrlReachable(const char *url) {
     if (!url || std::strlen(url) <= CONTENT_URL_PREFIX_LENGTH) {
         return false;
@@ -613,7 +627,15 @@ void loadSettings() {
         const String savedContentUrl = settingsPreferences.getString("contentUrl", "");
         const String savedVoice = settingsPreferences.getString("ttsVoice", "Jasper");
         std::strncpy(contentUrl, savedContentUrl.c_str(), sizeof(contentUrl) - 1);
-        if (contentUrl[0] == '\0') std::strcpy(contentUrl, CONTENT_URL_PREFIX);
+        if (contentUrl[0] == '\0') {
+            std::strcpy(contentUrl, CONTENT_URL_PREFIX);
+        } else {
+            const bool hadScheme = std::strncmp(contentUrl, "http://", 7) == 0 ||
+                                   std::strncmp(contentUrl, "https://", 8) == 0;
+            if (!hadScheme && normalizeContentUrl(contentUrl, sizeof(contentUrl))) {
+                migratedContentUrl = true;
+            }
+        }
         // Migrate the known mistyped local server address used by earlier
         // firmware/settings. The active epaper_s3 API is at 192.168.2.220.
         constexpr char MISTYPED_CONTENT_HOST[] = "http://192.169.2.220";
@@ -1837,6 +1859,8 @@ bool isHomeIcon(int16_t x, int16_t y) {
                        homeTargetWidth, homeTargetHeight);
 }
 
+bool isSettingsKeyboardAction(int16_t x, int16_t y);
+
 bool isImmediateTouchControl(int16_t x, int16_t y) {
     const auto inRect = [](int16_t px, int16_t py, int left, int top,
                            int width, int height) {
@@ -1851,6 +1875,7 @@ bool isImmediateTouchControl(int16_t x, int16_t y) {
     if (currentPage == PageId::Settings) {
         const SettingsPage::Action action = SettingsPage::actionAt(x, y);
         return action != SettingsPage::Action::None &&
+               !isSettingsKeyboardAction(x, y) &&
                action != SettingsPage::Action::SelectWifiNetwork &&
                action != SettingsPage::Action::SelectVoice;
     }
@@ -1904,6 +1929,24 @@ bool isImmediateTouchControl(int16_t x, int16_t y) {
     return false;
 }
 
+bool isSettingsKeyboardAction(int16_t x, int16_t y) {
+    if (currentPage != PageId::Settings) return false;
+    const SettingsPage::Action action = SettingsPage::actionAt(x, y);
+    switch (action) {
+    case SettingsPage::Action::WifiKey:
+    case SettingsPage::Action::WifiBackspace:
+    case SettingsPage::Action::WifiSpace:
+    case SettingsPage::Action::WifiChangeKeyboard:
+    case SettingsPage::Action::UrlKey:
+    case SettingsPage::Action::UrlBackspace:
+    case SettingsPage::Action::UrlSpace:
+    case SettingsPage::Action::UrlChangeKeyboard:
+        return true;
+    default:
+        return false;
+    }
+}
+
 PageId mainPageAt(int16_t x, int16_t y) {
     constexpr int16_t iconSize = 48;
     constexpr int16_t hitPadding = 10;
@@ -1938,7 +1981,10 @@ void queuePage(PageId page) {
 
 void handleTouch(TPoint point, TEvent event) {
     if (calibrationActive) {
-        if (event == TEvent::Tap && calibrationCount < 4) {
+        // Use the initial contact for calibration. A release sample can move
+        // several pixels while the finger lifts, which is significant for the
+        // 23-pixel keyboard keys.
+        if (event == TEvent::TouchStart && calibrationCount < 4) {
             calibrationRaw[calibrationCount++] = point;
             Serial.printf("[CAL] target=%u raw=(%u,%u)\n", calibrationCount, point.x, point.y);
         }
@@ -2194,6 +2240,9 @@ void handleTouch(TPoint point, TEvent event) {
 
     if (currentPage == PageId::Settings) {
         const SettingsPage::Action action = SettingsPage::actionAt(uiX, uiY);
+        Serial.printf("[SETTINGS TOUCH] action=%u ui=(%d,%d) url=%s wifi=%d cellular=%d\n",
+                      static_cast<unsigned>(action), uiX, uiY, contentUrl,
+                      WiFi.status(), cellularModem.isConnected());
         switch (action) {
         case SettingsPage::Action::OpenContentUrl:
             SettingsPage::showContentUrl(contentUrl);
@@ -2352,7 +2401,10 @@ void handleTouch(TPoint point, TEvent event) {
         }
         case SettingsPage::Action::UrlBackspace: {
             const size_t length = std::strlen(contentUrl);
-            if (length > CONTENT_URL_PREFIX_LENGTH) contentUrl[length - 1] = '\0';
+            const size_t protectedLength =
+                std::strncmp(contentUrl, CONTENT_URL_PREFIX, CONTENT_URL_PREFIX_LENGTH) == 0
+                    ? CONTENT_URL_PREFIX_LENGTH : 0;
+            if (length > protectedLength) contentUrl[length - 1] = '\0';
             SettingsPage::showContentUrl(contentUrl);
             refreshCurrentRegion(10, 68, 220, 58);
             return;
@@ -2373,17 +2425,36 @@ void handleTouch(TPoint point, TEvent event) {
             refreshCurrentPage();
             return;
         case SettingsPage::Action::UrlSave:
-            if (contentUrlReachable(contentUrl)) {
-                std::strncpy(savedContentUrl, contentUrl, sizeof(savedContentUrl) - 1);
-                savedContentUrl[sizeof(savedContentUrl) - 1] = '\0';
-                saveSettings();
-                SettingsPage::showSettings();
-                Serial.printf("[CONTENT URL] Saved reachable URL: %s\n", contentUrl);
-            } else {
+            Serial.printf("[CONTENT URL] Save requested input=%s\n", contentUrl);
+            if (!normalizeContentUrl(contentUrl, sizeof(contentUrl))) {
+                Serial.println("[CONTENT URL] Normalization failed");
                 std::strncpy(contentUrl, savedContentUrl, sizeof(contentUrl) - 1);
                 contentUrl[sizeof(contentUrl) - 1] = '\0';
                 SettingsPage::showContentUrl(contentUrl);
-                Serial.printf("[CONTENT URL] New URL unreachable; restored: %s\n", contentUrl);
+                refreshCurrentPage();
+                return;
+            }
+            SettingsPage::showContentUrl(contentUrl);
+            {
+                const bool transportConnected = WiFi.status() == WL_CONNECTED ||
+                                                cellularModem.isConnected();
+                const bool canSave = !transportConnected || contentUrlReachable(contentUrl);
+                if (!transportConnected) {
+                    Serial.printf("[CONTENT URL] No active transport; saving without validation: %s\n",
+                                  contentUrl);
+                }
+                if (canSave) {
+                    std::strncpy(savedContentUrl, contentUrl, sizeof(savedContentUrl) - 1);
+                    savedContentUrl[sizeof(savedContentUrl) - 1] = '\0';
+                    saveSettings();
+                    SettingsPage::showSettings();
+                    Serial.printf("[CONTENT URL] Saved URL: %s\n", contentUrl);
+                } else {
+                    std::strncpy(contentUrl, savedContentUrl, sizeof(contentUrl) - 1);
+                    contentUrl[sizeof(contentUrl) - 1] = '\0';
+                    SettingsPage::showContentUrl(contentUrl);
+                    Serial.printf("[CONTENT URL] New URL unreachable; restored: %s\n", contentUrl);
+                }
             }
             refreshCurrentPage();
             return;
