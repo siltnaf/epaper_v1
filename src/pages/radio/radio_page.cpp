@@ -7,6 +7,7 @@
 #include <AudioGeneratorMP3.h>
 #include <AudioOutput.h>
 #include <HTTPClient.h>
+#include <SD_MMC.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <esp_heap_caps.h>
@@ -29,26 +30,16 @@
 namespace {
 
 constexpr uint8_t ITEMS_PER_PAGE = 10;
-// The decoder occupies about 29 KiB of the no-PSRAM ESP32-S3's internal heap.
-// Keep the live stream entirely in RAM, leaving enough contiguous heap for the
-// decoder, network stack, and the decoder's short-read adapter.
-constexpr size_t STREAM_RING_BUFFER_BYTES = 12 * 1024;
-constexpr size_t STREAM_START_BYTES = 8 * 1024;
 constexpr uint16_t STREAM_BUFFER_BYTES = 2 * 1024;
-constexpr uint32_t STREAM_PREFETCH_TIMEOUT_MS = 30000;
-constexpr uint32_t STREAM_REFILL_TIMEOUT_MS = 15000;
+constexpr uint32_t STREAM_HTTP_READ_TIMEOUT_MS = 15000;
 constexpr uint16_t PLAYBACK_TASK_STACK_BYTES = 4608;
-// ESP-IDF's task APIs use bytes for stack depth. The producer keeps its large
-// network buffer off-stack so 3 KiB is sufficient for its shallow fetch loop.
-constexpr uint16_t PRODUCER_TASK_STACK_BYTES = 3 * 1024;
-static_assert(PRODUCER_TASK_STACK_BYTES % sizeof(StackType_t) == 0,
-              "Producer stack byte count must contain whole StackType_t words");
 constexpr int LIST_TOP = 82;
 constexpr int ROW_HEIGHT = 30;
 constexpr int ROW_GAP = 2;
 constexpr int PAGER_TOP = 52;
 constexpr int BUTTON_WIDTH = 34;
 constexpr int BUTTON_HEIGHT = 25;
+constexpr char RADIO_SD_FOLDER[] = "/radio";
 constexpr int MARQUEE_X = 40;
 constexpr int MARQUEE_WIDTH = 164;
 constexpr int MARQUEE_HEIGHT = ROW_HEIGHT - 2;
@@ -58,8 +49,6 @@ struct Station {
     char streamPath[256] = {};
 };
 
-StackType_t producerTaskStack[PRODUCER_TASK_STACK_BYTES / sizeof(StackType_t)] = {};
-StaticTask_t producerTaskBuffer = {};
 
 class RadioHttpSource final : public AudioFileSource {
 public:
@@ -114,7 +103,7 @@ public:
         uint8_t *output = static_cast<uint8_t *>(data);
         uint32_t total = 0;
         const uint32_t started = millis();
-        while (total < len && millis() - started < 5000) {
+        while (total < len && millis() - started < STREAM_HTTP_READ_TIMEOUT_MS) {
             if (chunked_ && chunkRemaining_ == 0) {
                 if (chunkNeedsCrlf_ && !consumeCrlf()) break;
                 char line[32] = {};
@@ -135,6 +124,8 @@ public:
                     break;
                 }
                 chunkRemaining_ = static_cast<uint32_t>(chunkSize);
+                Serial.printf("[RADIO HTTP] chunk size=%lu pos=%lu\n",
+                              chunkSize, static_cast<unsigned long>(position_));
                 if (chunkRemaining_ == 0) {
                     Serial.printf("[RADIO HTTP] terminal chunk pos=%lu\n",
                                   static_cast<unsigned long>(position_));
@@ -166,8 +157,14 @@ public:
             position_ += received;
             if (chunked_) chunkRemaining_ -= received;
         }
-        if (total == 0 && opened_ && millis() - started >= 5000) {
+        if (total == 0 && opened_ && millis() - started >= STREAM_HTTP_READ_TIMEOUT_MS) {
             readFailure_ = "read timeout";
+            Serial.printf("[RADIO HTTP] read timeout after=%lums pos=%lu chunk_remaining=%lu "
+                          "connected=%s available=%d\n",
+                          static_cast<unsigned long>(millis() - started),
+                          static_cast<unsigned long>(position_),
+                          static_cast<unsigned long>(chunkRemaining_),
+                          client_.connected() ? "yes" : "no", client_.available());
         }
         return total;
     }
@@ -261,218 +258,6 @@ private:
     const char *readFailure_ = "";
 };
 
-class RadioPrefetchSource final : public AudioFileSource {
-public:
-    explicit RadioPrefetchSource(AudioFileSource *network) : network_(network) {}
-
-    bool prefetch(const volatile bool *cancelRequested) {
-        cancelRequested_ = cancelRequested;
-        if (!network_ || !network_->isOpen() || SD_MMC.cardType() == CARD_NONE) return false;
-        if (!SD_MMC.exists(RADIO_SD_FOLDER) && !SD_MMC.mkdir(RADIO_SD_FOLDER)) return false;
-        SD_MMC.remove(STREAM_PREFETCH_PATH);
-        writer_ = SD_MMC.open(STREAM_PREFETCH_PATH, FILE_WRITE);
-        if (!writer_) return false;
-        uint8_t chunk[512] = {};
-        const uint32_t started = millis();
-        while (prefetchedBytes_ < STREAM_PREFETCH_BYTES &&
-               millis() - started < STREAM_PREFETCH_TIMEOUT_MS &&
-               !(cancelRequested && *cancelRequested)) {
-            const size_t requested = min<size_t>(sizeof(chunk),
-                STREAM_PREFETCH_BYTES - prefetchedBytes_);
-            const uint32_t received = network_->read(chunk, requested);
-            if (received == 0) {
-                if (!network_->isOpen()) break;
-                vTaskDelay(pdMS_TO_TICKS(5));
-                continue;
-            }
-            if (writer_.write(chunk, received) != received) break;
-            prefetchedBytes_ += received;
-            producedBytes_ = prefetchedBytes_;
-            vTaskDelay(1);
-        }
-        writer_.flush();
-        writtenBytes_ = prefetchedBytes_;
-        const bool cancelled = cancelRequested && *cancelRequested;
-        Serial.printf("[RADIO PREFETCH] bytes=%u target=%u elapsed=%lums result=%s\n",
-                      static_cast<unsigned>(producedBytes_),
-                      static_cast<unsigned>(STREAM_PREFETCH_BYTES),
-                      static_cast<unsigned long>(millis() - started),
-                      cancelled ? "cancelled" :
-                      producedBytes_ >= STREAM_PREFETCH_BYTES ? "ok" : "partial");
-        if (cancelled || producedBytes_ < STREAM_PREFETCH_BYTES) {
-            Serial.printf("[RADIO PREFETCH] rejected partial cache bytes=%u target=%u "
-                          "http_reason=%s\n",
-                          static_cast<unsigned>(producedBytes_),
-                          static_cast<unsigned>(STREAM_PREFETCH_BYTES),
-                          network_ ? static_cast<RadioHttpSource *>(network_)->readFailure()
-                                   : "none");
-            writer_.close();
-            SD_MMC.remove(STREAM_PREFETCH_PATH);
-            return false;
-        }
-        producerRunning_ = true;
-        producerTaskHandle_ = xTaskCreateStaticPinnedToCore(
-            producerTaskThunk, "radio-fetch", PRODUCER_TASK_STACK_BYTES, this, 3,
-            producerTaskStack, &producerTaskBuffer, 1);
-        if (!producerTaskHandle_) {
-            producerRunning_ = false;
-            return false;
-        }
-        return true;
-    }
-
-    uint32_t read(void *data, uint32_t len) override {
-        if (!data || len == 0) return 0;
-        const uint32_t started = millis();
-        uint32_t total = 0;
-        while (total < len && !(cancelRequested_ && *cancelRequested_)) {
-            const uint32_t received = readAvailable(
-                static_cast<uint8_t *>(data) + total, len - total);
-            if (received > 0) {
-                total += received;
-                continue;
-            }
-            if (!producerRunning_ || millis() - started >= STREAM_REFILL_TIMEOUT_MS) break;
-            vTaskDelay(pdMS_TO_TICKS(2));
-        }
-        if (total < len && producerRunning_) {
-            Serial.printf("[RADIO PREFETCH] refill timeout requested=%u received=%u "
-                          "lead=%u http_reason=%s\n",
-                          static_cast<unsigned>(len), static_cast<unsigned>(total),
-                          static_cast<unsigned>(leadBytes()),
-                          network_ ? static_cast<RadioHttpSource *>(network_)->readFailure()
-                                   : "none");
-        }
-        return total;
-    }
-
-    uint32_t readNonBlock(void *data, uint32_t len) override {
-        if (!data || len == 0) return 0;
-        return readAvailable(data, len);
-    }
-
-    bool close() override {
-        producerRunning_ = false;
-        const uint32_t started = millis();
-        // RadioHttpSource::read can remain in its socket loop for two seconds.
-        // Do not destroy this source until the producer has left that call and
-        // stopped using this object and its File handles.
-        while (producerTaskHandle_ && millis() - started < 3000) vTaskDelay(1);
-        if (producerTaskHandle_) {
-            Serial.println("[RADIO PREFETCH] forcing producer shutdown after timeout");
-            vTaskDelete(producerTaskHandle_);
-            producerTaskHandle_ = nullptr;
-        }
-        if (reader_) reader_.close();
-        if (writer_) writer_.close();
-        const bool closed = network_ ? network_->close() : true;
-        SD_MMC.remove(STREAM_PREFETCH_PATH);
-        return closed;
-    }
-
-    bool isOpen() override {
-        return producedBytes_ > consumedBytes_ || producerRunning_;
-    }
-
-    uint32_t getSize() override { return 0; }
-    uint32_t getPos() override { return consumedBytes_; }
-    bool loop() override { return true; }
-
-    size_t leadBytes() const {
-        return producedBytes_ > consumedBytes_ ? producedBytes_ - consumedBytes_ : 0;
-    }
-
-private:
-    static void producerTaskThunk(void *context) {
-        static_cast<RadioPrefetchSource *>(context)->producerLoop();
-    }
-
-    uint32_t readAvailable(void *data, uint32_t len) {
-        const size_t available = producedBytes_ > consumedBytes_
-            ? producedBytes_ - consumedBytes_ : 0;
-        if (available == 0) return 0;
-        if (!reader_) {
-            reader_ = SD_MMC.open(STREAM_PREFETCH_PATH, FILE_READ);
-            if (!reader_ || !reader_.seek(consumedBytes_)) return 0;
-        } else if (reader_.position() != consumedBytes_ && !reader_.seek(consumedBytes_)) {
-            reader_.close();
-            return 0;
-        }
-        const uint32_t requested = min<uint32_t>(len, available);
-        const uint32_t received = reader_.read(static_cast<uint8_t *>(data), requested);
-        if (received == 0) {
-            // The VFS handle can retain the file size from when it was opened.
-            // Reopen after the producer publishes appended bytes.
-            reader_.close();
-            return 0;
-        }
-        consumedBytes_ += received;
-        return received;
-    }
-
-    void producerLoop() {
-        uint8_t chunk[512] = {};
-        uint32_t lastProgressLogMs = millis();
-        while (producerRunning_ && !(cancelRequested_ && *cancelRequested_)) {
-            if (writtenBytes_ > consumedBytes_ &&
-                writtenBytes_ - consumedBytes_ >= STREAM_PREFETCH_BYTES) {
-                vTaskDelay(pdMS_TO_TICKS(5));
-                continue;
-            }
-            const uint32_t received = network_->read(chunk, sizeof(chunk));
-            if (received == 0) {
-                if (!network_->isOpen()) {
-                    Serial.printf("[RADIO PREFETCH] producer HTTP closed bytes=%u reason=%s\n",
-                                  static_cast<unsigned>(writtenBytes_),
-                                  static_cast<RadioHttpSource *>(network_)->readFailure());
-                    break;
-                }
-                if (millis() - lastProgressLogMs >= 5000) {
-                    Serial.printf("[RADIO PREFETCH] producer waiting lead=%u written=%u "
-                                  "published=%u reason=%s\n",
-                                  static_cast<unsigned>(writtenBytes_ > consumedBytes_
-                                      ? writtenBytes_ - consumedBytes_ : 0),
-                                  static_cast<unsigned>(writtenBytes_),
-                                  static_cast<unsigned>(producedBytes_),
-                                  static_cast<RadioHttpSource *>(network_)->readFailure());
-                    lastProgressLogMs = millis();
-                }
-                vTaskDelay(1);
-                continue;
-            }
-            if (writer_.write(chunk, received) != received) {
-                Serial.printf("[RADIO PREFETCH] producer SD write failed bytes=%u\n",
-                              static_cast<unsigned>(writtenBytes_));
-                break;
-            }
-            writtenBytes_ += received;
-            lastProgressLogMs = millis();
-            // Publish in SD-sized batches. Frequent flushes make the producer
-            // fall behind even when network throughput exceeds playback rate.
-            if (writtenBytes_ - producedBytes_ >= STREAM_PUBLISH_BYTES) {
-                writer_.flush();
-                producedBytes_ = writtenBytes_;
-            }
-            taskYIELD();
-        }
-        writer_.flush();
-        producedBytes_ = writtenBytes_;
-        producerRunning_ = false;
-        producerTaskHandle_ = nullptr;
-        vTaskDelete(nullptr);
-    }
-
-    AudioFileSource *network_ = nullptr;
-    File reader_;
-    File writer_;
-    const volatile bool *cancelRequested_ = nullptr;
-    TaskHandle_t producerTaskHandle_ = nullptr;
-    volatile bool producerRunning_ = false;
-    size_t prefetchedBytes_ = 0;
-    size_t writtenBytes_ = 0;
-    volatile size_t producedBytes_ = 0;
-    volatile size_t consumedBytes_ = 0;
-};
 
 class RadioAudioOutput final : public AudioOutput {
 public:
@@ -886,26 +671,18 @@ void playbackTask(void *) {
                   static_cast<unsigned>(ESP.getFreeHeap()),
                   static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
     RadioHttpSource *source = new RadioHttpSource();
-    RadioPrefetchSource *prefetchSource = source ? new RadioPrefetchSource(source) : nullptr;
     AudioFileSourceBuffer *buffer = nullptr;
     RadioAudioOutput *output = nullptr;
-    const bool prefetchObjectsReady = decoderWorkspace && source && prefetchSource;
-    logMemory(prefetchObjectsReady ? "prefetch objects allocated" : "prefetch allocation failed");
-    const bool httpOpen = prefetchObjectsReady && source->open(requestedUrl);
+    const bool sourceReady = decoderWorkspace && source;
+    logMemory(sourceReady ? "direct stream objects allocated" : "direct stream allocation failed");
+    const bool httpOpen = sourceReady && source->open(requestedUrl);
     logMemory(httpOpen ? "HTTP stream opened" : "HTTP stream open failed");
-    bool prefetchReady = false;
     if (httpOpen) {
-        prefetchReady = prefetchSource->prefetch(&stopRequested);
-    }
-    if (prefetchReady) {
-        // The large decoder block is already reserved. Delay playback-only
-        // allocations until SD has the full lead so lwIP has maximum heap while
-        // receiving the bursty HLS-to-MP3 proxy stream.
         decoder = new AudioGeneratorMP3(decoderWorkspace, decoderBytes);
         output = new RadioAudioOutput(codec);
         streamBufferWorkspace = heap_caps_malloc(STREAM_BUFFER_BYTES, MALLOC_CAP_8BIT);
         buffer = streamBufferWorkspace
-            ? new AudioFileSourceBuffer(prefetchSource, streamBufferWorkspace,
+            ? new AudioFileSourceBuffer(source, streamBufferWorkspace,
                                         STREAM_BUFFER_BYTES)
             : nullptr;
         if (buffer) buffer->RegisterStatusCB(radioBufferStatus, nullptr);
@@ -919,17 +696,17 @@ void playbackTask(void *) {
     }
     const bool bufferReady = buffer != nullptr && streamBufferWorkspace != nullptr;
     bool decoderReady = false;
-    const bool objectsReady = decoder && source && prefetchSource && output;
-    bool started = httpOpen && prefetchReady && objectsReady && bufferReady;
+    const bool objectsReady = decoder && source && output;
+    bool started = httpOpen && objectsReady && bufferReady;
     if (started) {
         logMemory(bufferReady ? "stream buffer allocated" : "stream buffer allocation failed");
         decoderReady = bufferReady && decoder->begin(buffer, output);
         started = decoderReady;
         logMemory(decoderReady ? "MP3 decoder started" : "MP3 decoder begin failed");
     }
-    Serial.printf("[RADIO] Stream %s objects=%s http=%s prefetch=%s buffer=%s decoder=%s url=%s\n",
+    Serial.printf("[RADIO] Stream %s objects=%s http=%s source=direct buffer=%s decoder=%s url=%s\n",
                   started ? "started" : "failed", objectsReady ? "ok" : "failed",
-                  httpOpen ? "ok" : "failed", prefetchReady ? "ok" : "failed",
+                  httpOpen ? "ok" : "failed",
                   bufferReady ? "ok" : "failed",
                   decoderReady ? "ok" : "failed", requestedUrl);
     uint32_t nextBufferLogMs = millis() + 5000;
@@ -937,11 +714,11 @@ void playbackTask(void *) {
         output->resetQuota();
         if (!decoder->loop()) break;
         if (buffer && millis() >= nextBufferLogMs) {
-            Serial.printf("[RADIO BUFFER] ram=%u/%u sd_lead=%u/%u heap=%u largest=%u\n",
+            Serial.printf("[RADIO BUFFER] ram=%u/%u http_pos=%u/%u heap=%u largest=%u\n",
                           static_cast<unsigned>(buffer->getFillLevel()),
                           static_cast<unsigned>(STREAM_BUFFER_BYTES),
-                          static_cast<unsigned>(prefetchSource ? prefetchSource->leadBytes() : 0),
-                          static_cast<unsigned>(STREAM_PREFETCH_BYTES),
+                          static_cast<unsigned>(source ? source->getPos() : 0),
+                          static_cast<unsigned>(source ? source->getSize() : 0),
                           static_cast<unsigned>(ESP.getFreeHeap()),
                           static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
             nextBufferLogMs = millis() + 5000;
@@ -950,11 +727,9 @@ void playbackTask(void *) {
     }
     if (decoder && decoder->isRunning()) decoder->stop();
     if (buffer) buffer->close();
-    else if (prefetchSource) prefetchSource->close();
     else if (source) source->close();
     delete decoder;
     delete buffer;
-    delete prefetchSource;
     delete source;
     delete output;
     free(streamBufferWorkspace);
@@ -1120,8 +895,8 @@ bool process() {
             activeIndex = -1;
         }
         // The tap refresh already rendered the pending row as active and
-        // captured its SD-backed title glyphs. Avoid a second full-page render
-        // while the radio producer is writing the stream cache on SD.
+        // captured its cached title glyphs. Avoid a second full-page render
+        // while the direct radio stream starts.
         return !started;
     }
     if (playbackEnded) {
