@@ -64,10 +64,25 @@ bool downloadFile(const char *url, const char *path, uint32_t minimumBytes) {
     }
 
     if (WiFi.status() != WL_CONNECTED) {
+        constexpr uint8_t MAX_4G_ATTEMPTS = 2;
         size_t written = 0;
-        Serial.printf("[SD] Downloading through 4G: %s\n", url);
-        const bool downloaded = cellularModem.httpGet(url, output, written);
-        output.flush();
+        bool downloaded = false;
+        for (uint8_t attempt = 1; attempt <= MAX_4G_ATTEMPTS; ++attempt) {
+            if (attempt > 1) {
+                output.close();
+                SD_MMC.remove(temporary);
+                output = SD_MMC.open(temporary, FILE_WRITE);
+                if (!output) break;
+            }
+            written = 0;
+            Serial.printf("[SD] Downloading through 4G attempt=%u/%u: %s\n",
+                          attempt, MAX_4G_ATTEMPTS, url);
+            downloaded = cellularModem.httpGet(url, output, written);
+            output.flush();
+            if (downloaded && written >= minimumBytes) break;
+            Serial.printf("[SD] 4G attempt failed bytes=%u\n",
+                          static_cast<unsigned>(written));
+        }
         output.close();
         if (!downloaded || written < minimumBytes) {
             Serial.printf("[SD] 4G download failed bytes=%u minimum=%lu\n",

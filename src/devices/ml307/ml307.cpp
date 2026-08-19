@@ -22,7 +22,21 @@ private:
 
 void logUrcLine(const String &line) {
     constexpr size_t MAX_URC_LOG_CHARS = 160;
+    if (!line.length()) return;
     Serial.print("[ML307 URC] ");
+    if (line.indexOf("+MHTTPURC: \"content\"") >= 0) {
+        const int marker = line.indexOf("\"content\"");
+        int payloadComma = marker;
+        for (int count = 0; count < 5 && payloadComma >= 0; ++count) {
+            payloadComma = line.indexOf(',', payloadComma + 1);
+        }
+        if (payloadComma >= 0) {
+            Serial.write(reinterpret_cast<const uint8_t *>(line.c_str()), payloadComma);
+            Serial.printf(",<hex chars=%u>\n",
+                          static_cast<unsigned>(line.length() - payloadComma - 1));
+            return;
+        }
+    }
     if (line.length() <= MAX_URC_LOG_CHARS) {
         Serial.println(line);
         return;
@@ -91,6 +105,10 @@ void Ml307::begin() {
     // powered and requiring DTR held low. Keep this control line low; treating
     // it as active-high power prevents AT responses on this board.
     digitalWrite(powerPin_, LOW);
+    // Encoded HTTP content URCs are commonly about 3 KiB per line. The default
+    // Arduino UART ring is too small while the task parses/writes the preceding
+    // chunk, causing dropped hex characters and truncated files.
+    serial_.setRxBufferSize(8 * 1024);
     serial_.begin(baud_, SERIAL_8N1, rxPin_, txPin_);
     serial_.setTimeout(200);
     delay(150);
@@ -561,6 +579,9 @@ bool Ml307::httpGetInternal(const char *url, String *payload, Print *output,
     const uint32_t deadline = millis() + timeoutMs;
     bool finished = false;
     bool writeFailed = false;
+    bool transferCorrupt = false;
+    size_t receivedBytes = 0;
+    size_t expectedContentLength = 0;
     while (static_cast<int32_t>(millis() - deadline) < 0) {
         while (serial_.available() > 0) pending += static_cast<char>(serial_.read());
         int newline = pending.indexOf('\n');
@@ -573,24 +594,6 @@ bool Ml307::httpGetInternal(const char *url, String *payload, Print *output,
         line.replace("\r", "");
         logUrcLine(line);
         if (line.indexOf("+MHTTPURC: \"content\"") >= 0) {
-            String hex;
-            if (extractContentHex(line, hex)) {
-                for (int i = 0; i + 1 < hex.length(); i += 2) {
-                    const int high = hexValue(hex[i]);
-                    const int low = hexValue(hex[i + 1]);
-                    if (high < 0 || low < 0) continue;
-                    const uint8_t value = static_cast<uint8_t>((high << 4) | low);
-                    if (payload) *payload += static_cast<char>(value);
-                    if (output) {
-                        if (output->write(value) != 1) {
-                            writeFailed = true;
-                            break;
-                        }
-                        if (bytesWritten) ++*bytesWritten;
-                    }
-                }
-            }
-            if (writeFailed) break;
             int commaCount = 0;
             int contentLength = -1;
             int totalLength = -1;
@@ -605,14 +608,55 @@ bool Ml307::httpGetInternal(const char *url, String *payload, Print *output,
                 if (commaCount == 2) contentLength = value.toInt();
                 if (commaCount == 3) totalLength = value.toInt();
                 if (commaCount == 4) currentLength = value.toInt();
+                if (commaCount >= 4) break;
             }
+            if (contentLength > 0) expectedContentLength = contentLength;
+
+            String hex;
+            size_t decodedBytes = 0;
+            if (extractContentHex(line, hex)) {
+                for (int i = 0; i + 1 < hex.length(); i += 2) {
+                    const int high = hexValue(hex[i]);
+                    const int low = hexValue(hex[i + 1]);
+                    if (high < 0 || low < 0) {
+                        transferCorrupt = true;
+                        break;
+                    }
+                    const uint8_t value = static_cast<uint8_t>((high << 4) | low);
+                    if (payload) *payload += static_cast<char>(value);
+                    if (output) {
+                        if (output->write(value) != 1) {
+                            writeFailed = true;
+                            break;
+                        }
+                        if (bytesWritten) ++*bytesWritten;
+                    }
+                    ++decodedBytes;
+                }
+            } else if (currentLength > 0) {
+                transferCorrupt = true;
+            }
+            receivedBytes += decodedBytes;
+            if (currentLength > 0 && decodedBytes != static_cast<size_t>(currentLength)) {
+                Serial.printf("[ML307 HTTP] Invalid chunk expected=%d decoded=%u cumulative=%d\n",
+                              currentLength, static_cast<unsigned>(decodedBytes), totalLength);
+                transferCorrupt = true;
+            }
+            if (totalLength > 0 && receivedBytes != static_cast<size_t>(totalLength)) {
+                Serial.printf("[ML307 HTTP] Non-contiguous content received=%u cumulative=%d\n",
+                              static_cast<unsigned>(receivedBytes), totalLength);
+                transferCorrupt = true;
+            }
+            if (writeFailed || transferCorrupt) break;
             // ML307 firmware reports HTTP content in several formats. For the
             // playlist endpoint, the final URC is commonly
             // `content,0,0,<total>,0`; the zero content-length field does not
             // mean the body is empty. A positive total plus currentLength=0 is
             // the modem's end-of-body marker.
-            if ((contentLength > 0 && totalLength >= contentLength) ||
-                (totalLength > 0 && currentLength == 0)) {
+            if ((contentLength > 0 && totalLength >= contentLength &&
+                 receivedBytes == static_cast<size_t>(contentLength)) ||
+                (totalLength > 0 && currentLength == 0 &&
+                 receivedBytes == static_cast<size_t>(totalLength))) {
                 finished = true;
             }
         } else if (line.indexOf("+MHTTPURC: \"err\"") >= 0) {
@@ -621,8 +665,17 @@ bool Ml307::httpGetInternal(const char *url, String *payload, Print *output,
         if (finished) break;
     }
     sendCommand("AT+MHTTPDEL=0", 1500, pending);
-    return !writeFailed && finished && ((payload && payload->length() > 0) ||
-                        (bytesWritten && *bytesWritten > 0));
+    const bool exactLength = expectedContentLength == 0 ||
+                             receivedBytes == expectedContentLength;
+    if (!finished || transferCorrupt || !exactLength) {
+        Serial.printf("[ML307 HTTP] Transfer rejected received=%u expected=%u finished=%s corrupt=%s\n",
+                      static_cast<unsigned>(receivedBytes),
+                      static_cast<unsigned>(expectedContentLength),
+                      finished ? "yes" : "no", transferCorrupt ? "yes" : "no");
+    }
+    return !writeFailed && !transferCorrupt && finished && exactLength &&
+           ((payload && payload->length() > 0) ||
+            (bytesWritten && *bytesWritten > 0));
 }
 
 String Ml307::readResponse(uint32_t timeoutMs, const char *tokenA, const char *tokenB) {

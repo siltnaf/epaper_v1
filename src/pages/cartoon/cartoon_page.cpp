@@ -1247,9 +1247,28 @@ bool downloadJpeg(const String &url, const char *destinationPath) {
         MemoryBudget::log("jpeg-skip");
         return false;
     }
-    if (WiFi.status() != WL_CONNECTED ||
-        !ensureCacheDirectory(selectedSlug, selectedChapterId)) {
-        copyText(statusText, sizeof(statusText), "SD OR WIFI NOT READY");
+    if (!ensureCacheDirectory(selectedSlug, selectedChapterId)) {
+        copyText(statusText, sizeof(statusText), "SD NOT READY");
+        return false;
+    }
+    // The modem does not expose the same HTTPClient stream API as WiFi, so
+    // reuse SdCard::downloadFile(), which already routes through
+    // cellularModem.httpGet() when WiFi is down. Without this the reader could
+    // list chapters over 4G but never fetch a single page image.
+    if (WiFi.status() != WL_CONNECTED) {
+        const bool downloaded = SdCard::downloadFile(url.c_str(), destinationPath, 128);
+        if (downloaded && validCachedJpeg(destinationPath, &jpegSize)) {
+            Serial.printf("[CARTOON JPEG] 4G downloaded path=%s bytes=%u\n",
+                          destinationPath, static_cast<unsigned>(jpegSize));
+            return true;
+        }
+        if (downloaded) {
+            Serial.printf("[CARTOON JPEG] 4G download failed validation path=%s\n",
+                          destinationPath);
+            SD_MMC.remove(destinationPath);
+        }
+        jpegSize = 0;
+        copyText(statusText, sizeof(statusText), "IMAGE DOWNLOAD FAILED");
         return false;
     }
     const String temporaryPath = String(destinationPath) + ".part";
@@ -1330,7 +1349,22 @@ bool downloadJpeg(const String &url, const char *destinationPath) {
 }
 
 uint16_t fetchReaderPageCount(const String &url) {
-    if (WiFi.status() != WL_CONNECTED) return 1;
+    if (WiFi.status() != WL_CONNECTED) {
+        // Manifest is a small JSON object; the 4G-capable text fetcher already
+        // returns it through cellularModem.httpGet() when WiFi is unavailable.
+        String payload;
+        if (!httpGetText(url, payload, 20000)) return 1;
+        JsonDocument filter;
+        filter["page_count"] = true;
+        JsonDocument document;
+        const DeserializationError jsonError = deserializeJson(
+            document, payload, DeserializationOption::Filter(filter));
+        const uint16_t pageTotal = jsonError
+            ? 1 : max<uint16_t>(1, document["page_count"] | 1);
+        Serial.printf("[CARTOON MANIFEST] 4G json=%s pages=%u url=%s\n",
+                      jsonError.c_str(), pageTotal, url.c_str());
+        return pageTotal;
+    }
     for (uint8_t attempt = 1; attempt <= 2; ++attempt) {
         HTTPClient http;
         WiFiClient client;
@@ -1400,14 +1434,23 @@ bool openChapter(const ListItem &chapter) {
     char pageCountPath[176] = {};
     snprintf(pageCountPath, sizeof(pageCountPath), "%s/%s/%s/page-count.txt",
              CARTOON_SD_FOLDER, safeSlug, safeChapter);
+    readerPageTotal = 1;
     File pageCountFile = SD_MMC.open(pageCountPath, FILE_READ);
-    if (pageCountFile) {
+    const bool pageCountCached = static_cast<bool>(pageCountFile);
+    if (pageCountCached) {
         readerPageTotal = max<uint16_t>(1, pageCountFile.parseInt());
         pageCountFile.close();
-    } else {
+    }
+    // Older 4G firmware could not fetch the chapter manifest and cached the
+    // fallback value 1. Revalidate suspicious one-page metadata whenever an
+    // Internet transport is available so next-page gestures are not disabled
+    // forever by that stale cache entry.
+    if ((!pageCountCached || readerPageTotal <= 1) &&
+        (WiFi.status() == WL_CONNECTED || cellularModem.isConnected())) {
         readerPageTotal = fetchReaderPageCount(
             apiBase() + "/" + selectedSlug + "/chapter/" + selectedChapterId);
         if (ensureCacheDirectory(selectedSlug, selectedChapterId)) {
+            SD_MMC.remove(pageCountPath);
             pageCountFile = SD_MMC.open(pageCountPath, FILE_WRITE);
             if (pageCountFile) {
                 pageCountFile.print(readerPageTotal);
@@ -1711,6 +1754,31 @@ bool handleTap(int16_t x, int16_t y) {
         return index < chapterRowCount && openChapter(chapterRows[index]);
     }
     return false;
+}
+
+bool handleSwipe(int16_t deltaX, int16_t deltaY) {
+    if (view != View::Reader) return false;
+    constexpr int16_t SWIPE_THRESHOLD = 35;
+    const bool horizontal = abs(deltaX) >= abs(deltaY);
+    const int16_t primaryDelta = horizontal ? deltaX : deltaY;
+    if (abs(primaryDelta) < SWIPE_THRESHOLD) return false;
+
+    // Match the other readers: sweeping content left/up advances and
+    // sweeping right/down goes back.
+    const bool next = primaryDelta < 0;
+    if (next) {
+        if (readerPage >= readerPageTotal) return false;
+        ++readerPage;
+    } else {
+        if (readerPage <= 1) return false;
+        --readerPage;
+    }
+    const bool loaded = loadReaderPage();
+    if (loaded) refreshMode = RefreshMode::ImageContent;
+    Serial.printf("[CARTOON SWIPE] %s page=%u/%u axis=%s loaded=%s\n",
+                  next ? "next" : "previous", readerPage, readerPageTotal,
+                  horizontal ? "horizontal" : "vertical", loaded ? "yes" : "no");
+    return loaded;
 }
 
 RefreshMode takeRefreshMode() {

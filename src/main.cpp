@@ -163,6 +163,7 @@ void refreshCurrentRegion(uint16_t x, uint16_t y, uint16_t width, uint16_t heigh
 void startCalculatorRefresh();
 void refreshBookReaderContent();
 void refreshBookLibraryContent();
+void refreshCartoonTopbar();
 bool refreshPendingBookOpenPressed();
 void openLocalBookReaderFast();
 void wipeContentAreaWhite(bool sleepAfter = true);
@@ -885,6 +886,7 @@ void refreshCartoonLayout() {
                               XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT - contentTop);
         std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
         epaper.sleep();
+        refreshCartoonTopbar();
         return;
     }
     // Cartoon playlist, chapter list, and reader use different controls and
@@ -969,6 +971,40 @@ void refreshCartoonImageContent() {
                           XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT - contentTop);
     std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
     epaper.sleep();
+    refreshCartoonTopbar();
+}
+
+void refreshCartoonTopbar() {
+    constexpr uint16_t topBarHeight = 32;
+    constexpr uint32_t blackSettleMs = 600;
+    constexpr size_t topBarBytes = static_cast<size_t>(topBarHeight) *
+                                   (XingtaiEpd::WIDTH / 8);
+
+    // Re-drive the fixed icons after every cartoon image update. Do not
+    // physically wipe the bar white first: use the inverse of the desired bar
+    // as the temporary old plane so both black and white pixels receive an
+    // active transition without a visible white flash.
+    std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
+    clearFrameRegion(transitionFrame, 0, 0, XingtaiEpd::WIDTH, topBarHeight);
+    Topbar::drawHome(transitionFrame, 4, 2);
+    if (WiFi.status() == WL_CONNECTED) Topbar::drawWifi(transitionFrame, 181, 2);
+    else if (cellularModem.isConnected()) Topbar::draw4G(transitionFrame, 184, 2);
+    Topbar::drawBattery(transitionFrame, 209, 2);
+
+    for (size_t index = 0; index < topBarBytes; ++index) {
+        frame[index] = static_cast<uint8_t>(~transitionFrame[index]);
+    }
+
+    epaper.displayPartial(frame, transitionFrame, 0, 0,
+                          XingtaiEpd::WIDTH, topBarHeight);
+    std::memcpy(frame, transitionFrame, topBarBytes);
+    // Leave the freshly driven black particles undisturbed before putting the
+    // controller into deep sleep. This produces darker, more stable icons after
+    // the large cartoon-image waveform has disturbed the adjacent top rows.
+    delay(blackSettleMs);
+    epaper.sleep();
+    Serial.printf("[CARTOON EPD] Top bar redrawn with %lums black settle\n",
+                  static_cast<unsigned long>(blackSettleMs));
 }
 
 void refreshBookReaderContent() {
@@ -2107,7 +2143,9 @@ void handleTouch(TPoint point, TEvent event) {
             const int16_t deltaY = touchGestureLastY - touchGestureStartY;
             touchGestureActive = false;
             const bool poemPopupOpen = currentPage == PageId::Poem && PoemPage::isPopupOpen();
-            const bool isSwipe = (poemPopupOpen || currentPage == PageId::Book ||
+            const bool isSwipe = (poemPopupOpen ||
+                 (currentPage == PageId::Cartoon && CartoonPage::isReader()) ||
+                 currentPage == PageId::Book ||
                  currentPage == PageId::Voice || currentPage == PageId::Music ||
                  currentPage == PageId::Poem || currentPage == PageId::Word) &&
                 touchGestureStartY >= 32 &&
@@ -2118,6 +2156,8 @@ void handleTouch(TPoint point, TEvent event) {
                               touchGestureLastX, touchGestureLastY, deltaX, deltaY);
                 const bool changed = poemPopupOpen
                     ? PoemPage::handleSwipe(deltaX, deltaY)
+                    : currentPage == PageId::Cartoon
+                    ? CartoonPage::handleSwipe(deltaX, deltaY)
                     : currentPage == PageId::Book
                     ? BookPage::handleSwipe(deltaX, deltaY)
                     : currentPage == PageId::Voice
@@ -2130,6 +2170,8 @@ void handleTouch(TPoint point, TEvent event) {
                 if (changed) {
                     if (poemPopupOpen || (currentPage == PageId::Poem && PoemPage::isPopupOpen())) {
                         refreshPoemDisplay();
+                    } else if (currentPage == PageId::Cartoon) {
+                        refreshCartoonImageContent();
                     } else if (currentPage == PageId::Book &&
                                BookPage::takeReaderContentRefreshRequest()) {
                         const BookPage::ReaderControl control =
