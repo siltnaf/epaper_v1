@@ -18,6 +18,18 @@ private:
     SemaphoreHandle_t mutex_;
     bool locked_ = false;
 };
+
+void logUrcLine(const String &line) {
+    constexpr size_t MAX_URC_LOG_CHARS = 160;
+    Serial.print("[ML307 URC] ");
+    if (line.length() <= MAX_URC_LOG_CHARS) {
+        Serial.println(line);
+        return;
+    }
+
+    Serial.write(reinterpret_cast<const uint8_t *>(line.c_str()), MAX_URC_LOG_CHARS);
+    Serial.printf("... (%u chars)\n", static_cast<unsigned>(line.length()));
+}
 }
 
 Ml307::Ml307(HardwareSerial &serial, int rxPin, int txPin, int powerPin,
@@ -35,15 +47,16 @@ void Ml307::begin() {
     }
 
     pinMode(powerPin_, OUTPUT);
-    // GPIO11 is the board's modem power-enable line. The ML307 reference code
-    // assumes the module is otherwise powered and only controls this enable.
+    // The standalone ML307 test project documents the module as externally
+    // powered and requiring DTR held low. Keep this control line low; treating
+    // it as active-high power prevents AT responses on this board.
     digitalWrite(powerPin_, LOW);
     serial_.begin(baud_, SERIAL_8N1, rxPin_, txPin_);
     serial_.setTimeout(200);
     delay(150);
     while (serial_.available() > 0) serial_.read();
     started_ = true;
-    Serial.printf("[ML307] UART0 started baud=%lu RX=GPIO%d TX=GPIO%d PWR=GPIO%d\n",
+    Serial.printf("[ML307] UART1 started baud=%lu RX=GPIO%d TX=GPIO%d DTR=GPIO%d LOW\n",
                   static_cast<unsigned long>(baud_), rxPin_, txPin_, powerPin_);
 }
 
@@ -51,7 +64,7 @@ void Ml307::setPowered(bool powered) {
     begin();
     if (powered_ == powered) return;
 
-    digitalWrite(powerPin_, powered ? HIGH : LOW);
+    digitalWrite(powerPin_, LOW);
     powered_ = powered;
     if (powered) {
         poweredAtMs_ = millis();
@@ -59,7 +72,7 @@ void Ml307::setPowered(bool powered) {
         poweredAtMs_ = 0;
         connected_ = false;
     }
-    Serial.printf("[ML307] power=%s\n", powered ? "ON" : "OFF");
+    Serial.printf("[ML307] logical power=%s DTR=LOW\n", powered ? "ON" : "OFF");
 }
 
 bool Ml307::probeConnection() {
@@ -328,7 +341,7 @@ bool Ml307::httpGetInternal(const char *url, String *payload, Print *output,
         String line = pending.substring(0, newline);
         pending.remove(0, newline + 1);
         line.replace("\r", "");
-        Serial.printf("[ML307 URC] %s\n", line.c_str());
+        logUrcLine(line);
         if (line.indexOf("+MHTTPURC: \"content\"") >= 0) {
             String hex;
             if (extractContentHex(line, hex)) {

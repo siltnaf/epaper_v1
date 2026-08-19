@@ -227,7 +227,10 @@ bool inRect(int16_t x, int16_t y, int left, int top, int width, int height) {
 void clippedText(uint8_t *frame, int x, int y, const char *value, int maxCharacters, int scale = 1) {
     char clipped[34] = {};
     if (!value) return;
-    std::strncpy(clipped, value, static_cast<size_t>(maxCharacters));
+    const size_t limit = maxCharacters > 0
+        ? min(static_cast<size_t>(maxCharacters), sizeof(clipped) - 1)
+        : 0;
+    std::strncpy(clipped, value, limit);
     text(frame, x, y, clipped, scale);
 }
 

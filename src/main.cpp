@@ -134,6 +134,9 @@ int16_t touchGestureLastY = 0;
 volatile bool touchInterruptPending = false;
 volatile uint32_t touchInterruptTick = 0;
 volatile bool touchWorkflowPriority = false;
+constexpr uint32_t STARTUP_TOUCH_GUARD_MS = 1500;
+uint32_t touchInputEnabledAtMs = 0;
+bool startupTouchGuardLogged = false;
 PageId openingLoadPage = PageId::Main;
 bool openingLoadVisible = false;
 bool suppressNextAudioTap = false;
@@ -305,22 +308,29 @@ bool contentUrlReachable(const char *url) {
     }
 
     UiLoadingIndicator::Scope loadingIndicator;
-    if (WiFi.status() != WL_CONNECTED) {
+    if (WiFi.status() == WL_CONNECTED) {
+        HTTPClient http;
+        http.setConnectTimeout(5000);
+        http.setTimeout(5000);
+        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        if (http.begin(url)) {
+            const int responseCode = http.GET();
+            http.end();
+            Serial.printf("[CONTENT URL] WiFi validation %s returned HTTP code %d\n",
+                          url, responseCode);
+            if (responseCode > 0) return true;
+        }
+    }
+
+    if (cellularModem.isConnected()) {
         String payload;
         const bool reachable = cellularModem.httpGet(url, payload, 10000);
         Serial.printf("[CONTENT URL] 4G validation %s %s\n", url,
                       reachable ? "succeeded" : "failed");
         return reachable;
     }
-    HTTPClient http;
-    http.setConnectTimeout(5000);
-    http.setTimeout(5000);
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    if (!http.begin(url)) return false;
-    const int responseCode = http.GET();
-    http.end();
-    Serial.printf("[CONTENT URL] Validation %s returned HTTP code %d\n", url, responseCode);
-    return responseCode > 0;
+    Serial.printf("[CONTENT URL] No validation transport available for %s\n", url);
+    return false;
 }
 
 void copyAsciiUpper(char *destination, size_t destinationSize, const String &source) {
@@ -1990,6 +2000,23 @@ void handleTouch(TPoint point, TEvent event) {
         }
         return;
     }
+
+    if (touchInputEnabledAtMs != 0 &&
+        static_cast<int32_t>(millis() - touchInputEnabledAtMs) < 0) {
+        if (!startupTouchGuardLogged) {
+            Serial.printf("[TOUCH] Ignoring startup touch event raw=(%u,%u) event=%u for %lums\n",
+                          point.x, point.y, static_cast<unsigned>(event),
+                          static_cast<unsigned long>(touchInputEnabledAtMs - millis()));
+            startupTouchGuardLogged = true;
+        }
+        touchGestureActive = false;
+        homeTouchActive = false;
+        suppressMainIconReleaseTap = false;
+        immediateControlPressHandled = false;
+        calculatorPressHandled = false;
+        return;
+    }
+
     int16_t x = 0;
     int16_t y = 0;
     if (!rawToDisplay(point, x, y)) {
@@ -2941,8 +2968,9 @@ void processTouchAction() {
 
 }
 
-// GPIO43/GPIO44 are the board's UART0 route to the ML307.
-Ml307 cellularModem(Serial0, BoardPins::MODEM_RX, BoardPins::MODEM_TX,
+// GPIO43/GPIO44 are the board's UART1 route to the ML307, matching the
+// standalone ESP-IDF test firmware in D:\project\epaper_test.
+Ml307 cellularModem(Serial1, BoardPins::MODEM_RX, BoardPins::MODEM_TX,
                     BoardPins::MODEM_PWR);
 
 void setup() {
@@ -3059,6 +3087,10 @@ void setup() {
                   audio.isOnline() ? "yes" : "no", audio.isInitialized() ? "yes" : "no",
                   touch.isOnline() ? "yes" : "no", digitalRead(BoardPins::TOUCH_INT));
     MemoryBudget::log("ready");
+    touchInputEnabledAtMs = millis() + STARTUP_TOUCH_GUARD_MS;
+    startupTouchGuardLogged = false;
+    Serial.printf("[BOOT] Touch input guard active for %lums\n",
+                  static_cast<unsigned long>(STARTUP_TOUCH_GUARD_MS));
     Serial.println("[BOOT] Startup sequence complete; entering touch monitoring");
     Serial.println("========================================");
 }
