@@ -30,9 +30,16 @@
 namespace {
 
 constexpr uint8_t ITEMS_PER_PAGE = 10;
+// AudioFileSourceBuffer provides a circular compressed-data buffer. Keep the
+// total internal-RAM reservation at 2 KiB; a second 2 KiB buffer would starve
+// the MP3 decoder on this no-PSRAM ESP32-S3.
 constexpr uint16_t STREAM_BUFFER_BYTES = 2 * 1024;
 constexpr uint32_t STREAM_HTTP_READ_TIMEOUT_MS = 15000;
+constexpr uint32_t STREAM_CHUNK_LOG_INTERVAL_BYTES = 128 * 1024;
 constexpr uint16_t PLAYBACK_TASK_STACK_BYTES = 4608;
+// Priority 2 is the tested audible configuration. Using the absolute highest
+// priority on the Arduino/I2S core can prevent normal codec servicing.
+constexpr UBaseType_t PLAYBACK_TASK_PRIORITY = 2;
 constexpr int LIST_TOP = 82;
 constexpr int ROW_HEIGHT = 30;
 constexpr int ROW_GAP = 2;
@@ -70,12 +77,17 @@ public:
         }
         std::strncpy(path_, path ? path : "/", sizeof(path_) - 1);
         path_[sizeof(path_) - 1] = '\0';
-        client_.setTimeout(2);
-        if (!client_.connect(host_, port_)) return false;
-        client_.printf("GET %s HTTP/1.1\r\nHost: %s\r\n"
-                       "User-Agent: ESP32-ePaper-Radio/1.0\r\n"
-                       "Accept: audio/mpeg\r\nConnection: close\r\n\r\n",
-                       path_, host_);
+        wifiClient_.setTimeout(2);
+        modemClient_ = cellularModem.isConnected() ? new Ml307TcpClient(cellularModem) : nullptr;
+        client_ = WiFi.status() == WL_CONNECTED
+            ? static_cast<Client *>(&wifiClient_)
+            : static_cast<Client *>(modemClient_);
+        transport_ = client_ == &wifiClient_ ? "wifi" : "4g";
+        if (!client_ || !client_->connect(host_, port_)) return close(), false;
+        client_->printf("GET %s HTTP/1.1\r\nHost: %s\r\n"
+                        "User-Agent: ESP32-ePaper-Radio/1.0\r\n"
+                        "Accept: audio/mpeg\r\nConnection: close\r\n\r\n",
+                        path_, host_);
         char line[160] = {};
         if (!readLine(line, sizeof(line), 5000)) return close(), false;
         int status = 0;
@@ -92,8 +104,9 @@ public:
             }
         }
         opened_ = true;
-        Serial.printf("[RADIO HTTP] connected host=%s port=%u chunked=%s length=%ld\n",
-                      host_, port_, chunked_ ? "yes" : "no",
+        nextChunkLogPosition_ = STREAM_CHUNK_LOG_INTERVAL_BYTES;
+        Serial.printf("[RADIO HTTP] connected transport=%s host=%s port=%u chunked=%s length=%ld\n",
+                      transport_, host_, port_, chunked_ ? "yes" : "no",
                       static_cast<long>(contentLength_));
         return true;
     }
@@ -124,8 +137,11 @@ public:
                     break;
                 }
                 chunkRemaining_ = static_cast<uint32_t>(chunkSize);
-                Serial.printf("[RADIO HTTP] chunk size=%lu pos=%lu\n",
-                              chunkSize, static_cast<unsigned long>(position_));
+                if (position_ >= nextChunkLogPosition_) {
+                    Serial.printf("[RADIO HTTP] progress pos=%lu next_chunk=%lu\n",
+                                  static_cast<unsigned long>(position_), chunkSize);
+                    nextChunkLogPosition_ = position_ + STREAM_CHUNK_LOG_INTERVAL_BYTES;
+                }
                 if (chunkRemaining_ == 0) {
                     Serial.printf("[RADIO HTTP] terminal chunk pos=%lu\n",
                                   static_cast<unsigned long>(position_));
@@ -135,9 +151,9 @@ public:
                 }
                 chunkNeedsCrlf_ = true;
             }
-            const int available = client_.available();
+            const int available = client_ ? client_->available() : 0;
             if (available <= 0) {
-                if (!client_.connected()) {
+                if (!client_ || !client_->connected()) {
                     readFailure_ = "socket closed";
                     opened_ = false;
                     break;
@@ -147,7 +163,7 @@ public:
             }
             uint32_t requested = min<uint32_t>(len - total, static_cast<uint32_t>(available));
             if (chunked_) requested = min<uint32_t>(requested, chunkRemaining_);
-            const int received = client_.read(output + total, requested);
+            const int received = client_->read(output + total, requested);
             if (received <= 0) {
                 readFailure_ = "socket read failed";
                 break;
@@ -164,17 +180,25 @@ public:
                           static_cast<unsigned long>(millis() - started),
                           static_cast<unsigned long>(position_),
                           static_cast<unsigned long>(chunkRemaining_),
-                          client_.connected() ? "yes" : "no", client_.available());
+                           client_ && client_->connected() ? "yes" : "no",
+                           client_ ? client_->available() : 0);
         }
         return total;
     }
 
     uint32_t readNonBlock(void *data, uint32_t len) override {
-        if (!opened_ || client_.available() <= 0) return 0;
+        if (!opened_ || !client_ || client_->available() <= 0) return 0;
         return read(data, len);
     }
-    bool close() override { client_.stop(); reset(); return true; }
-    bool isOpen() override { return opened_ && (client_.connected() || client_.available()); }
+    bool close() override {
+        if (client_) client_->stop();
+        delete modemClient_;
+        modemClient_ = nullptr;
+        client_ = nullptr;
+        reset();
+        return true;
+    }
+    bool isOpen() override { return opened_ && client_ && (client_->connected() || client_->available()); }
     uint32_t getSize() override { return contentLength_ > 0 ? contentLength_ : 0; }
     uint32_t getPos() override { return position_; }
     const char *readFailure() const { return readFailure_; }
@@ -188,6 +212,7 @@ private:
         contentLength_ = -1;
         position_ = 0;
         readFailure_ = "";
+        nextChunkLogPosition_ = STREAM_CHUNK_LOG_INTERVAL_BYTES;
         port_ = 80;
         host_[0] = '\0';
         path_[0] = '\0';
@@ -197,12 +222,12 @@ private:
         size_t used = 0;
         const uint32_t started = millis();
         while (millis() - started < timeoutMs) {
-            if (client_.available() <= 0) {
-                if (!client_.connected()) break;
+            if (!client_ || client_->available() <= 0) {
+                if (!client_ || !client_->connected()) break;
                 vTaskDelay(1);
                 continue;
             }
-            const int value = client_.read();
+            const int value = client_->read();
             if (value < 0) continue;
             if (value == '\n') { line[used] = '\0'; return true; }
             if (value != '\r' && used + 1 < size) line[used++] = static_cast<char>(value);
@@ -224,8 +249,8 @@ private:
     int readByte(uint32_t timeoutMs) {
         const uint32_t started = millis();
         while (millis() - started < timeoutMs) {
-            if (client_.available() > 0) return client_.read();
-            if (!client_.connected()) return -1;
+            if (client_ && client_->available() > 0) return client_->read();
+            if (!client_ || !client_->connected()) return -1;
             vTaskDelay(1);
         }
         return -1;
@@ -245,7 +270,10 @@ private:
         return false;
     }
 
-    WiFiClient client_;
+    WiFiClient wifiClient_;
+    Ml307TcpClient *modemClient_ = nullptr;
+    Client *client_ = nullptr;
+    const char *transport_ = "none";
     char host_[96] = {};
     char path_[384] = {};
     uint16_t port_ = 80;
@@ -255,6 +283,7 @@ private:
     uint32_t chunkRemaining_ = 0;
     int32_t contentLength_ = -1;
     uint32_t position_ = 0;
+    uint32_t nextChunkLogPosition_ = STREAM_CHUNK_LOG_INTERVAL_BYTES;
     const char *readFailure_ = "";
 };
 
@@ -360,6 +389,7 @@ bool stationHasMore = false;
 int8_t selectedIndex = -1;
 int8_t activeIndex = -1;
 int8_t pendingIndex = -1;
+uint32_t pendingRetryAtMs = 0;
 char contentBaseUrl[128] = "http://";
 char statusText[64] = {};
 Es8311 *codec = nullptr;
@@ -562,7 +592,7 @@ bool loadStations(uint16_t requestedOffset = 0) {
     snprintf(cacheSlot, sizeof(cacheSlot), "offset-%u", requestedOffset);
     bool fetchedRemote = false;
     if (WiFi.status() != WL_CONNECTED) {
-        if (!cellularModem.httpGet(url.c_str(), payload)) {
+        if (!cellularModem.httpGet(url.c_str(), payload, 45000)) {
             if (!PlaylistCache::load(RADIO_SD_FOLDER, endpoint, cacheSlot, payload)) {
                 copyText(statusText, sizeof(statusText), UiLocalization::isChinese()
                     ? "网络未连接" : "NETWORK NOT CONNECTED");
@@ -725,6 +755,16 @@ void playbackTask(void *) {
         }
         vTaskDelay(pdMS_TO_TICKS(1));
     }
+    Serial.printf("[RADIO] Playback loop ended stop=%s decoder_running=%s http_open=%s "
+                  "http_pos=%lu failure=%s heap=%u largest=%u stack_free=%u\n",
+                  stopRequested ? "yes" : "no",
+                  decoder && decoder->isRunning() ? "yes" : "no",
+                  source && source->isOpen() ? "yes" : "no",
+                  static_cast<unsigned long>(source ? source->getPos() : 0),
+                  source && source->readFailure()[0] ? source->readFailure() : "none",
+                  static_cast<unsigned>(ESP.getFreeHeap()),
+                  static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)),
+                  static_cast<unsigned>(uxTaskGetStackHighWaterMark(nullptr)));
     if (decoder && decoder->isRunning()) decoder->stop();
     if (buffer) buffer->close();
     else if (source) source->close();
@@ -756,6 +796,12 @@ bool startStream(uint8_t index) {
                       stopRequested ? "yes" : "no");
         return false;
     }
+    if (WiFi.status() != WL_CONNECTED && !cellularModem.isConnected()) {
+        copyText(statusText, sizeof(statusText), UiLocalization::isChinese()
+            ? "正在连接4G网络" : "CONNECTING 4G");
+        Serial.println("[RADIO] Stream start deferred: no WiFi and ML307 is not connected yet");
+        return false;
+    }
     OpusPlayer::stop();
     const String url = absoluteStreamUrl(stations[index].streamPath);
     copyText(requestedUrl, sizeof(requestedUrl), url.c_str());
@@ -764,10 +810,13 @@ bool startStream(uint8_t index) {
     playbackEnded = false;
     playbackActive = true;
     if (xTaskCreatePinnedToCore(playbackTask, "radio-playback",
-                                PLAYBACK_TASK_STACK_BYTES, nullptr, 2,
+                                PLAYBACK_TASK_STACK_BYTES, nullptr,
+                                PLAYBACK_TASK_PRIORITY,
                                 &playbackTaskHandle, 0) != pdPASS) {
-        Serial.printf("[RADIO] Playback task creation failed stack=%u heap=%u largest=%u\n",
+        Serial.printf("[RADIO] Playback task creation failed stack=%u priority=%u "
+                      "heap=%u largest=%u\n",
                       static_cast<unsigned>(PLAYBACK_TASK_STACK_BYTES),
+                      static_cast<unsigned>(PLAYBACK_TASK_PRIORITY),
                       static_cast<unsigned>(ESP.getFreeHeap()),
                       static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
         playbackActive = false;
@@ -796,6 +845,7 @@ void open() {
     selectedIndex = -1;
     activeIndex = -1;
     pendingIndex = -1;
+    pendingRetryAtMs = 0;
     stationCount = 0;
     copyText(statusText, sizeof(statusText), UiLocalization::isChinese()
         ? "正在获取电台" : "LOADING RADIO");
@@ -872,6 +922,7 @@ bool handleTap(int16_t x, int16_t y) {
         stop();
         selectedIndex = index;
         pendingIndex = index;
+        pendingRetryAtMs = 0;
         Serial.printf("[RADIO TOUCH] selected index=%u name=%s url=%s\n",
                       index, stations[index].name, stations[index].streamPath);
         return true;
@@ -881,6 +932,9 @@ bool handleTap(int16_t x, int16_t y) {
 
 bool process() {
     if (pendingIndex >= 0) {
+        if (pendingRetryAtMs && static_cast<int32_t>(millis() - pendingRetryAtMs) < 0) {
+            return false;
+        }
         const int8_t index = pendingIndex;
         pendingIndex = -1;
         const bool started = startStream(static_cast<uint8_t>(index));
@@ -889,10 +943,18 @@ bool process() {
         if (started) {
             activeIndex = index;
             selectedIndex = -1;
+            pendingRetryAtMs = 0;
             marqueeOffset = 0;
+        } else if (WiFi.status() != WL_CONNECTED && !cellularModem.isConnected()) {
+            pendingIndex = index;
+            selectedIndex = index;
+            activeIndex = -1;
+            pendingRetryAtMs = millis() + 1000;
+            return false;
         } else {
             selectedIndex = -1;
             activeIndex = -1;
+            pendingRetryAtMs = 0;
         }
         // The tap refresh already rendered the pending row as active and
         // captured its cached title glyphs. Avoid a second full-page render
@@ -945,6 +1007,7 @@ void renderMarquee(uint8_t *destination, const uint8_t *currentFrame) {
 
 void stop() {
     pendingIndex = -1;
+    pendingRetryAtMs = 0;
     if (playbackTaskHandle || playbackActive) {
         stopRequested = true;
         const uint32_t started = millis();

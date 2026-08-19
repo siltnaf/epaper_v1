@@ -447,7 +447,10 @@ bool loadCartoons(int32_t requestedOffset, bool forceRemote = false,
     cartoonTotal = max<uint16_t>(responseTotal, responseOffset);
     cartoonOffset = responseOffset;
     cartoonHasMore = document["has_more"] | false;
-    const bool offline = WiFi.status() != WL_CONNECTED;
+    // A successful ML307 request is online content too. Treating every
+    // non-WiFi session as offline filtered out all fresh 4G cartoons unless
+    // their chapters were already cached on SD.
+    const bool offline = WiFi.status() != WL_CONNECTED && !cellularModem.isConnected();
     for (JsonObject item : document["cartoons"].as<JsonArray>()) {
         if (cartoonCount >= ROWS_PER_PAGE) break;
         copyText(cartoons[cartoonCount].id, sizeof(cartoons[cartoonCount].id), item["id"] | "");
@@ -472,6 +475,11 @@ bool loadCartoons(int32_t requestedOffset, bool forceRemote = false,
     cartoonPage = max<uint16_t>(
         1, (cartoonOffset + ROWS_PER_PAGE - 1) / ROWS_PER_PAGE + 1);
     copyText(statusText, sizeof(statusText), cartoonCount ? "" : "NO CARTOONS");
+    Serial.printf("[CARTOON API] parsed count=%u total=%u offset=%u has_more=%s transport=%s\n",
+                  cartoonCount, cartoonTotal, cartoonOffset,
+                  cartoonHasMore ? "true" : "false",
+                  WiFi.status() == WL_CONNECTED ? "wifi" :
+                  cellularModem.isConnected() ? "4g" : "offline");
     return cartoonCount > 0 || cartoonTotal == 0;
 }
 

@@ -3,6 +3,7 @@
 namespace {
 constexpr char ML307_SERVER[] = "43.133.150.106";
 constexpr uint16_t ML307_SERVER_PORT = 8081;
+constexpr uint8_t ML307_TCP_STREAM_ID = 0;
 
 class ModemLock {
 public:
@@ -31,6 +32,45 @@ void logUrcLine(const String &line) {
     Serial.printf("... (%u chars)\n", static_cast<unsigned>(line.length()));
 }
 }
+
+Ml307TcpClient::Ml307TcpClient(Ml307 &modem) : modem_(modem) {}
+
+int Ml307TcpClient::connect(IPAddress ip, uint16_t port) {
+    char host[16] = {};
+    snprintf(host, sizeof(host), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+    return connect(host, port);
+}
+
+int Ml307TcpClient::connect(const char *host, uint16_t port) {
+    return modem_.openTcpStream(host, port) ? 1 : 0;
+}
+
+size_t Ml307TcpClient::write(uint8_t value) { return write(&value, 1); }
+
+size_t Ml307TcpClient::write(const uint8_t *buffer, size_t size) {
+    return modem_.writeTcpStream(buffer, size);
+}
+
+int Ml307TcpClient::available() { return modem_.availableTcpStream(); }
+
+int Ml307TcpClient::read() {
+    uint8_t value = 0;
+    return read(&value, 1) == 1 ? value : -1;
+}
+
+int Ml307TcpClient::read(uint8_t *buffer, size_t size) {
+    return modem_.readTcpStream(buffer, size);
+}
+
+int Ml307TcpClient::peek() { return modem_.peekTcpStream(); }
+
+void Ml307TcpClient::flush() {}
+
+void Ml307TcpClient::stop() { modem_.closeTcpStream(); }
+
+uint8_t Ml307TcpClient::connected() { return modem_.tcpStreamConnected() ? 1 : 0; }
+
+Ml307TcpClient::operator bool() { return connected(); }
 
 Ml307::Ml307(HardwareSerial &serial, int rxPin, int txPin, int powerPin,
              uint32_t baud)
@@ -147,15 +187,21 @@ bool Ml307::ensureTcpConnection() {
         return true;
     }
 
+    return openTcpConnection(ML307_SERVER, ML307_SERVER_PORT);
+}
+
+bool Ml307::openTcpConnection(const char *host, uint16_t port) {
+    String response;
     sendCommand("AT+MIPCLOSE=0", 5000, response);
+
     if (!sendCommand("AT+MIPCFG=\"encoding\",0,1,1", 5000, response)) {
-        Serial.println("[ML307] Failed to configure TCP receive encoding");
+        Serial.println("[ML307] Failed to configure TCP hex encoding");
         return false;
     }
 
     char command[128] = {};
-    snprintf(command, sizeof(command), "AT+MIPOPEN=0,\"TCP\",\"%s\",%u,,0",
-             ML307_SERVER, ML307_SERVER_PORT);
+    snprintf(command, sizeof(command), "AT+MIPOPEN=%u,\"TCP\",\"%s\",%u,,0",
+             ML307_TCP_STREAM_ID, host, port);
     if (!sendCommand(command, 5000, response)) {
         Serial.println("[ML307] Failed to request TCP connection");
         return false;
@@ -164,9 +210,9 @@ bool Ml307::ensureTcpConnection() {
     int connectionId = -1;
     int errorCode = -1;
     if (parseMipOpen(response, connectionId, errorCode)) {
-        if (connectionId == 0 && errorCode == 0) {
+        if (connectionId == ML307_TCP_STREAM_ID && errorCode == 0) {
             Serial.printf("[ML307] TCP connected: %s:%u\n",
-                          ML307_SERVER, ML307_SERVER_PORT);
+                          host, port);
             return true;
         }
         Serial.printf("[ML307] TCP open failed id=%d error=%d\n",
@@ -274,6 +320,190 @@ bool Ml307::isConnected() const {
     return connected_;
 }
 
+bool Ml307::openTcpStream(const char *host, uint16_t port) {
+    begin();
+    if (!host || !host[0] || !connected_ || tcpStreamOpen_) return false;
+    if (!commandMutex_ || xSemaphoreTake(commandMutex_, portMAX_DELAY) != pdTRUE) return false;
+    tcpStreamLockHeld_ = true;
+    if (!tcpRxBuffer_) {
+        tcpRxBuffer_ = static_cast<uint8_t *>(malloc(TCP_RX_BUFFER_SIZE));
+        if (!tcpRxBuffer_) {
+            Serial.printf("[ML307 TCP] receive buffer allocation failed bytes=%u\n",
+                          static_cast<unsigned>(TCP_RX_BUFFER_SIZE));
+            releaseTcpStreamLock();
+            return false;
+        }
+    }
+    resetTcpReceiveBuffer();
+    // Do not retain the capacity of a previous multi-kilobyte URC between
+    // radio attempts; it fragments the small internal heap needed by MAD.
+    tcpPendingLine_ = String();
+    if (!openTcpConnection(host, port)) {
+        free(tcpRxBuffer_);
+        tcpRxBuffer_ = nullptr;
+        releaseTcpStreamLock();
+        return false;
+    }
+    snprintf(tcpStreamHost_, sizeof(tcpStreamHost_), "%s", host);
+    tcpStreamPort_ = port;
+    tcpStreamOpen_ = true;
+    Serial.printf("[ML307 TCP] stream connected %s:%u\n", host, port);
+    return true;
+}
+
+size_t Ml307::writeTcpStream(const uint8_t *buffer, size_t size) {
+    if (!tcpStreamOpen_ || !buffer || size == 0) return 0;
+    constexpr size_t MAX_SEND_CHUNK = 512;
+    size_t sent = 0;
+    while (sent < size && tcpStreamOpen_) {
+        const size_t chunk = min<size_t>(MAX_SEND_CHUNK, size - sent);
+        while (serial_.available() > 0) pumpTcpStream(0);
+        String command;
+        command.reserve(16 + chunk * 2);
+        command += "AT+MIPSEND=";
+        command += String(ML307_TCP_STREAM_ID);
+        command += ",";
+        command += String(static_cast<unsigned>(chunk));
+        command += ",";
+        appendHex(command, reinterpret_cast<const char *>(buffer + sent), chunk);
+        Serial.printf("[ML307 TCP] >> AT+MIPSEND=%u,%u hex=%u\n",
+                      ML307_TCP_STREAM_ID, static_cast<unsigned>(chunk),
+                      static_cast<unsigned>(chunk * 2));
+        String response;
+        if (!sendCommand(command.c_str(), 5000, response)) {
+            Serial.printf("[ML307 TCP] send failed response=%s\n", response.c_str());
+            tcpStreamOpen_ = false;
+            break;
+        }
+        sent += chunk;
+    }
+    return sent;
+}
+
+int Ml307::availableTcpStream() {
+    pumpTcpStream(0);
+    return static_cast<int>(min<size_t>(tcpRxLength_, INT_MAX));
+}
+
+int Ml307::readTcpStream(uint8_t *buffer, size_t size) {
+    if (!tcpRxBuffer_ || !buffer || size == 0) return 0;
+    const uint32_t started = millis();
+    while (tcpStreamOpen_ && tcpRxLength_ == 0 && millis() - started < 2000) {
+        pumpTcpStream(50);
+        if (tcpRxLength_ == 0) vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    const size_t count = min<size_t>(size, tcpRxLength_);
+    for (size_t i = 0; i < count; ++i) {
+        buffer[i] = tcpRxBuffer_[tcpRxRead_];
+        tcpRxRead_ = (tcpRxRead_ + 1) % TCP_RX_BUFFER_SIZE;
+    }
+    tcpRxLength_ -= count;
+    return static_cast<int>(count);
+}
+
+int Ml307::peekTcpStream() {
+    if (availableTcpStream() <= 0) return -1;
+    return tcpRxBuffer_[tcpRxRead_];
+}
+
+void Ml307::closeTcpStream() {
+    if (!tcpStreamOpen_ && !tcpStreamLockHeld_) return;
+    tcpStreamOpen_ = false;
+    String response;
+    sendCommand("AT+MIPCLOSE=0", 5000, response);
+    resetTcpReceiveBuffer();
+    tcpPendingLine_ = String();
+    free(tcpRxBuffer_);
+    tcpRxBuffer_ = nullptr;
+    releaseTcpStreamLock();
+    Serial.println("[ML307 TCP] stream closed");
+}
+
+bool Ml307::tcpStreamConnected() {
+    pumpTcpStream(0);
+    return tcpStreamOpen_;
+}
+
+void Ml307::pumpTcpStream(uint32_t timeoutMs) {
+    const uint32_t started = millis();
+    do {
+        while (serial_.available() > 0) {
+            const char value = static_cast<char>(serial_.read());
+            tcpPendingLine_ += value;
+            if (value != '\n') continue;
+            String line = tcpPendingLine_;
+            tcpPendingLine_ = "";
+            line.replace("\r", "");
+            line.replace("\n", "");
+            line.trim();
+            if (line.length()) parseTcpUrcLine(line);
+        }
+        if (timeoutMs == 0 || tcpRxLength_ > 0 || !tcpStreamOpen_) break;
+        vTaskDelay(pdMS_TO_TICKS(2));
+    } while (millis() - started < timeoutMs);
+}
+
+void Ml307::resetTcpReceiveBuffer() {
+    tcpRxRead_ = 0;
+    tcpRxWrite_ = 0;
+    tcpRxLength_ = 0;
+}
+
+bool Ml307::appendTcpReceiveByte(uint8_t value) {
+    if (!tcpRxBuffer_ || tcpRxLength_ >= TCP_RX_BUFFER_SIZE) return false;
+    tcpRxBuffer_[tcpRxWrite_] = value;
+    tcpRxWrite_ = (tcpRxWrite_ + 1) % TCP_RX_BUFFER_SIZE;
+    ++tcpRxLength_;
+    return true;
+}
+
+bool Ml307::parseTcpUrcLine(const String &line) {
+    if (line.indexOf("+MIPURC: \"disconn\"") >= 0) {
+        tcpStreamOpen_ = false;
+        Serial.printf("[ML307 TCP] disconnected: %s\n", line.c_str());
+        return true;
+    }
+    const int marker = line.indexOf("+MIPURC: \"rtcp\"");
+    if (marker < 0) return false;
+    int firstComma = line.indexOf(',', marker);
+    int secondComma = firstComma >= 0 ? line.indexOf(',', firstComma + 1) : -1;
+    int thirdComma = secondComma >= 0 ? line.indexOf(',', secondComma + 1) : -1;
+    if (firstComma < 0 || secondComma < 0 || thirdComma < 0) return false;
+    const int socketId = line.substring(firstComma + 1, secondComma).toInt();
+    const int byteCount = line.substring(secondComma + 1, thirdComma).toInt();
+    if (socketId != ML307_TCP_STREAM_ID || byteCount <= 0) return false;
+    String payload = line.substring(thirdComma + 1);
+    payload.trim();
+    const bool looksHex = payload.length() >= byteCount * 2;
+    int appended = 0;
+    if (looksHex) {
+        for (int i = 0; i + 1 < payload.length() && appended < byteCount; i += 2) {
+            const int high = hexValue(payload[i]);
+            const int low = hexValue(payload[i + 1]);
+            if (high < 0 || low < 0) break;
+            if (!appendTcpReceiveByte(static_cast<uint8_t>((high << 4) | low))) break;
+            ++appended;
+        }
+    }
+    if (appended == 0) {
+        for (int i = 0; i < payload.length() && appended < byteCount; ++i) {
+            if (!appendTcpReceiveByte(static_cast<uint8_t>(payload[i]))) break;
+            ++appended;
+        }
+    }
+    if (appended < byteCount) {
+        Serial.printf("[ML307 TCP] receive truncated expected=%d appended=%d buffered=%u\n",
+                      byteCount, appended, static_cast<unsigned>(tcpRxLength_));
+    }
+    return appended > 0;
+}
+
+void Ml307::releaseTcpStreamLock() {
+    if (!tcpStreamLockHeld_) return;
+    tcpStreamLockHeld_ = false;
+    xSemaphoreGive(commandMutex_);
+}
+
 bool Ml307::httpGet(const char *url, String &payload, uint32_t timeoutMs) {
     payload = "";
     return httpGetInternal(url, &payload, nullptr, nullptr, timeoutMs);
@@ -376,8 +606,13 @@ bool Ml307::httpGetInternal(const char *url, String *payload, Print *output,
                 if (commaCount == 3) totalLength = value.toInt();
                 if (commaCount == 4) currentLength = value.toInt();
             }
+            // ML307 firmware reports HTTP content in several formats. For the
+            // playlist endpoint, the final URC is commonly
+            // `content,0,0,<total>,0`; the zero content-length field does not
+            // mean the body is empty. A positive total plus currentLength=0 is
+            // the modem's end-of-body marker.
             if ((contentLength > 0 && totalLength >= contentLength) ||
-                (contentLength == -1 && currentLength == 0)) {
+                (totalLength > 0 && currentLength == 0)) {
                 finished = true;
             }
         } else if (line.indexOf("+MHTTPURC: \"err\"") >= 0) {
