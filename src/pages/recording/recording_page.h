@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 class Es8311;
@@ -25,6 +26,13 @@ bool takeTimerEvent();
 bool advanceMarquee(int16_t &rowTop);
 void renderMarquee(uint8_t *destination, const uint8_t *currentFrame);
 bool isRecording();
+bool startChatRecording();
+void stopChatRecording();
+bool takeChatRecording(char *path, size_t capacity);
+bool playWavFile(const char *path);
+bool isPlayingWav();
+bool acceptsTouchStop(uint32_t interruptTick);
+void stopFromTouchInterrupt();
 void stop();
 void render(uint8_t *frame);
 }

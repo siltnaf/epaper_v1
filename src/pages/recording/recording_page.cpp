@@ -72,6 +72,7 @@ volatile bool recordingPaused = false;
 volatile bool recordingStopRequested = false;
 volatile bool recordingCompleted = false;
 volatile uint32_t recordedDataBytes = 0;
+volatile TickType_t recordingStartedTick = 0;
 uint32_t recordingStartedMs = 0;
 uint32_t pauseStartedMs = 0;
 uint32_t pausedTotalMs = 0;
@@ -215,20 +216,6 @@ bool marqueePixel(int x, int y) {
 const char *tagLabel(uint8_t tag) {
     if (tag >= TAG_COUNT) return "";
     return UiLocalization::isChinese() ? TAG_NAMES_CN[tag] : TAG_NAMES[tag];
-}
-
-const char *localizedStatus() {
-    if (!UiLocalization::isChinese()) return statusText;
-    if (std::strcmp(statusText, "READY") == 0) return "就绪";
-    if (std::strcmp(statusText, "RECORDING") == 0) return "录音中";
-    if (std::strcmp(statusText, "PAUSED") == 0) return "已暂停";
-    if (std::strcmp(statusText, "SAVING") == 0) return "保存中";
-    if (std::strcmp(statusText, "SAVED") == 0) return "已保存";
-    if (std::strcmp(statusText, "RECORDING UNAVAILABLE") == 0) return "录音不可用";
-    if (std::strcmp(statusText, "FILE OPEN FAILED") == 0) return "文件打开失败";
-    if (std::strcmp(statusText, "RECORD TASK FAILED") == 0) return "录音任务失败";
-    if (std::strcmp(statusText, "STOP TIMEOUT") == 0) return "停止超时";
-    return statusText;
 }
 
 void writeLe16(File &file, uint16_t value) {
@@ -543,6 +530,7 @@ bool startRecording() {
     recordingCompleted = false;
     recordingPaused = false;
     recordingStartedMs = millis();
+    recordingStartedTick = xTaskGetTickCount();
     pauseStartedMs = 0;
     pausedTotalMs = 0;
     displayedRecordingSecond = 0;
@@ -759,7 +747,6 @@ void drawRecorder(uint8_t *frame) {
              static_cast<unsigned long>((seconds / 60) % 60),
              static_cast<unsigned long>(seconds % 60));
     UiLocalization::drawCentered(frame, 120, timer, 4);
-    UiLocalization::drawCentered(frame, 178, localizedStatus(), 1);
     line(frame, 12, 278, 228, 278);
     roundedFrame(frame, 12, 333, 56, 56);
     drawFolder(frame, 16, 337);
@@ -1089,6 +1076,54 @@ void renderMarquee(uint8_t *destination, const uint8_t *currentFrame) {
 }
 
 bool isRecording() { return recordingActive; }
+bool startChatRecording() {
+    view = View::Recorder;
+    return startRecording();
+}
+void stopChatRecording() { stopRecording(); }
+bool takeChatRecording(char *path, size_t capacity) {
+    if (!recordingCompleted || !path || capacity == 0) return false;
+    recordingCompleted = false;
+    std::strncpy(path, activePath, capacity - 1);
+    path[capacity - 1] = '\0';
+    return true;
+}
+bool playWavFile(const char *path) {
+    if (!path || !path[0] || !SD_MMC.exists(path) || !codec || !codec->isInitialized()) {
+        return false;
+    }
+    stopPlayback();
+    OpusPlayer::stop();
+    std::strncpy(playbackPath, path, sizeof(playbackPath) - 1);
+    playbackPath[sizeof(playbackPath) - 1] = '\0';
+    playbackStopRequested = false;
+    playbackPaused = false;
+    playbackCompleted = false;
+    playbackActive = true;
+    constexpr uint32_t WAV_PLAYBACK_STACK_BYTES = 8 * 1024;
+    if (xTaskCreatePinnedToCore(playbackTask, "chat-wav", WAV_PLAYBACK_STACK_BYTES,
+                                nullptr, 2, &playbackTaskHandle, 0) != pdPASS) {
+        playbackActive = false;
+        playbackTaskHandle = nullptr;
+        return false;
+    }
+    return true;
+}
+bool isPlayingWav() { return playbackActive; }
+bool acceptsTouchStop(uint32_t interruptTick) {
+    // The FT6336 can emit another edge from the same physical press that
+    // started recording. Require a short separation so that edge cannot stop
+    // the capture immediately; every later touch interrupt is accepted.
+    constexpr TickType_t START_TOUCH_GUARD_TICKS = pdMS_TO_TICKS(250);
+    return recordingActive &&
+           static_cast<int32_t>(interruptTick - recordingStartedTick) >=
+               static_cast<int32_t>(START_TOUCH_GUARD_TICKS);
+}
+void stopFromTouchInterrupt() {
+    if (!recordingActive && !recordingTaskHandle) return;
+    stopRecording();
+    Serial.println("[RECORDING IRQ] Touch interrupt requested immediate stop");
+}
 void stop() { stopRecording(); stopPlayback(); }
 
 void render(uint8_t *frame) {

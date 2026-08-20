@@ -1,6 +1,7 @@
 #include "pages/main/main_page.h"
 
 #include <cstring>
+#include <cmath>
 
 #include "devices/epd_xingtai/epd_xingtai.h"
 #include "pages/settings/settings_bitmap.h"
@@ -15,6 +16,8 @@
 #include "pages/music/music_bitmap.h"
 #include "pages/poem/poem_bitmap.h"
 #include "pages/word/word_bitmap.h"
+#include "pages/find_home/find_home_bitmap.h"
+#include "pages/game/game_bitmap.h"
 #include "pages/topbar/topbar_assets.h"
 #include "pages/topbar/topbar_bitmap.h"
 
@@ -126,6 +129,18 @@ void icon(uint8_t *frame, int x, int y, const uint8_t *bitmap, bool selected) {
     }
 }
 
+void chatIcon(uint8_t *frame, int x, int y, bool selected) {
+    roundedFrame(frame, x - 4, y - 4, 56, 56);
+    roundedFrame(frame, x + 4, y + 7, 40, 27);
+    for (int i = 0; i < 8; ++i) pixel(frame, x + 14 + i, y + 34 + i / 2);
+    for (int dot = 0; dot < 3; ++dot) {
+        for (int yy = 0; yy < 4; ++yy) {
+            for (int xx = 0; xx < 4; ++xx) pixel(frame, x + 12 + dot * 10 + xx, y + 18 + yy);
+        }
+    }
+    if (selected) invertRoundedRect(frame, x - 4, y - 4, 56, 56);
+}
+
 }
 
 namespace MainPage {
@@ -169,6 +184,9 @@ void render(uint8_t *frame, FunctionIcon selectedIcon) {
          selectedIcon == FunctionIcon::Cartoon);
     icon(frame, x3, y3 + iconSize + rowGap, RadioBitmap::DATA,
          selectedIcon == FunctionIcon::Radio);
+    icon(frame, 16, 346, FindHomeBitmap::DATA, selectedIcon == FunctionIcon::FindHome);
+    chatIcon(frame, 96, 346, selectedIcon == FunctionIcon::Chat);
+    icon(frame, 176, 346, GameBitmap::DATA, selectedIcon == FunctionIcon::Game);
 }
 
 }

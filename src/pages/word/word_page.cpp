@@ -284,7 +284,13 @@ String absoluteUrl(const char *value) {
 bool httpGetText(const String &url, String &payload, bool showLoading = true,
                  uint32_t timeoutMs = 12000) {
     OptionalLoadingScope loading(showLoading);
-    if (WiFi.status() != WL_CONNECTED) return cellularModem.httpGet(url.c_str(), payload);
+    if (WiFi.status() != WL_CONNECTED) {
+        const bool loaded = cellularModem.httpGet(url.c_str(), payload, timeoutMs);
+        Serial.printf("[WORD API] 4G GET ok=%s bytes=%u url=%s\n",
+                      loaded ? "yes" : "no", static_cast<unsigned>(payload.length()),
+                      url.c_str());
+        return loaded;
+    }
     HTTPClient http;
     http.setConnectTimeout(7000);
     http.setTimeout(min<uint32_t>(timeoutMs, 65000));
@@ -304,7 +310,19 @@ bool httpGetText(const String &url, String &payload, bool showLoading = true,
 }
 
 bool httpGetBitmap(const String &url, uint8_t *output) {
-    if (!output || WiFi.status() != WL_CONNECTED) return false;
+    if (!output) return false;
+    if (WiFi.status() != WL_CONNECTED) {
+        String payload;
+        const bool loaded = cellularModem.httpGet(url.c_str(), payload, 30000);
+        const size_t bytes = payload.length();
+        if (loaded && bytes == BITMAP_BYTES) {
+            std::memcpy(output, payload.c_str(), BITMAP_BYTES);
+        }
+        Serial.printf("[WORD BITMAP] 4G ok=%s bytes=%u/%u url=%s\n",
+                      loaded ? "yes" : "no", static_cast<unsigned>(bytes),
+                      static_cast<unsigned>(BITMAP_BYTES), url.c_str());
+        return loaded && bytes == BITMAP_BYTES;
+    }
     HTTPClient http;
     http.setConnectTimeout(7000);
     http.setTimeout(12000);
@@ -530,7 +548,7 @@ bool loadPage(bool showLoading = true) {
         items[i] = WordItem();
         std::memset(bitmaps[i], 0xFF, BITMAP_BYTES);
     }
-    if (WiFi.status() != WL_CONNECTED) {
+    if (WiFi.status() != WL_CONNECTED && !cellularModem.isConnected()) {
         return loadOfflinePage();
     }
     const String url = apiBase() + "/api/image-learn?page=" + String(currentPage) +

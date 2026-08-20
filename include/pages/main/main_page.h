@@ -18,6 +18,9 @@ enum class FunctionIcon : uint8_t {
     Recording,
     Cartoon,
     Radio,
+    FindHome,
+    Chat,
+    Game,
 };
 
 enum class NetworkMode : uint8_t {

@@ -22,6 +22,9 @@
 #include "pages/calculator/calculator_page.h"
 #include "pages/cartoon/cartoon_page.h"
 #include "pages/clock/clock_page.h"
+#include "pages/chat/chat_page.h"
+#include "pages/find_home/find_home_page.h"
+#include "pages/game/game_page.h"
 #include "pages/word/word_page.h"
 #include "pages/main/main_page.h"
 #include "pages/music/music_page.h"
@@ -62,6 +65,9 @@ enum class PageId : uint8_t {
     Recording,
     Cartoon,
     Radio,
+    FindHome,
+    Chat,
+    Game,
 };
 
 struct TouchAction {
@@ -140,6 +146,7 @@ bool startupTouchGuardLogged = false;
 PageId openingLoadPage = PageId::Main;
 bool openingLoadVisible = false;
 bool suppressNextAudioTap = false;
+bool suppressNextRecordingTap = false;
 bool suppressMainIconReleaseTap = false;
 bool suppressDriverTap = false;
 bool dispatchingSyntheticTap = false;
@@ -208,7 +215,18 @@ void serviceTouchInterruptBeforeI2c() {
     // Stroke animation does not use the shared audio/touch I2C path. Including
     // it here allowed a trailing IRQ from the opening tap to cancel the drawing.
     const bool wordActive = currentPage == PageId::Word && WordPage::isAudioActive();
-    if (!pending || (!voiceActive && !musicActive && !poemActive && !wordActive)) return;
+    const bool recordingActive = currentPage == PageId::Recording && RecordingPage::isRecording();
+    if (!pending || (!voiceActive && !musicActive && !poemActive && !wordActive &&
+                     !recordingActive)) return;
+    if (recordingActive) {
+        if (!RecordingPage::acceptsTouchStop(interruptTick)) {
+            Serial.println("[RECORDING IRQ] Ignoring start-touch interrupt");
+            return;
+        }
+        suppressNextRecordingTap = true;
+        RecordingPage::stopFromTouchInterrupt();
+        return;
+    }
     if ((voiceActive || musicActive || poemActive || WordPage::isAudioActive()) &&
         !OpusPlayer::acceptsTouchStop(interruptTick)) {
         suppressNextAudioTap = true;
@@ -755,6 +773,9 @@ const char *pageName(PageId page) {
     case PageId::Recording: return "Recording";
     case PageId::Cartoon: return "Cartoon";
     case PageId::Radio: return "Radio";
+    case PageId::FindHome: return "Find Home";
+    case PageId::Chat: return "Chat";
+    case PageId::Game: return "Game";
     default: return "Main";
     }
 }
@@ -773,6 +794,9 @@ PageRenderer rendererFor(PageId page) {
     case PageId::Recording: return RecordingPage::render;
     case PageId::Cartoon: return CartoonPage::render;
     case PageId::Radio: return RadioPage::render;
+    case PageId::FindHome: return FindHomePage::render;
+    case PageId::Chat: return ChatPage::render;
+    case PageId::Game: return GamePage::render;
     default: return MainPage::render;
     }
 }
@@ -781,6 +805,7 @@ void refreshCurrentPage() {
     rendererFor(currentPage)(transitionFrame);
     constexpr size_t topBarBytes = static_cast<size_t>(32) * (XingtaiEpd::WIDTH / 8);
     std::memcpy(transitionFrame, frame, topBarBytes);
+    if (currentPage == PageId::Game) GamePage::drawTopbar(transitionFrame);
     const bool enteringBookReader = currentPage == PageId::Book && BookPage::isReader();
     if (currentPage == PageId::Book || currentPage == PageId::Voice ||
         currentPage == PageId::Music || currentPage == PageId::Poem ||
@@ -789,7 +814,12 @@ void refreshCurrentPage() {
         // list/detail/page state, reducing ghosted text and borders.
         wipeContentAreaWhite(enteringBookReader ? false : true);
     }
-    if (enteringBookReader) {
+    if (currentPage == PageId::Game) {
+        // The top bar carries the transient status message, so refresh the full
+        // frame (top bar + board) in a single partial update.
+        epaper.displayPartial(frame, transitionFrame, 0, 0,
+                              XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT);
+    } else if (enteringBookReader) {
         // The reader replaces the library only below the fixed top bar. Wipe
         // that region first, then draw the reader without touching the bar.
         epaper.displayPartial(frame, transitionFrame, 0, 32,
@@ -1637,7 +1667,7 @@ void showTopbarLoading(bool visible) {
         clearFrameRegion(transitionFrame, loadingLeft, loadingTop,
                          loadingWidth, loadingHeight);
         UiLocalization::drawCentered(transitionFrame, 12,
-                                     UiLocalization::isChinese() ? "下载中" : "DOWNLOADING", 1);
+                                     UiLocalization::isChinese() ? "下载中，请稍候" : "DOWNLOADING, PLEASE WAIT", 1);
         epaper.displayPartial(frame, transitionFrame, loadingLeft, loadingTop,
                               loadingWidth, loadingHeight);
     } else {
@@ -1647,7 +1677,7 @@ void showTopbarLoading(bool visible) {
         clearFrameRegion(transitionFrame, loadingLeft, loadingTop,
                          loadingWidth, loadingHeight);
         UiLocalization::drawCentered(transitionFrame, 12,
-                                     UiLocalization::isChinese() ? "下载中" : "DOWNLOADING", 1);
+                                     UiLocalization::isChinese() ? "下载中，请稍候" : "DOWNLOADING, PLEASE WAIT", 1);
         epaper.displayPartial(transitionFrame, frame, loadingLeft, loadingTop,
                               loadingWidth, loadingHeight);
     }
@@ -1718,6 +1748,9 @@ MainPage::FunctionIcon mainIconFor(PageId page) {
     case PageId::Recording: return MainPage::FunctionIcon::Recording;
     case PageId::Cartoon: return MainPage::FunctionIcon::Cartoon;
     case PageId::Radio: return MainPage::FunctionIcon::Radio;
+    case PageId::FindHome: return MainPage::FunctionIcon::FindHome;
+    case PageId::Chat: return MainPage::FunctionIcon::Chat;
+    case PageId::Game: return MainPage::FunctionIcon::Game;
     default: return MainPage::FunctionIcon::None;
     }
 }
@@ -1746,6 +1779,24 @@ bool mainIconBounds(PageId page, uint16_t &x, uint16_t &y, uint16_t &width, uint
     case PageId::Recording: column = 0; row = 3; break;
     case PageId::Cartoon: column = 1; row = 3; break;
     case PageId::Radio: column = 2; row = 3; break;
+    case PageId::FindHome:
+        x = 12;
+        y = 342;
+        width = frameSize;
+        height = frameSize;
+        return true;
+    case PageId::Chat:
+        x = 92;
+        y = 342;
+        width = frameSize;
+        height = frameSize;
+        return true;
+    case PageId::Game:
+        x = 172;
+        y = 342;
+        width = frameSize;
+        height = frameSize;
+        return true;
     default: return false;
     }
 
@@ -1972,6 +2023,15 @@ bool isImmediateTouchControl(int16_t x, int16_t y) {
         return CartoonPage::controlBoundsAt(x, y, left, top, width, height);
     }
     if (currentPage == PageId::Radio) return pagerControl();
+    if (currentPage == PageId::FindHome) {
+        return FindHomePage::returnControlAt(x, y) ||
+               FindHomePage::actionControlAt(x, y);
+    }
+    if (currentPage == PageId::Chat) {
+        return ChatPage::returnControlAt(x, y) || ChatPage::recordControlAt(x, y) ||
+               ChatPage::refreshControlAt(x, y);
+    }
+    if (currentPage == PageId::Game) return true;
     return false;
 }
 
@@ -2016,6 +2076,9 @@ PageId mainPageAt(int16_t x, int16_t y) {
             }
         }
     }
+    if (pointInRect(x, y, 6, 336, 68, 68)) return PageId::FindHome;
+    if (pointInRect(x, y, 86, 336, 68, 68)) return PageId::Chat;
+    if (pointInRect(x, y, 166, 336, 68, 68)) return PageId::Game;
     return PageId::Main;
 }
 
@@ -2227,6 +2290,11 @@ void handleTouch(TPoint point, TEvent event) {
     }
     if (event != TEvent::Tap) return;
     touchWorkflowPriority = false;
+    if (currentPage == PageId::Recording && suppressNextRecordingTap) {
+        suppressNextRecordingTap = false;
+        Serial.println("[RECORDING IRQ] Stop tap consumed");
+        return;
+    }
     if (immediateControlPressHandled && !dispatchingSyntheticTap) {
         immediateControlPressHandled = false;
         return;
@@ -2772,6 +2840,38 @@ void handleTouch(TPoint point, TEvent event) {
         return;
     }
 
+    if (currentPage == PageId::FindHome) {
+        if (FindHomePage::returnControlAt(uiX, uiY)) {
+            showPressedInversion(10, 40, 48, 28);
+        } else if (FindHomePage::actionControlAt(uiX, uiY)) {
+            showPressedRoundedInversion(24, 306, 192, 64);
+        }
+        if (FindHomePage::handleTap(uiX, uiY)) {
+            if (FindHomePage::takeExitRequest()) queuePage(PageId::Main);
+            else refreshCurrentPage();
+        }
+        return;
+    }
+
+    if (currentPage == PageId::Chat) {
+        if (ChatPage::returnControlAt(uiX, uiY)) showPressedInversion(10, 40, 48, 28);
+        else if (ChatPage::recordControlAt(uiX, uiY)) showPressedInversion(24, 150, 192, 100);
+        else if (ChatPage::refreshControlAt(uiX, uiY)) showPressedInversion(24, 290, 192, 48);
+        if (ChatPage::handleTap(uiX, uiY)) {
+            if (ChatPage::takeExitRequest()) queuePage(PageId::Main);
+            else refreshCurrentPage();
+        }
+        return;
+    }
+
+    if (currentPage == PageId::Game) {
+        if (GamePage::handleTap(uiX, uiY)) {
+            if (GamePage::takeExitRequest()) queuePage(PageId::Main);
+            else refreshCurrentPage();
+        }
+        return;
+    }
+
     // Other content pages currently expose no page-specific touch actions.
     if (currentPage != PageId::Main) return;
 
@@ -2933,6 +3033,9 @@ void processTouchAction() {
     if (currentPage == PageId::Radio && nextPage != PageId::Radio) {
         RadioPage::stop();
     }
+    if (currentPage == PageId::Chat && nextPage != PageId::Chat) {
+        RecordingPage::stop();
+    }
     if ((currentPage == PageId::Calculator) != (nextPage == PageId::Calculator)) {
         if (currentPage == PageId::Calculator) {
             calculatorRefreshPending = false;
@@ -2976,14 +3079,36 @@ void processTouchAction() {
         RadioPage::setContentUrl(contentUrl);
         RadioPage::open();
     }
-    const bool fastHomeTransition = nextPage == PageId::Main;
-    if (fastHomeTransition) {
-        // Clear only the function area below the fixed top bar before drawing
-        // the cached Home menu with the partial waveform.
+    if (nextPage == PageId::FindHome) {
+        FindHomePage::setContentUrl(contentUrl);
+        FindHomePage::open();
+    }
+    if (nextPage == PageId::Chat) {
+        ChatPage::setContentUrl(contentUrl);
+        ChatPage::open();
+    }
+    if (nextPage == PageId::Game) {
+        GamePage::setContentUrl(contentUrl);
+        GamePage::open();
+    }
+    const bool recordingToMainTransition = currentPage == PageId::Recording &&
+                                           nextPage == PageId::Main;
+    rendererFor(nextPage)(transitionFrame);
+    if (recordingToMainTransition) {
+        // Only the recording page needs a fully initialized Home refresh to
+        // remove its large filled controls reliably from the e-paper panel.
+        epaper.display(transitionFrame);
+        std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+        epaper.sleep();
+        currentPage = nextPage;
+        Serial.printf("[UI] %s page ready\n", pageName(currentPage));
+        return;
+    }
+    if (nextPage == PageId::Main && !recordingToMainTransition) {
+        // Preserve the existing fast Home transition for every source page
+        // except Recording: white-drive the content area, then redraw it
+        // with the partial waveform below while leaving the top bar intact.
         wipeContentAreaWhite(false);
-        MainPage::render(transitionFrame);
-    } else {
-        rendererFor(nextPage)(transitionFrame);
     }
 
     // Keep the current top-bar pixels untouched and refresh only the function
@@ -2991,11 +3116,15 @@ void processTouchAction() {
     constexpr uint16_t topBarHeight = 32;
     constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
     std::memcpy(transitionFrame, frame, static_cast<size_t>(topBarHeight) * rowBytes);
-    // For Home, frame now represents the physical white pre-drive. For every
-    // other page it represents the currently displayed page.
-    epaper.displayPartial(frame, transitionFrame, 0, topBarHeight,
-                          XingtaiEpd::WIDTH,
-                          XingtaiEpd::HEIGHT - topBarHeight);
+    if (nextPage == PageId::Game) {
+        GamePage::drawTopbar(transitionFrame);
+        epaper.displayPartial(frame, transitionFrame, 0, 0,
+                              XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT);
+    } else {
+        epaper.displayPartial(frame, transitionFrame, 0, topBarHeight,
+                              XingtaiEpd::WIDTH,
+                              XingtaiEpd::HEIGHT - topBarHeight);
+    }
     std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
     epaper.sleep();
     currentPage = nextPage;
@@ -3204,6 +3333,9 @@ void loop() {
         refreshCurrentPage();
     }
     if (currentPage == PageId::Radio && RadioPage::process()) {
+        refreshCurrentPage();
+    }
+    if (currentPage == PageId::Chat && ChatPage::process()) {
         refreshCurrentPage();
     }
     int16_t marqueeTop = 0;
