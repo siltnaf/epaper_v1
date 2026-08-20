@@ -10,6 +10,7 @@
 
 #include "devices/epd_xingtai/epd_xingtai.h"
 #include "devices/ml307/ml307.h"
+#include "pages/game/chess/chess_assets.h"
 #include "ui/loading_indicator.h"
 #include "ui/localization.h"
 
@@ -38,23 +39,27 @@ char xiangqi[10][9] = {
 };
 
 constexpr int BOARD_X = 8;
-constexpr int BOARD_Y = 76;
+constexpr int BOARD_Y = 80;
 constexpr int CHESS_CELL = 28;
 constexpr int XIANGQI_CELL_X = 27;
 constexpr int XIANGQI_CELL_Y = 36;
 constexpr int XIANGQI_LEFT = 12;
-constexpr int XIANGQI_TOP = 74;
+constexpr int XIANGQI_TOP = 80;
 constexpr int XIANGQI_PIECE_RADIUS = 11;
-constexpr int RETURN_ICON_CX = 26;
-constexpr int RETURN_ICON_CY = 54;
-constexpr int NEW_GAME_ICON_CX = 214;
-constexpr int NEW_GAME_ICON_CY = 54;
-constexpr int GAME_ICON_RADIUS = 12;
+constexpr int RETURN_BUTTON_X = 10;
+constexpr int RETURN_BUTTON_Y = 40;
+constexpr int RETURN_BUTTON_W = 48;
+constexpr int RETURN_BUTTON_H = 28;
+constexpr int NEW_GAME_BUTTON_X = 170;
+constexpr int NEW_GAME_BUTTON_Y = 40;
+constexpr int NEW_GAME_BUTTON_W = 60;
+constexpr int NEW_GAME_BUTTON_H = 28;
 
 void copyText(char *dst, size_t size, const char *src) { if (dst && size) { std::strncpy(dst, src ? src : "", size - 1); dst[size - 1] = 0; } }
 void pixel(uint8_t *f, int x, int y) { if (x >= 0 && x < XingtaiEpd::WIDTH && y >= 0 && y < XingtaiEpd::HEIGHT) f[static_cast<size_t>(y) * 30 + x / 8] |= 0x80U >> (x % 8); }
 void line(uint8_t *f, int x0, int y0, int x1, int y1) { int dx=abs(x1-x0), sx=x0<x1?1:-1, dy=-abs(y1-y0), sy=y0<y1?1:-1, e=dx+dy; while(true){pixel(f,x0,y0);if(x0==x1&&y0==y1)break;int e2=2*e;if(e2>=dy){e+=dy;x0+=sx;}if(e2<=dx){e+=dx;y0+=sy;}} }
 void rect(uint8_t *f,int x,int y,int w,int h){line(f,x,y,x+w-1,y);line(f,x,y+h-1,x+w-1,y+h-1);line(f,x,y,x,y+h-1);line(f,x+w-1,y,x+w-1,y+h-1);}
+void fillRect(uint8_t *f,int x,int y,int w,int h){for(int yy=y;yy<y+h;++yy)for(int xx=x;xx<x+w;++xx)pixel(f,xx,yy);}
 void clearRect(uint8_t *f,int x,int y,int w,int h){for(int yy=y;yy<y+h;++yy)for(int xx=x;xx<x+w;++xx)if(xx>=0&&xx<XingtaiEpd::WIDTH&&yy>=0&&yy<XingtaiEpd::HEIGHT)f[static_cast<size_t>(yy)*30+xx/8]&=static_cast<uint8_t>(~(0x80U>>(xx%8)));}
 bool inRect(int16_t x,int16_t y,int l,int t,int w,int h){return x>=l&&x<l+w&&y>=t&&y<t+h;}
 String host() { String base(contentUrl); base.trim(); while(base.endsWith("/")) base.remove(base.length()-1); int scheme=base.indexOf("://"); if(scheme>=0){int path=base.indexOf('/',scheme+3);if(path>=0)base.remove(path);} return base; }
@@ -193,35 +198,11 @@ void circleOutline(uint8_t *f, int cx, int cy, int radius) {
         }
     }
 }
-void drawNewGameIcon(uint8_t *f, int cx, int cy, int r) {
-    // Refresh arrow: a circle open at the top-right with an arrowhead.
-    int x = r;
-    int y = 0;
-    int error = 1 - r;
-    while (x >= y) {
-        pixel(f, cx - x, cy - y);
-        pixel(f, cx - y, cy - x);
-        pixel(f, cx - y, cy + x);
-        pixel(f, cx - x, cy + y);
-        pixel(f, cx + x, cy + y);
-        pixel(f, cx + y, cy + x);
-        ++y;
-        if (error < 0) {
-            error += 2 * y + 1;
-        } else {
-            --x;
-            error += 2 * (y - x) + 1;
-        }
-    }
-    line(f, cx - 2, cy - r, cx + 2, cy - r);
-    line(f, cx + 2, cy - r, cx, cy - r - 2);
-    line(f, cx + 2, cy - r, cx, cy - r + 2);
-}
-void drawReturnIcon(uint8_t *f, int cx, int cy, int r) {
-    circleOutline(f, cx, cy, r);
-    line(f, cx - r + 3, cy, cx + r - 3, cy);
-    line(f, cx - r + 3, cy, cx - r + 7, cy - 4);
-    line(f, cx - r + 3, cy, cx - r + 7, cy + 4);
+void drawTextButton(uint8_t *f, int x, int y, int w, int h, const char *label) {
+    rect(f, x, y, w, h);
+    const int labelWidth = UiLocalization::textWidth(label, 1);
+    const int labelY = y + (UiLocalization::isChinese() ? 6 : 10);
+    UiLocalization::drawText(f, x + (w - labelWidth) / 2, labelY, label, 1);
 }
 bool isBlackXiangqiPiece(char piece) { return piece >= 'a' && piece <= 'z'; }
 bool isWhiteXiangqiPiece(char piece) { return piece >= 'A' && piece <= 'Z'; }
@@ -258,8 +239,33 @@ void drawXiangqiPiece(uint8_t *f, int cx, int cy, char piece) {
         drawSymbol(f, cx, cy, symbol, false);
     }
 }
-void drawPiece(uint8_t *f,int x,int y,char piece){if(piece==' ')return;char s[2]={piece,0};UiLocalization::drawText(f,x+9,y+9,s,2);}
-void drawChess(uint8_t *f){for(int y=0;y<8;++y)for(int x=0;x<8;++x){int px=BOARD_X+x*CHESS_CELL,py=BOARD_Y+y*CHESS_CELL;rect(f,px,py,CHESS_CELL,CHESS_CELL);if(x==selectedX&&y==selectedY)rect(f,px+2,py+2,CHESS_CELL-4,CHESS_CELL-4);drawPiece(f,px,py,chess[y][x]);}}
+void drawChessPiece(uint8_t *f, int left, int top, char symbol) {
+    const ChessAssets::Piece *piece = ChessAssets::piece(symbol);
+    if (!piece) return;
+    for (int y = 0; y < ChessAssets::HEIGHT; ++y) {
+        for (int x = 0; x < ChessAssets::WIDTH; ++x) {
+            const uint8_t bit = static_cast<uint8_t>(0x80U >> (x % 8));
+            const size_t maskIndex = static_cast<size_t>(y) * ChessAssets::ROW_BYTES + x / 8;
+            const int screenX = left + x;
+            const int screenY = top + y;
+            if (piece->clear[maskIndex] & bit) clearRect(f, screenX, screenY, 1, 1);
+            if (piece->ink[maskIndex] & bit) pixel(f, screenX, screenY);
+        }
+    }
+}
+void drawChess(uint8_t *f) {
+    // chess-board.svg is an 8x8 alternating checkerboard.
+    for (int y = 0; y < 8; ++y)
+        for (int x = 0; x < 8; ++x) {
+            const int left = BOARD_X + x * CHESS_CELL;
+            const int top = BOARD_Y + y * CHESS_CELL;
+            if ((x + y) % 2 != 0) fillRect(f, left, top, CHESS_CELL, CHESS_CELL);
+            drawChessPiece(f, left + 1, top + 1, chess[y][x]);
+            if (x == selectedX && y == selectedY)
+                rect(f, left + 2, top + 2, CHESS_CELL - 4, CHESS_CELL - 4);
+        }
+    rect(f, BOARD_X, BOARD_Y, 8 * CHESS_CELL, 8 * CHESS_CELL);
+}
 void drawXiangqi(uint8_t *f) {
     // Geometry follows chinese_chess/board.svg: a 9x10 grid split by a river,
     // with palace diagonals and no vertical lines across the river.
@@ -291,13 +297,14 @@ void drawXiangqi(uint8_t *f) {
 namespace GamePage {
 void setContentUrl(const char *url){copyText(contentUrl,sizeof(contentUrl),url);}
 void open(){exitRequested=false;selectedGame=Game::List;copyText(feedback,sizeof(feedback),text("Choose a game","选择游戏"));}
-bool returnControlAt(int16_t x,int16_t y){return inRect(x,y,10,40,48,28);}
+bool returnControlAt(int16_t x,int16_t y){return inRect(x,y,RETURN_BUTTON_X,RETURN_BUTTON_Y,RETURN_BUTTON_W,RETURN_BUTTON_H);}
+bool newGameControlAt(int16_t x,int16_t y){return (selectedGame==Game::InternationalChess||selectedGame==Game::ChineseChess)&&inRect(x,y,NEW_GAME_BUTTON_X,NEW_GAME_BUTTON_Y,NEW_GAME_BUTTON_W,NEW_GAME_BUTTON_H);}
 bool takeExitRequest(){bool r=exitRequested;exitRequested=false;return r;}
 bool handleTap(int16_t x,int16_t y){
     if(returnControlAt(x,y)){if(selectedGame==Game::List)exitRequested=true;else{selectedGame=Game::List;copyText(feedback,sizeof(feedback),text("Choose a game","选择游戏"));}return true;}
     if(selectedGame==Game::List){if(inRect(x,y,16,90,208,54)){selectedGame=Game::InternationalChess;resetBoard();copyText(feedback,sizeof(feedback),text("Your turn","轮到你走"));}else if(inRect(x,y,16,156,208,54)){selectedGame=Game::ChineseChess;resetBoard();copyText(feedback,sizeof(feedback),text("Chinese chess ready","象棋已准备"));}else if(inRect(x,y,16,222,208,54)){selectedGame=Game::DouDizhu;copyText(feedback,sizeof(feedback),text("Dou Dizhu ready","斗地主已准备"));}else return false;return true;}
     if(selectedGame==Game::DouDizhu){if(inRect(x,y,16,300,208,48))postMove("",false);return true;}
-    if(selectedGame==Game::ChineseChess&&inRect(x,y,NEW_GAME_ICON_CX-16,NEW_GAME_ICON_CY-16,32,32)){resetBoard();copyText(feedback,sizeof(feedback),text("New game","新游戏"));return true;}
+    if(newGameControlAt(x,y)){resetBoard();copyText(feedback,sizeof(feedback),text("New game","新游戏"));return true;}
     const int cellX=selectedGame==Game::InternationalChess?CHESS_CELL:XIANGQI_CELL_X;
     const int cellY=selectedGame==Game::InternationalChess?CHESS_CELL:XIANGQI_CELL_Y;
     const int cols=selectedGame==Game::InternationalChess?8:9,rows=selectedGame==Game::InternationalChess?8:10;
@@ -324,18 +331,18 @@ void render(uint8_t *f){
         for(int i=0;i<3;++i){rect(f,16,90+i*66,208,54);UiLocalization::drawCentered(f,112+i*66,names[i],1);}
         UiLocalization::drawCentered(f,330,feedback,1);return;
     }
-    if(selectedGame!=Game::ChineseChess){
+    if(selectedGame!=Game::ChineseChess&&selectedGame!=Game::InternationalChess){
         const char* title=selectedGame==Game::InternationalChess?text("CHESS","国际象棋"):text("DOU DIZHU","斗地主");
         UiLocalization::drawText(f,10,42,title,1);
     }
     if(selectedGame==Game::InternationalChess){
         drawChess(f);
-        UiLocalization::drawText(f,8,306,text("YOU: WHITE","你：白方"),1);
-        UiLocalization::drawText(f,132,306,text("AI: BLACK","AI：黑方"),1);
+        drawTextButton(f,RETURN_BUTTON_X,RETURN_BUTTON_Y,RETURN_BUTTON_W,RETURN_BUTTON_H,text("RETURN","返回"));
+        drawTextButton(f,NEW_GAME_BUTTON_X,NEW_GAME_BUTTON_Y,NEW_GAME_BUTTON_W,NEW_GAME_BUTTON_H,text("NEW GAME","新游戏"));
     } else if(selectedGame==Game::ChineseChess){
         drawXiangqi(f);
-        drawReturnIcon(f,RETURN_ICON_CX,RETURN_ICON_CY,GAME_ICON_RADIUS);
-        drawNewGameIcon(f,NEW_GAME_ICON_CX,NEW_GAME_ICON_CY,GAME_ICON_RADIUS);
+        drawTextButton(f,RETURN_BUTTON_X,RETURN_BUTTON_Y,RETURN_BUTTON_W,RETURN_BUTTON_H,text("RETURN","返回"));
+        drawTextButton(f,NEW_GAME_BUTTON_X,NEW_GAME_BUTTON_Y,NEW_GAME_BUTTON_W,NEW_GAME_BUTTON_H,text("NEW GAME","新游戏"));
     } else {
         rect(f,16,100,208,150);UiLocalization::drawCentered(f,130,"3 3 4 5 6 7 8 9 J Q K A 2",1);UiLocalization::drawCentered(f,180,text("ASK AI FOR MOVE","请求 AI 走牌"),1);
         rect(f,16,350,208,42);UiLocalization::drawCentered(f,365,text("ASK AI","请求 AI"),1);UiLocalization::drawCentered(f,400,feedback,1);

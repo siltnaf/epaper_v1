@@ -1667,7 +1667,7 @@ void showTopbarLoading(bool visible) {
         clearFrameRegion(transitionFrame, loadingLeft, loadingTop,
                          loadingWidth, loadingHeight);
         UiLocalization::drawCentered(transitionFrame, 12,
-                                     UiLocalization::isChinese() ? "下载中，请稍候" : "DOWNLOADING, PLEASE WAIT", 1);
+                                     UiLocalization::isChinese() ? "下载中" : "DOWNLOADING", 1);
         epaper.displayPartial(frame, transitionFrame, loadingLeft, loadingTop,
                               loadingWidth, loadingHeight);
     } else {
@@ -1677,7 +1677,7 @@ void showTopbarLoading(bool visible) {
         clearFrameRegion(transitionFrame, loadingLeft, loadingTop,
                          loadingWidth, loadingHeight);
         UiLocalization::drawCentered(transitionFrame, 12,
-                                     UiLocalization::isChinese() ? "下载中，请稍候" : "DOWNLOADING, PLEASE WAIT", 1);
+                                     UiLocalization::isChinese() ? "下载中" : "DOWNLOADING", 1);
         epaper.displayPartial(transitionFrame, frame, loadingLeft, loadingTop,
                               loadingWidth, loadingHeight);
     }
@@ -2024,7 +2024,7 @@ bool isImmediateTouchControl(int16_t x, int16_t y) {
     }
     if (currentPage == PageId::Radio) return pagerControl();
     if (currentPage == PageId::FindHome) {
-        return FindHomePage::returnControlAt(x, y) ||
+        return FindHomePage::resetControlAt(x, y) ||
                FindHomePage::actionControlAt(x, y);
     }
     if (currentPage == PageId::Chat) {
@@ -2841,14 +2841,13 @@ void handleTouch(TPoint point, TEvent event) {
     }
 
     if (currentPage == PageId::FindHome) {
-        if (FindHomePage::returnControlAt(uiX, uiY)) {
-            showPressedInversion(10, 40, 48, 28);
+        if (FindHomePage::resetControlAt(uiX, uiY)) {
+            showPressedInversion(158, 40, 72, 28);
         } else if (FindHomePage::actionControlAt(uiX, uiY)) {
-            showPressedRoundedInversion(24, 306, 192, 64);
+            showPressedRoundedInversion(24, 328, 192, 52);
         }
         if (FindHomePage::handleTap(uiX, uiY)) {
-            if (FindHomePage::takeExitRequest()) queuePage(PageId::Main);
-            else refreshCurrentPage();
+            refreshCurrentPage();
         }
         return;
     }
@@ -2865,6 +2864,11 @@ void handleTouch(TPoint point, TEvent event) {
     }
 
     if (currentPage == PageId::Game) {
+        if (GamePage::returnControlAt(uiX, uiY)) {
+            showPressedInversion(10, 40, 48, 28);
+        } else if (GamePage::newGameControlAt(uiX, uiY)) {
+            showPressedInversion(170, 40, 60, 28);
+        }
         if (GamePage::handleTap(uiX, uiY)) {
             if (GamePage::takeExitRequest()) queuePage(PageId::Main);
             else refreshCurrentPage();
