@@ -204,6 +204,7 @@ void drawTextButton(uint8_t *f, int x, int y, int w, int h, const char *label) {
     const int labelY = y + (UiLocalization::isChinese() ? 6 : 10);
     UiLocalization::drawText(f, x + (w - labelWidth) / 2, labelY, label, 1);
 }
+
 bool isBlackXiangqiPiece(char piece) { return piece >= 'a' && piece <= 'z'; }
 bool isWhiteXiangqiPiece(char piece) { return piece >= 'A' && piece <= 'Z'; }
 void drawSymbol(uint8_t *f, int cx, int cy, const char *symbol, bool inverted) {

@@ -150,7 +150,7 @@ String mapUrl() {
     if (scheme < 0) return String();
     const int path = base.indexOf('/', scheme + 3);
     if (path >= 0) base.remove(path);
-    String url = base + "/api/find-home/map.jpg?w=224&h=224&z=auto";
+    String url = base + "/api/find-home/map.jpg?w=224&h=224&z=auto&simplified=1";
     url += "&device_mac=";
     String mac = deviceMac();
     mac.replace(":", "");
@@ -253,12 +253,14 @@ void scanWifi() {
     WiFi.scanDelete();
 }
 
-void parseResponse(const String &payload) {
+bool parseResponse(const String &payload) {
     JsonDocument document;
     const DeserializationError error = deserializeJson(document, payload);
     if (error) {
         copyText(status, sizeof(status), "Invalid server response");
-        return;
+        Serial.printf("[FIND HOME] JSON parse failed: %s payload=%s\n",
+                      error.c_str(), payload.c_str());
+        return false;
     }
     JsonObject result = document["result"].as<JsonObject>();
     if (result.isNull()) result = document.as<JsonObject>();
@@ -280,6 +282,7 @@ void parseResponse(const String &payload) {
     else copyText(status, sizeof(status), "No result");
     Serial.printf("[FIND HOME] Server location IP=%s\n",
                   serverLocationIp[0] ? serverLocationIp : "unavailable");
+    return true;
 }
 
 bool postViaCellular(const String &url, const String &body, String &responseBody,
@@ -405,10 +408,10 @@ bool postFootprint() {
                 ? "4G requires HTTP URL" : "Request failed");
             return false;
         }
+        if (!parseResponse(response)) return false;
         homeSet = true;
         currentMeasured = !markingHome;
         saveHomeState();
-        parseResponse(response);
         return true;
     }
     if (!began) {
@@ -432,10 +435,10 @@ bool postFootprint() {
         copyText(status, sizeof(status), "Request failed");
         return false;
     }
+    if (!parseResponse(response)) return false;
     homeSet = true;
     currentMeasured = !markingHome;
     saveHomeState();
-    parseResponse(response);
     return true;
 }
 
@@ -460,7 +463,13 @@ void drawMap(uint8_t *frame) {
     hline(frame, MAP_X, MAP_Y + MAP_H - 1, MAP_W);
     vline(frame, MAP_X, MAP_Y, MAP_H);
     vline(frame, MAP_X + MAP_W - 1, MAP_Y, MAP_H);
-    if (!mapReady) return;
+    if (!mapReady) {
+        const char *text = mapStatus[0] ? mapStatus : status;
+        const int textWidth = UiLocalization::textWidth(text, 1);
+        UiLocalization::drawText(frame, MAP_X + (MAP_W - textWidth) / 2,
+                                 MAP_Y + MAP_H / 2 - 8, text, 1);
+        return;
+    }
     for (int y = 0; y < MAP_H; ++y)
         for (int x = 0; x < MAP_W; ++x) {
             const size_t bitIndex = static_cast<size_t>(y) * MAP_W + x;
@@ -517,10 +526,16 @@ bool handleTap(int16_t x, int16_t y) {
     }
     if (!actionControlAt(x, y) || requestPending) return false;
     requestPending = true;
+    message[0] = '\0';
+    resultStatus[0] = '\0';
     const bool succeeded = postFootprint();
-    if (succeeded) loadMap();
+    bool mapLoaded = false;
+    if (succeeded) mapLoaded = loadMap();
     requestPending = false;
-    if (!succeeded && !message[0]) copyText(message, sizeof(message), status);
+    if (!succeeded) {
+        if (!message[0]) copyText(message, sizeof(message), status);
+        copyText(mapStatus, sizeof(mapStatus), message);
+    }
     if (succeeded && currentMeasured && !std::isnan(distanceKm)) {
         if (UiLocalization::isChinese())
             snprintf(status, sizeof(status), "当前位置到家：%.1f 公里",
@@ -529,7 +544,8 @@ bool handleTap(int16_t x, int16_t y) {
             snprintf(status, sizeof(status), "CURRENT TO HOME: %.1f KM",
                      static_cast<double>(distanceKm));
     } else if (succeeded) {
-        status[0] = '\0';
+        copyText(status, sizeof(status), localized("Home marked", "家已标记"));
+        if (!mapLoaded) copyText(message, sizeof(message), mapStatus);
     }
     return true;
 }

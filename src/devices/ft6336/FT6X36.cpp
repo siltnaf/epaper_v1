@@ -70,6 +70,11 @@ bool FT6X36::isOnline() const
 	return _online;
 }
 
+bool FT6X36::isTouchActive() const
+{
+	return _touchActive;
+}
+
 uint8_t FT6X36::chipId() const
 {
 	return _chipId;

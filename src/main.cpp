@@ -77,7 +77,6 @@ struct TouchAction {
 
 static uint8_t frame[XingtaiEpd::FRAME_BYTES];
 static uint8_t transitionFrame[XingtaiEpd::FRAME_BYTES];
-static uint8_t *calculatorRefreshFrame = nullptr;
 Preferences touchPreferences;
 Preferences settingsPreferences;
 Preferences wifiPreferences;
@@ -854,21 +853,18 @@ void refreshCurrentRegion(uint16_t x, uint16_t y, uint16_t width, uint16_t heigh
     epaper.sleep();
 }
 
-void calculatorRefreshTask(void *) {
+void refreshCalculatorDisplay() {
     constexpr uint16_t displayX = 8;
     constexpr uint16_t displayY = 38;
     constexpr uint16_t displayWidth = 224;
     constexpr uint16_t displayHeight = 68;
 
-    epaper.displayPartial(frame, calculatorRefreshFrame, displayX, displayY,
+    CalculatorPage::render(transitionFrame);
+    epaper.displayPartial(frame, transitionFrame, displayX, displayY,
                           displayWidth, displayHeight);
-    copyFrameRegion(frame, calculatorRefreshFrame, displayX, displayY,
+    copyFrameRegion(frame, transitionFrame, displayX, displayY,
                     displayWidth, displayHeight);
     epaper.sleep();
-    free(calculatorRefreshFrame);
-    calculatorRefreshFrame = nullptr;
-    calculatorRefreshRunning = false;
-    vTaskDelete(nullptr);
 }
 
 void startCalculatorRefresh() {
@@ -878,26 +874,9 @@ void startCalculatorRefresh() {
     }
 
     calculatorRefreshPending = false;
-    calculatorRefreshFrame = static_cast<uint8_t *>(malloc(XingtaiEpd::FRAME_BYTES));
-    if (!calculatorRefreshFrame) {
-        calculatorRefreshPending = true;
-        Serial.printf("[CALCULATOR] Refresh buffer allocation failed; free_heap=%u largest_block=%u\n",
-                      static_cast<unsigned>(ESP.getFreeHeap()),
-                      static_cast<unsigned>(ESP.getMaxAllocHeap()));
-        return;
-    }
-    CalculatorPage::render(calculatorRefreshFrame);
     calculatorRefreshRunning = true;
-    if (xTaskCreate(calculatorRefreshTask, "calculator-epd", 4096,
-                    nullptr, 1, nullptr) != pdPASS) {
-        calculatorRefreshRunning = false;
-        calculatorRefreshPending = true;
-        free(calculatorRefreshFrame);
-        calculatorRefreshFrame = nullptr;
-        Serial.printf("[CALCULATOR] Display worker start failed; free_heap=%u largest_block=%u\n",
-                      static_cast<unsigned>(ESP.getFreeHeap()),
-                      static_cast<unsigned>(ESP.getMaxAllocHeap()));
-    }
+    refreshCalculatorDisplay();
+    calculatorRefreshRunning = false;
 }
 
 void refreshCartoonLayout() {
@@ -2028,8 +2007,9 @@ bool isImmediateTouchControl(int16_t x, int16_t y) {
                FindHomePage::actionControlAt(x, y);
     }
     if (currentPage == PageId::Chat) {
-        return ChatPage::returnControlAt(x, y) || ChatPage::recordControlAt(x, y) ||
-               ChatPage::refreshControlAt(x, y);
+        int16_t left = 0, top = 0, width = 0, height = 0;
+        return ChatPage::recordControlAt(x, y) ||
+               ChatPage::messageControlBoundsAt(x, y, left, top, width, height);
     }
     if (currentPage == PageId::Game) return true;
     return false;
@@ -2289,7 +2269,10 @@ void handleTouch(TPoint point, TEvent event) {
         return;
     }
     if (event != TEvent::Tap) return;
-    touchWorkflowPriority = false;
+    // Immediate controls synthesize Tap on TouchStart. Keep IRQ priority until
+    // the physical TouchEnd arrives; otherwise services can start while the
+    // finger is still on the panel.
+    if (!dispatchingSyntheticTap) touchWorkflowPriority = false;
     if (currentPage == PageId::Recording && suppressNextRecordingTap) {
         suppressNextRecordingTap = false;
         Serial.println("[RECORDING IRQ] Stop tap consumed");
@@ -2381,6 +2364,16 @@ void handleTouch(TPoint point, TEvent event) {
                       static_cast<unsigned>(action), uiX, uiY, contentUrl,
                       WiFi.status(), cellularModem.isConnected());
         switch (action) {
+        case SettingsPage::Action::OpenChatRoom:
+            SettingsPage::showChatRoom(ChatPage::roomName(),
+                                       ChatPage::deviceMacAddress(), ChatPage::pairingUrl(),
+                                       ChatPage::authStatus(), ChatPage::isAuthenticated());
+            refreshCurrentPage();
+            return;
+        case SettingsPage::Action::ChatBack:
+            SettingsPage::showSettings();
+            refreshCurrentPage();
+            return;
         case SettingsPage::Action::OpenContentUrl:
             SettingsPage::showContentUrl(contentUrl);
             refreshCurrentPage();
@@ -2853,12 +2846,15 @@ void handleTouch(TPoint point, TEvent event) {
     }
 
     if (currentPage == PageId::Chat) {
-        if (ChatPage::returnControlAt(uiX, uiY)) showPressedInversion(10, 40, 48, 28);
-        else if (ChatPage::recordControlAt(uiX, uiY)) showPressedInversion(24, 150, 192, 100);
-        else if (ChatPage::refreshControlAt(uiX, uiY)) showPressedInversion(24, 290, 192, 48);
+        int16_t left = 0, top = 0, width = 0, height = 0;
+        if (ChatPage::recordControlAt(uiX, uiY)) {
+            showPressedInversion(12, 348, 216, 52);
+        } else if (ChatPage::messageControlBoundsAt(
+                       uiX, uiY, left, top, width, height)) {
+            showPressedInversion(left, top, width, height);
+        }
         if (ChatPage::handleTap(uiX, uiY)) {
-            if (ChatPage::takeExitRequest()) queuePage(PageId::Main);
-            else refreshCurrentPage();
+            refreshCurrentPage();
         }
         return;
     }
@@ -3049,7 +3045,12 @@ void processTouchAction() {
     }
 
     Serial.printf("[UI] Opening %s page\n", pageName(nextPage));
-    if (nextPage == PageId::Settings) SettingsPage::showSettings();
+    if (nextPage == PageId::Settings) {
+        SettingsPage::showChatRoom(ChatPage::roomName(),
+                                   ChatPage::deviceMacAddress(), ChatPage::pairingUrl(),
+                                   ChatPage::authStatus(), ChatPage::isAuthenticated());
+        SettingsPage::showSettings();
+    }
     if (nextPage == PageId::Clock) prepareClockPage();
     if (nextPage == PageId::Book) {
         BookPage::setContentUrl(contentUrl);
@@ -3271,6 +3272,27 @@ void setup() {
 }
 
 void loop() {
+    serviceTouchInterruptBeforeI2c();
+    touch.loop();
+    processTouchAction();
+
+    // A malformed/spurious sample may not emit TouchEnd. Release priority only
+    // after the driver and physical interrupt line both confirm that no touch
+    // remains; this also prevents startup-guard touches from locking services.
+    if (touchWorkflowPriority && !touch.isTouchActive() &&
+        digitalRead(BoardPins::TOUCH_INT) == HIGH) {
+        touchWorkflowPriority = false;
+        touchGestureActive = false;
+    }
+
+    // The FT6336 ISR owns foreground priority. Do not start any timer, display,
+    // storage, audio, or network service until the physical gesture is fully
+    // drained and its queued page action has been handled.
+    if (touchWorkflowPriority || touchGestureActive) {
+        delay(1);
+        return;
+    }
+
     // Consume one counting notification per EPD update. Partial refresh can
     // exceed one second, so clearing the full count would skip timer labels.
     const bool recordingTimerEvent = ulTaskNotifyTake(pdFALSE, 0) > 0;
@@ -3280,30 +3302,12 @@ void loop() {
         // and SPI work here so timer refreshes cannot race another display job.
         refreshCurrentRegion(24, 116, 192, 36);
     }
-    serviceTouchInterruptBeforeI2c();
-    touch.loop();
-    processTouchAction();
     startCalculatorRefresh();
     if (calculatorRefreshRunning) {
         delay(1);
         return;
     }
     processOpeningLibraryLoads();
-
-    // A touch interrupt promotes input handling above every nonessential
-    // foreground workflow. While a finger gesture is active, do not advance
-    // saves, playback UI, animation, marquee, network indicators, or clock refreshes.
-    if (touchWorkflowPriority || touchGestureActive) {
-        // Radio row taps queue playback so the audio task is not created from
-        // the touch callback. A Tap can arrive without a matching LiftUp after
-        // a long e-paper refresh, leaving touchGestureActive set; service the
-        // queued station before honoring the gesture-priority early return.
-        if (currentPage == PageId::Radio && RadioPage::process()) {
-            refreshCurrentPage();
-        }
-        delay(1);
-        return;
-    }
     // Touch feedback has priority over a pending 下载中/LOADING top-bar update.
     // Service the indicator only after the current physical gesture and its
     // immediate pressed-state refresh have completed.
@@ -3342,6 +3346,7 @@ void loop() {
     if (currentPage == PageId::Chat && ChatPage::process()) {
         refreshCurrentPage();
     }
+    ChatPage::service();
     int16_t marqueeTop = 0;
     if (VoicePage::advanceMarquee(marqueeTop) && currentPage == PageId::Voice) {
         VoicePage::renderMarquee(transitionFrame, frame);

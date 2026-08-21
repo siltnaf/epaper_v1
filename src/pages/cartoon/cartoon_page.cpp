@@ -539,6 +539,48 @@ void loadChapterRows() {
     }
 }
 
+bool parseChapterPage(const String &payload, uint16_t firstVisible) {
+    chapterRowCount = 0;
+    chapterTotal = 0;
+    chapterOffset = firstVisible;
+    chapterHasMore = false;
+    const int chaptersKey = payload.indexOf("\"chapters\"");
+    int position = chaptersKey >= 0 ? payload.indexOf('[', chaptersKey) + 1 : -1;
+    if (position <= 0) return false;
+
+    uint16_t chapterIndex = 0;
+    while (position < static_cast<int>(payload.length())) {
+        const int objectStart = payload.indexOf('{', position);
+        const int arrayEnd = payload.indexOf(']', position);
+        if (objectStart < 0 || (arrayEnd >= 0 && objectStart > arrayEnd)) break;
+        const int objectEnd = payload.indexOf('}', objectStart);
+        if (objectEnd < 0) return false;
+        if (chapterIndex >= firstVisible) {
+            if (chapterRowCount >= ROWS_PER_PAGE) {
+                chapterHasMore = true;
+                break;
+            }
+            const String id = jsonStringAt(payload, objectStart, "id", objectEnd);
+            const String title = jsonStringAt(payload, objectStart, "title", objectEnd);
+            if (!id.isEmpty()) {
+                ListItem &row = chapterRows[chapterRowCount++];
+                copyText(row.id, sizeof(row.id), id.c_str());
+                copyText(row.title, sizeof(row.title), title.c_str(), "UNTITLED");
+                row.saved = chapterHasCache(selectedSlug, row.id);
+                if (row.saved) saveChapterTitleToSd(selectedSlug, row.id, row.title);
+            }
+        }
+        ++chapterIndex;
+        position = objectEnd + 1;
+    }
+    chapterTotal = firstVisible + chapterRowCount + (chapterHasMore ? 1 : 0);
+    chapterPage = max<uint16_t>(1, firstVisible / ROWS_PER_PAGE + 1);
+    Serial.printf("[CARTOON API] lightweight chapters offset=%u visible=%u has_more=%s payload=%u\n",
+                  firstVisible, chapterRowCount, chapterHasMore ? "true" : "false",
+                  static_cast<unsigned>(payload.length()));
+    return chapterRowCount > 0;
+}
+
 void chapterListPath(const char *slug, char *path, size_t pathSize) {
     char safeSlug[64] = {};
     safePathComponent(slug, safeSlug, sizeof(safeSlug));
@@ -634,8 +676,16 @@ bool loadChapterPageFromApi(const char *slug, int32_t requestedOffset) {
         }
         if (WiFi.status() != WL_CONNECTED) {
             loaded = httpGetText(url, payload, 30000);
-            if (loaded) PlaylistCache::save(
-                CARTOON_SD_FOLDER, endpoint, cacheSlot, payload);
+            if (loaded) {
+                const bool parsed = parseChapterPage(payload, firstVisible);
+                payload = String();
+                if (parsed) {
+                    copyText(statusText, sizeof(statusText), "");
+                    return true;
+                }
+                copyText(statusText, sizeof(statusText), "CHAPTER JSON FAILED");
+                return false;
+            }
         }
     }
     if (!loaded) {
@@ -645,40 +695,12 @@ bool loadChapterPageFromApi(const char *slug, int32_t requestedOffset) {
         }
         return loadSavedChapterPageFromSd(slug, requestedOffset);
     }
-
-    JsonDocument document;
-    if (deserializeJson(document, payload)) {
-        copyText(statusText, sizeof(statusText), "CHAPTER JSON FAILED");
-        return false;
-    }
-    const uint16_t responseTotal = document["total"] | 0;
-    const uint16_t responseOffset = document["offset"] |
-        static_cast<uint16_t>(requestedOffset < 0 ? 0 : requestedOffset);
-    chapterRowCount = 0;
-    chapterTotal = max<uint16_t>(responseTotal, responseOffset);
-    chapterOffset = responseOffset;
-    chapterHasMore = document["has_more"] | false;
-    for (JsonObject item : document["chapters"].as<JsonArray>()) {
-        if (chapterRowCount >= ROWS_PER_PAGE) break;
-        copyText(chapterRows[chapterRowCount].id, sizeof(chapterRows[chapterRowCount].id),
-                 item["id"] | "");
-        copyText(chapterRows[chapterRowCount].title, sizeof(chapterRows[chapterRowCount].title),
-                 item["title"] | "", "UNTITLED");
-        chapterRows[chapterRowCount].saved =
-            chapterHasCache(selectedSlug, chapterRows[chapterRowCount].id);
-        if (chapterRows[chapterRowCount].saved) {
-            saveChapterTitleToSd(slug, chapterRows[chapterRowCount].id,
-                                 chapterRows[chapterRowCount].title);
-        }
-        if (chapterRows[chapterRowCount].id[0]) ++chapterRowCount;
-    }
-    if (chapterTotal < chapterOffset + chapterRowCount) {
-        chapterTotal = chapterOffset + chapterRowCount;
-    }
-    chapterPage = max<uint16_t>(
-        1, (chapterOffset + ROWS_PER_PAGE - 1) / ROWS_PER_PAGE + 1);
-    copyText(statusText, sizeof(statusText), chapterRowCount ? "" : "NO CHAPTERS");
-    return chapterRowCount > 0 || chapterTotal == 0;
+    const uint16_t firstVisible = static_cast<uint16_t>(
+        requestedOffset < 0 ? 0 : requestedOffset);
+    const bool parsed = parseChapterPage(payload, firstVisible);
+    payload = String();
+    copyText(statusText, sizeof(statusText), parsed ? "" : "CHAPTER JSON FAILED");
+    return parsed;
 }
 
 bool loadChapters(const ListItem &comic) {

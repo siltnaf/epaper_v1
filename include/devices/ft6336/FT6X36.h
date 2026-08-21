@@ -104,6 +104,7 @@ public:
 	bool begin(uint8_t threshold = FT6X36_DEFAULT_THRESHOLD);
 	void end();
 	bool isOnline() const;
+	bool isTouchActive() const;
 	uint8_t chipId() const;
 	uint8_t vendorId() const;
 	uint8_t firmwareVersion() const;

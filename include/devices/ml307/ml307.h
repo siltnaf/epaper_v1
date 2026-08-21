@@ -90,10 +90,10 @@ private:
     bool tcpStreamLockHeld_ = false;
     char tcpStreamHost_[96] = {};
     uint16_t tcpStreamPort_ = 0;
-    // ML307 can deliver a whole encoded TCP URC in one line. Radio responses
-    // observed so far are below 8.3 KiB decoded; 12 KiB preserves them while
-    // leaving enough contiguous internal RAM for the MP3 decoder workspace.
-    static constexpr size_t TCP_RX_BUFFER_SIZE = 12 * 1024;
+    // Keep this allocation small enough for HTTP requests made while the UI is
+    // active. Large modem URCs are drained incrementally and report truncation
+    // instead of taking a 12 KiB contiguous block from the internal heap.
+    static constexpr size_t TCP_RX_BUFFER_SIZE = 4 * 1024;
     uint8_t *tcpRxBuffer_ = nullptr;
     size_t tcpRxRead_ = 0;
     size_t tcpRxWrite_ = 0;

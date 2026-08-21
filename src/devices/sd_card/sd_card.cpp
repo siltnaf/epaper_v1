@@ -40,7 +40,8 @@ bool isValidOggOpus(const char *path, uint32_t minimumBytes) {
     return std::memcmp(header + packetOffset, "OpusHead", 8) == 0;
 }
 
-bool downloadFile(const char *url, const char *path, uint32_t minimumBytes) {
+bool downloadFile(const char *url, const char *path, uint32_t minimumBytes,
+                  const char *bearerToken) {
     if (!url || !path || !isMounted() ||
         (WiFi.status() != WL_CONNECTED && !cellularModem.isConnected())) return false;
     UiLoadingIndicator::Scope loadingIndicator;
@@ -109,6 +110,11 @@ bool downloadFile(const char *url, const char *path, uint32_t minimumBytes) {
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     http.setReuse(false);
     http.setUserAgent("ESP32-ePaper-Asset/1.0");
+    if (bearerToken && bearerToken[0]) {
+        String authorization = "Bearer ";
+        authorization += bearerToken;
+        http.addHeader("Authorization", authorization);
+    }
     WiFiClient plainClient;
     WiFiClientSecure secureClient;
     secureClient.setInsecure();
@@ -129,67 +135,10 @@ bool downloadFile(const char *url, const char *path, uint32_t minimumBytes) {
     const uint32_t transferStartedMs = millis();
     if (responseCode >= 200 && responseCode < 300) {
         expectedBytes = http.getSize();
-        WiFiClient *stream = http.getStreamPtr();
-        uint8_t buffer[2048] = {};
-        written = 0;
-        uint32_t lastDataMs = millis();
-        uint32_t nextProgressMs = lastDataMs + 5000;
-        // Generated TTS files can pause between server chunks even while the
-        // connection remains healthy. Match the HTTP socket timeout instead of
-        // aborting after 20 seconds, and allow slow large files to finish.
-        constexpr uint32_t idleTimeoutMs = 65000;
-        constexpr uint32_t totalTimeoutMs = 600000;
-
-        while ((expectedBytes < 0 && (http.connected() || stream->available())) ||
-               (expectedBytes >= 0 && written < expectedBytes)) {
-            const uint32_t now = millis();
-            if (now - transferStartedMs >= totalTimeoutMs) {
-                Serial.printf("[SD] Download total timeout at %d/%d bytes\n",
-                              written, expectedBytes);
-                break;
-            }
-            const int available = stream->available();
-            if (available > 0) {
-                const size_t requested = min<size_t>(static_cast<size_t>(available),
-                                                     sizeof(buffer));
-                const int received = stream->read(buffer, requested);
-                if (received <= 0 ||
-                    output.write(buffer, static_cast<size_t>(received)) !=
-                        static_cast<size_t>(received)) {
-                    Serial.printf("[SD] Download stream/write error received=%d written=%d\n",
-                                  received, written);
-                    break;
-                }
-                written += received;
-                lastDataMs = millis();
-            } else {
-                if (!http.connected()) {
-                    Serial.printf("[SD] Download connection closed at %d/%d bytes\n",
-                                  written, expectedBytes);
-                    break;
-                }
-                if (now - lastDataMs >= idleTimeoutMs) {
-                    Serial.printf("[SD] Download idle timeout at %d/%d bytes after %lums\n",
-                                  written, expectedBytes,
-                                  static_cast<unsigned long>(now - lastDataMs));
-                    break;
-                }
-                delay(2);
-            }
-
-            const uint32_t progressNow = millis();
-            if (static_cast<int32_t>(progressNow - nextProgressMs) >= 0) {
-                const uint32_t elapsed = progressNow - transferStartedMs;
-                const uint32_t bytesPerSecond = elapsed > 0
-                    ? static_cast<uint32_t>((static_cast<uint64_t>(written) * 1000ULL) / elapsed)
-                    : 0;
-                Serial.printf("[SD] Download progress %d/%d bytes (%lu B/s)\n",
-                              written, expectedBytes,
-                              static_cast<unsigned long>(bytesPerSecond));
-                nextProgressMs = progressNow + 5000;
-            }
-            delay(1);
-        }
+        // HTTPClient owns the socket receive loop. Its stream copier handles
+        // partial Wi-Fi packets correctly; polling available() here stalled
+        // after the first 1146-byte packet from the Find Home map endpoint.
+        written = http.writeToStream(&output);
         transferComplete = written >= static_cast<int>(minimumBytes) &&
                            (expectedBytes < 0 || written == expectedBytes);
     }
