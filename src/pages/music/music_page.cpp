@@ -6,7 +6,6 @@
 #include <SD_MMC.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
-#include <WiFiClientSecure.h>
 #include <esp_heap_caps.h>
 
 #include <cstdlib>
@@ -26,8 +25,8 @@ namespace {
 
 constexpr uint8_t ITEMS_PER_PAGE = 10;
 constexpr size_t MAX_PLAYLIST_RESPONSE_BYTES = MemoryBudget::MAX_JSON_PAYLOAD;
-constexpr uint32_t MIN_PLAYLIST_REQUEST_HEAP = 16 * 1024;
-constexpr uint32_t MIN_PLAYLIST_REQUEST_BLOCK = 8 * 1024;
+constexpr uint32_t MIN_PLAYLIST_REQUEST_HEAP = 10 * 1024;
+constexpr uint32_t MIN_PLAYLIST_REQUEST_BLOCK = 3 * 1024;
 constexpr int LIST_TOP = 82;
 constexpr int ROW_HEIGHT = 30;
 constexpr int ROW_GAP = 2;
@@ -344,16 +343,34 @@ bool httpGet(const String &url, String &payload, bool showLoading = true) {
     http.setTimeout(20000);
     http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
     http.setReuse(false);
+    if (!url.startsWith("http://")) {
+        std::strcpy(statusText, "CONTENT URL MUST USE HTTP");
+        Serial.printf("[MUSIC API] Unsupported content URL: %s\n", url.c_str());
+        return false;
+    }
     WiFiClient plainClient;
-    WiFiClientSecure secureClient;
-    secureClient.setInsecure();
-    const bool began = url.startsWith("https://")
-        ? http.begin(secureClient, url) : http.begin(plainClient, url);
+    const bool began = http.begin(plainClient, url);
     if (!began) { std::strcpy(statusText, "INVALID CONTENT URL"); return false; }
     http.addHeader("Connection", "close");
     http.addHeader("User-Agent", "ESP32-ePaper-Music/1.0");
     const int code = http.GET();
     if (code >= 200 && code < 300) {
+        const int contentLength = http.getSize();
+        if (contentLength > static_cast<int>(MAX_PLAYLIST_RESPONSE_BYTES)) {
+            Serial.printf("[MUSIC API] response too large bytes=%d limit=%u\n",
+                          contentLength, static_cast<unsigned>(MAX_PLAYLIST_RESPONSE_BYTES));
+            http.end();
+            std::strcpy(statusText, "PLAYLIST TOO LARGE");
+            return false;
+        }
+        if (contentLength > 0 && !payload.reserve(static_cast<unsigned>(contentLength))) {
+            Serial.printf("[MUSIC API] response allocation failed bytes=%d heap=%u largest=%u\n",
+                          contentLength, static_cast<unsigned>(ESP.getFreeHeap()),
+                          static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_8BIT)));
+            http.end();
+            std::strcpy(statusText, "LOW MEMORY, USING SD");
+            return false;
+        }
         payload = http.getString();
         if (payload.length() > MAX_PLAYLIST_RESPONSE_BYTES) {
             Serial.printf("[MUSIC API] response too large bytes=%u limit=%u\n",
@@ -673,9 +690,6 @@ void renderLibrary(uint8_t *frame) {
             if (!marqueeReady) captureMarquee(frame, top);
         } else if (songs[index].saved) drawCheckmark(frame, 215, top + ROW_HEIGHT / 2);
         else drawArrow(frame, 215, top + ROW_HEIGHT / 2, true);
-        if (index == activeSongIndex || index == selectedIndex) {
-            invertRect(frame, 12, top, 216, ROW_HEIGHT);
-        }
     }
 }
 
@@ -720,7 +734,7 @@ bool startLibraryLoad() {
     if (libraryLoadRunning) return false;
     libraryLoadRunning = true;
     libraryLoadCompleted = false;
-    if (xTaskCreate(libraryLoadTask, "music-library", 4096, nullptr, 1, nullptr) != pdPASS) {
+    if (xTaskCreate(libraryLoadTask, "music-library", 6144, nullptr, 1, nullptr) != pdPASS) {
         libraryLoadRunning = false;
         libraryAwaitingContent = false;
         std::strcpy(statusText, "MUSIC TASK FAILED");

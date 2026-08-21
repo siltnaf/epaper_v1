@@ -11,6 +11,7 @@
 #include "devices/epd_xingtai/epd_xingtai.h"
 #include "devices/ml307/ml307.h"
 #include "pages/game/chess/chess_assets.h"
+#include "pages/ai/ai_page.h"
 #include "ui/loading_indicator.h"
 #include "ui/localization.h"
 
@@ -351,5 +352,8 @@ void render(uint8_t *f){
 }
 void drawTopbar(uint8_t *frame){
     clearRect(frame,28,0,152,32);
+    // This page owns a custom top-bar refresh. Restore the shared AI control
+    // after clearing the game-specific center area.
+    AiPage::drawTopbarStatus(frame);
 }
 }

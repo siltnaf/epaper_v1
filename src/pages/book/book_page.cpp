@@ -6,7 +6,6 @@
 #include <SD_MMC.h>
 #include <WiFi.h>
 #include <WiFiClient.h>
-#include <WiFiClientSecure.h>
 
 #include "devices/epd_xingtai/epd_xingtai.h"
 #include "devices/ml307/ml307.h"
@@ -494,41 +493,49 @@ bool httpGet(const String &url, String &payload, bool showLoading = true) {
         return false;
     }
 
-    HTTPClient http;
-    http.setConnectTimeout(7000);
-    http.setTimeout(20000);
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    http.setReuse(false);
-    WiFiClient plainClient;
-    WiFiClientSecure secureClient;
-    plainClient.setTimeout(20);
-    secureClient.setTimeout(20);
-    bool began = false;
-    if (url.startsWith("https://")) {
-        secureClient.setInsecure();
-        began = http.begin(secureClient, url);
-    } else {
-        began = http.begin(plainClient, url);
-    }
-    if (!began) {
-        std::strcpy(statusText, "INVALID CONTENT URL");
-        Serial.printf("[BOOK] Invalid URL: %s\n", url.c_str());
+    if (!url.startsWith("http://")) {
+        std::strcpy(statusText, "CONTENT URL MUST USE HTTP");
+        Serial.printf("[BOOK] Unsupported content URL: %s\n", url.c_str());
         return false;
     }
-    http.addHeader("Connection", "close");
-    http.addHeader("User-Agent", "ESP32-ePaper-Book/1.0");
-    const int code = http.GET();
-    if (code >= 200 && code < 300) payload = http.getString();
-    const String error = code < 0 ? http.errorToString(code) : String();
-    http.end();
-    Serial.printf("[BOOK API] response code=%d%s%s bytes=%u url=%s\n", code,
-                  error.isEmpty() ? "" : " ", error.c_str(), payload.length(), url.c_str());
-    if (code < 0) {
-        if (UiLocalization::isChinese()) std::strcpy(statusText, "网络错误");
-        else snprintf(statusText, sizeof(statusText), "HTTP ERROR %d", code);
+
+    // The configured content endpoint is plain HTTP. Keep TLS objects out of
+    // this path because this board has no PSRAM and can have only a few KiB free.
+    for (uint8_t attempt = 1; attempt <= 2; ++attempt) {
+        HTTPClient http;
+        WiFiClient plainClient;
+        http.setConnectTimeout(7000);
+        http.setTimeout(20000);
+        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        http.setReuse(false);
+        plainClient.setTimeout(20);
+        if (!http.begin(plainClient, url)) {
+            std::strcpy(statusText, "INVALID CONTENT URL");
+            Serial.printf("[BOOK] Invalid URL: %s\n", url.c_str());
+            return false;
+        }
+        http.addHeader("Connection", "close");
+        http.addHeader("User-Agent", "ESP32-ePaper-Book/1.0");
+        const int code = http.GET();
+        if (code >= 200 && code < 300) payload = http.getString();
+        const String error = code < 0 ? http.errorToString(code) : String();
+        http.end();
+        Serial.printf("[BOOK API] response attempt=%u code=%d%s%s bytes=%u url=%s heap=%u\n",
+                      attempt, code, error.isEmpty() ? "" : " ", error.c_str(),
+                      payload.length(), url.c_str(), static_cast<unsigned>(ESP.getFreeHeap()));
+        if (code >= 200 && code < 300) return true;
+        if (code >= 0 || attempt == 2) {
+            if (code < 0) {
+                if (UiLocalization::isChinese()) std::strcpy(statusText, "网络错误");
+                else snprintf(statusText, sizeof(statusText), "HTTP ERROR %d", code);
+            } else {
+                snprintf(statusText, sizeof(statusText), "SERVER HTTP %d", code);
+            }
+            return false;
+        }
+        delay(250);
     }
-    else if (code < 200 || code >= 300) snprintf(statusText, sizeof(statusText), "SERVER HTTP %d", code);
-    return code >= 200 && code < 300;
+    return false;
 }
 
 int findKey(const String &json, const char *key, int start = 0) {
@@ -613,6 +620,8 @@ bool loadLibrary(bool showLoading = true, bool forceRemote = false,
     if (!remoteLoaded) {
         // The remote library is optional once books have been cached. Build a
         // local page directly from /book/<id>/meta.txt + content.txt.
+        SdCard::Lock sdLock;
+        if (!sdLock.acquired()) return false;
         if (!SdCard::isMounted()) return false;
         File root = SD_MMC.open(BOOK_SD_FOLDER);
         if (!root || !root.isDirectory()) return false;
@@ -805,12 +814,10 @@ void renderLibrary(uint8_t *frame) {
         drawUtf8Title(frame, 34, top + 1, 171, ROW_HEIGHT - 2, books[index].title);
         if (books[index].saved) drawCheckmark(frame, 215, top + ROW_HEIGHT / 2);
         else drawArrow(frame, 215, top + ROW_HEIGHT / 2, true);
-        if (index == selectedLibraryIndex) invertRect(frame, 12, top, 216, ROW_HEIGHT);
     }
 }
 
 void renderReader(uint8_t *frame) {
-    rect(frame, 8, 38, 50, 26);
     UiLocalization::drawText(frame, UiLocalization::isChinese() ? 16 : 15, 47,
                              UiLocalization::isChinese() ? "返回" : "BACK");
     drawUtf8Title(frame, 66, 39, 164, 24, selectedTitle);
@@ -854,9 +861,7 @@ void renderReader(uint8_t *frame) {
         }
         x += advance;
     }
-    rect(frame, 8, 386, 34, 24);
     drawArrow(frame, 25, 398, false);
-    rect(frame, 198, 386, 34, 24);
     drawArrow(frame, 215, 398, true);
     char pager[20] = {};
     if (UiLocalization::isChinese()) snprintf(pager, sizeof(pager), "%d/%d", readerPage + 1, readerPageCount());
@@ -1037,13 +1042,10 @@ void renderReaderControlPressed(uint8_t *frame, ReaderControl control) {
     renderReader(frame);
     switch (control) {
     case ReaderControl::Back:
-        invertRect(frame, 8, 38, 50, 26);
         break;
     case ReaderControl::Previous:
-        invertRect(frame, 8, 386, 34, 24);
         break;
     case ReaderControl::Next:
-        invertRect(frame, 198, 386, 34, 24);
         break;
     default:
         break;

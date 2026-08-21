@@ -36,6 +36,10 @@ constexpr int READER_TOP = 32;
 constexpr int READER_HEIGHT = XingtaiEpd::HEIGHT - READER_TOP;
 constexpr int READER_BACK_HEIGHT = 48;
 constexpr size_t MAX_CARTOON_LIST_BYTES = 64 * 1024;
+constexpr size_t JPEG_DOWNLOAD_FREE_RESERVE = 8 * 1024;
+constexpr size_t JPEG_DOWNLOAD_BLOCK_RESERVE = 4 * 1024;
+constexpr size_t JPEG_DECODE_FREE_RESERVE = 8 * 1024;
+constexpr size_t JPEG_DECODE_BLOCK_RESERVE = 2 * 1024;
 
 struct ListItem {
     char id[64] = {};
@@ -85,6 +89,8 @@ bool loadChapterRowsFromSd(const char *slug);
 bool loadSavedCartoonsFromSd();
 bool loadSavedChapterPageFromSd(const char *slug, int32_t requestedOffset);
 bool parseChapterObject(const String &object, uint16_t firstVisible);
+bool loadCartoonPageStream(const String &url, int32_t requestedOffset);
+String jsonStringAt(const String &json, int objectStart, const char *key, int objectEnd);
 void saveCartoonTitleToSd(const char *slug, const char *title);
 void saveChapterTitleToSd(const char *slug, const char *chapterId, const char *title);
 void safePathComponent(const char *value, char *output, size_t outputSize);
@@ -307,6 +313,145 @@ bool httpGetText(const String &url, String &payload, uint32_t timeout = 20000) {
     return false;
 }
 
+bool loadCartoonPageStream(const String &url, int32_t requestedOffset) {
+    UiLoadingIndicator::Scope loading;
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    HTTPClient http;
+    WiFiClient client;
+    http.setConnectTimeout(10000);
+    http.setTimeout(30000);
+    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+    http.setReuse(false);
+    client.setTimeout(30);
+    if (!http.begin(client, url)) return false;
+    http.addHeader("Connection", "close");
+    http.addHeader("User-Agent", "ESP32-ePaper-Cartoon/1.0");
+    const int code = http.GET();
+    const int contentLength = http.getSize();
+    bool inArray = false;
+    bool inObject = false;
+    bool inString = false;
+    bool escaped = false;
+    bool cartoonsKeyFound = false;
+    bool arrayEnded = false;
+    uint16_t depth = 0;
+    uint16_t total = 0;
+    size_t receivedBytes = 0;
+    uint16_t firstVisible = requestedOffset < 0 ? 0 : static_cast<uint16_t>(requestedOffset);
+    uint16_t rollingStart = 0;
+    String marker;
+    String object;
+    cartoonCount = 0;
+    cartoonTotal = 0;
+    cartoonOffset = 0;
+    cartoonHasMore = false;
+
+    if (code >= 200 && code < 300) {
+        WiFiClient *stream = http.getStreamPtr();
+        const uint32_t started = millis();
+        uint32_t lastData = started;
+        while (millis() - started < 30000) {
+            if (stream->available() <= 0) {
+                if (!stream->connected() && millis() - lastData >= 1000) break;
+                delay(2);
+                continue;
+            }
+            const char character = static_cast<char>(stream->read());
+            ++receivedBytes;
+            lastData = millis();
+            if (arrayEnded) continue;
+            if (!inArray) {
+                if (!cartoonsKeyFound) {
+                    marker += character;
+                    if (marker.length() > 12) marker.remove(0, marker.length() - 12);
+                    cartoonsKeyFound = marker.endsWith("\"cartoons\"");
+                } else if (character == '[') {
+                    inArray = true;
+                }
+                continue;
+            }
+            if (!inObject) {
+                if (character == ']') {
+                    arrayEnded = true;
+                    continue;
+                }
+                if (character == '{') {
+                    inObject = true;
+                    inString = false;
+                    escaped = false;
+                    depth = 1;
+                    object = "{";
+                }
+                continue;
+            }
+            object += character;
+            if (inString) {
+                if (escaped) escaped = false;
+                else if (character == '\\') escaped = true;
+                else if (character == '"') inString = false;
+            } else if (character == '"') {
+                inString = true;
+            } else if (character == '{') {
+                ++depth;
+            } else if (character == '}' && depth > 0 && --depth == 0) {
+                if (requestedOffset < 0) {
+                    if (total >= ROWS_PER_PAGE) {
+                        for (uint8_t index = 1; index < ROWS_PER_PAGE; ++index)
+                            cartoons[index - 1] = cartoons[index];
+                        rollingStart = total - ROWS_PER_PAGE + 1;
+                        cartoonCount = ROWS_PER_PAGE - 1;
+                    }
+                    firstVisible = rollingStart;
+                }
+                if (total >= firstVisible && cartoonCount < ROWS_PER_PAGE) {
+                    const String id = jsonStringAt(object, 0, "id", object.length());
+                    const String title = jsonStringAt(object, 0, "name", object.length());
+                    if (!id.isEmpty()) {
+                        ListItem &item = cartoons[cartoonCount++];
+                        copyText(item.id, sizeof(item.id), id.c_str());
+                        copyText(item.title, sizeof(item.title), title.c_str(), "UNTITLED");
+                        item.saved = cartoonHasCache(item.id);
+                        if (item.saved) saveCartoonTitleToSd(item.id, item.title);
+                    }
+                }
+                ++total;
+                inObject = false;
+                object = "";
+            }
+        }
+    }
+    http.end();
+    const bool complete = contentLength < 0 ||
+                          receivedBytes == static_cast<size_t>(contentLength);
+    if (code < 200 || code >= 300 || !arrayEnded || !complete ||
+        total == 0 || cartoonCount == 0) {
+        Serial.printf("[CARTOON API] stream list failed code=%d bytes=%u content_length=%d total=%u visible=%u\n",
+                      code, static_cast<unsigned>(receivedBytes), contentLength, total, cartoonCount);
+        return false;
+    }
+    if (requestedOffset < 0) {
+        const uint8_t finalPageCount = total % ROWS_PER_PAGE
+            ? static_cast<uint8_t>(total % ROWS_PER_PAGE) : ROWS_PER_PAGE;
+        const uint8_t firstRetained = cartoonCount - finalPageCount;
+        for (uint8_t index = 0; index < finalPageCount; ++index)
+            cartoons[index] = cartoons[firstRetained + index];
+        cartoonCount = finalPageCount;
+        firstVisible = total - finalPageCount;
+        cartoonOffset = firstVisible;
+    } else {
+        cartoonOffset = requestedOffset;
+    }
+    cartoonTotal = total;
+    cartoonHasMore = cartoonOffset + cartoonCount < cartoonTotal;
+    cartoonPage = max<uint16_t>(1, cartoonOffset / ROWS_PER_PAGE + 1);
+    copyText(statusText, sizeof(statusText), "");
+    Serial.printf("[CARTOON API] stream list code=%d bytes=%u content_length=%d total=%u offset=%u visible=%u\n",
+                  code, static_cast<unsigned>(receivedBytes), contentLength,
+                  cartoonTotal, cartoonOffset, cartoonCount);
+    return true;
+}
+
 // The chapter endpoint currently returns the complete chapter array even when
 // limit/offset are supplied.  That response can exceed the largest available
 // heap block, so do not use HTTPClient::getString() here.  Keep only one JSON
@@ -418,13 +563,18 @@ bool loadCartoons(int32_t requestedOffset, bool forceRemote = false,
                   bool cacheOnly = false) {
     String payload;
     const String endpoint = apiBase();
-    char cacheSlot[24] = {};
-    snprintf(cacheSlot, sizeof(cacheSlot), "offset-%ld", static_cast<long>(requestedOffset));
+    // The Cartoon API's limit/offset query selects a small legacy subset rather
+    // than paginating the complete catalog. Cache the full response once and
+    // slice its 121-item cartoons array locally.
+    constexpr char cacheSlot[] = "full-list-v2";
     bool loaded = !forceRemote && PlaylistCache::load(
         CARTOON_SD_FOLDER, endpoint, cacheSlot, payload);
     bool fetchedRemote = false;
-    const String url = endpoint + "?limit=" + String(ROWS_PER_PAGE) +
-                       "&offset=" + String(requestedOffset);
+    const String url = endpoint;
+    if (!cacheOnly && WiFi.status() == WL_CONNECTED &&
+        loadCartoonPageStream(url, requestedOffset)) {
+        return true;
+    }
     if (!cacheOnly && (forceRemote || !loaded)) {
         loaded = httpGetText(url, payload);
         fetchedRemote = loaded;
@@ -440,18 +590,38 @@ bool loadCartoons(int32_t requestedOffset, bool forceRemote = false,
     }
     if (fetchedRemote) PlaylistCache::save(
         CARTOON_SD_FOLDER, endpoint, cacheSlot, payload);
-    const uint16_t responseTotal = document["total"] | 0;
-    const uint16_t responseOffset = document["offset"] |
-        static_cast<uint16_t>(requestedOffset < 0 ? 0 : requestedOffset);
+    JsonArray cartoonItems = document["cartoons"].as<JsonArray>();
+    if (cartoonItems.isNull()) {
+        copyText(statusText, sizeof(statusText), "NO CARTOONS IN JSON");
+        return false;
+    }
+    const bool serverPaginated = !document["total"].isNull() ||
+                                 !document["offset"].isNull() ||
+                                 !document["has_more"].isNull();
+    const uint16_t returnedTotal = min<size_t>(cartoonItems.size(), UINT16_MAX);
+    const uint16_t responseTotal = serverPaginated
+        ? static_cast<uint16_t>(document["total"] | returnedTotal)
+        : returnedTotal;
+    uint16_t responseOffset = 0;
+    if (serverPaginated) {
+        responseOffset = document["offset"] |
+            static_cast<uint16_t>(requestedOffset < 0 ? 0 : requestedOffset);
+    } else if (returnedTotal > 0) {
+        responseOffset = requestedOffset < 0
+            ? static_cast<uint16_t>(((returnedTotal - 1) / ROWS_PER_PAGE) * ROWS_PER_PAGE)
+            : min<uint16_t>(static_cast<uint16_t>(requestedOffset), returnedTotal);
+    }
     cartoonCount = 0;
     cartoonTotal = max<uint16_t>(responseTotal, responseOffset);
     cartoonOffset = responseOffset;
-    cartoonHasMore = document["has_more"] | false;
+    cartoonHasMore = serverPaginated ? (document["has_more"] | false) : false;
     // A successful ML307 request is online content too. Treating every
     // non-WiFi session as offline filtered out all fresh 4G cartoons unless
     // their chapters were already cached on SD.
     const bool offline = WiFi.status() != WL_CONNECTED && !cellularModem.isConnected();
-    for (JsonObject item : document["cartoons"].as<JsonArray>()) {
+    uint16_t returnedIndex = 0;
+    for (JsonObject item : cartoonItems) {
+        if (!serverPaginated && returnedIndex++ < responseOffset) continue;
         if (cartoonCount >= ROWS_PER_PAGE) break;
         copyText(cartoons[cartoonCount].id, sizeof(cartoons[cartoonCount].id), item["id"] | "");
         copyText(cartoons[cartoonCount].title, sizeof(cartoons[cartoonCount].title),
@@ -466,6 +636,9 @@ bool loadCartoons(int32_t requestedOffset, bool forceRemote = false,
     if (cartoonTotal < cartoonOffset + cartoonCount) {
         cartoonTotal = cartoonOffset + cartoonCount;
     }
+    if (!serverPaginated) {
+        cartoonHasMore = cartoonOffset + cartoonCount < cartoonTotal;
+    }
     if (offline) {
         cartoonTotal = cartoonCount;
         cartoonOffset = 0;
@@ -475,9 +648,10 @@ bool loadCartoons(int32_t requestedOffset, bool forceRemote = false,
     cartoonPage = max<uint16_t>(
         1, (cartoonOffset + ROWS_PER_PAGE - 1) / ROWS_PER_PAGE + 1);
     copyText(statusText, sizeof(statusText), cartoonCount ? "" : "NO CARTOONS");
-    Serial.printf("[CARTOON API] parsed count=%u total=%u offset=%u has_more=%s transport=%s\n",
+    Serial.printf("[CARTOON API] parsed count=%u total=%u offset=%u has_more=%s pagination=%s transport=%s\n",
                   cartoonCount, cartoonTotal, cartoonOffset,
                   cartoonHasMore ? "true" : "false",
+                   serverPaginated ? "server" : "local",
                   WiFi.status() == WL_CONNECTED ? "wifi" :
                   cellularModem.isConnected() ? "4g" : "offline");
     return cartoonCount > 0 || cartoonTotal == 0;
@@ -1264,7 +1438,11 @@ bool downloadJpeg(const String &url, const char *destinationPath) {
     UiLoadingIndicator::Scope loading;
     imageReady = false;
     jpegSize = 0;
-    if (!MemoryBudget::canAllocate(1024)) {
+    // JPEG data streams directly to SD. It does not need the TLS/JSON reserve
+    // used by the generic memory guard, and rejecting at that threshold can
+    // make an otherwise healthy 17 KiB heap unable to turn a reader page.
+    if (!MemoryBudget::canAllocate(1024, JPEG_DOWNLOAD_FREE_RESERVE,
+                                   JPEG_DOWNLOAD_BLOCK_RESERVE)) {
         copyText(statusText, sizeof(statusText), "LOW MEMORY, RETRY IMAGE");
         MemoryBudget::log("jpeg-skip");
         return false;
@@ -1519,7 +1697,8 @@ void renderList(uint8_t *frame, const ListItem *items, uint8_t count,
 
 void renderReader(uint8_t *frame) {
     if (imageReady && jpegSize && SD_MMC.exists(readerJpegPath) &&
-        MemoryBudget::canAllocate(4 * 1024)) {
+        MemoryBudget::canAllocate(4 * 1024, JPEG_DECODE_FREE_RESERVE,
+                                  JPEG_DECODE_BLOCK_RESERVE)) {
         uint16_t sourceWidth = 0, sourceHeight = 0;
         const JRESULT sizeResult = TJpgDec.getFsJpgSize(
             &sourceWidth, &sourceHeight, readerJpegPath, SD_MMC);
@@ -1707,8 +1886,13 @@ bool handleTap(int16_t x, int16_t y) {
         if (inRect(x, y, 0, READER_TOP + READER_BACK_HEIGHT,
                    XingtaiEpd::WIDTH / 2, READER_HEIGHT - READER_BACK_HEIGHT) &&
             readerPage > 1) {
+            const uint16_t previousPage = readerPage;
             --readerPage;
-            loadReaderPage();
+            if (!loadReaderPage()) {
+                readerPage = previousPage;
+                loadReaderPage();
+                return false;
+            }
             refreshMode = RefreshMode::ImageContent;
             return true;
         }
@@ -1716,8 +1900,13 @@ bool handleTap(int16_t x, int16_t y) {
                    XingtaiEpd::WIDTH / 2,
                    READER_HEIGHT - READER_BACK_HEIGHT) &&
             readerPage < readerPageTotal) {
+            const uint16_t previousPage = readerPage;
             ++readerPage;
-            loadReaderPage();
+            if (!loadReaderPage()) {
+                readerPage = previousPage;
+                loadReaderPage();
+                return false;
+            }
             refreshMode = RefreshMode::ImageContent;
             return true;
         }
@@ -1788,6 +1977,7 @@ bool handleSwipe(int16_t deltaX, int16_t deltaY) {
     // Match the other readers: sweeping content left/up advances and
     // sweeping right/down goes back.
     const bool next = primaryDelta < 0;
+    const uint16_t previousPage = readerPage;
     if (next) {
         if (readerPage >= readerPageTotal) return false;
         ++readerPage;
@@ -1796,6 +1986,10 @@ bool handleSwipe(int16_t deltaX, int16_t deltaY) {
         --readerPage;
     }
     const bool loaded = loadReaderPage();
+    if (!loaded) {
+        readerPage = previousPage;
+        loadReaderPage();
+    }
     if (loaded) refreshMode = RefreshMode::ImageContent;
     Serial.printf("[CARTOON SWIPE] %s page=%u/%u axis=%s loaded=%s\n",
                   next ? "next" : "previous", readerPage, readerPageTotal,

@@ -44,8 +44,6 @@ enum class Action : uint8_t {
     UrlSave,
     UrlClear,
     UrlCancel,
-    OpenChatRoom,
-    ChatBack,
 };
 
 void render(uint8_t *frame);
@@ -60,8 +58,6 @@ void showWifiScanning();
 void showWifiNetworks(const char networks[][33], uint8_t count);
 void showWifiPassword(const char *ssid, const char *password);
 void showContentUrl(const char *url);
-void showChatRoom(const char *room, const char *mac, const char *pairingUrl,
-                  const char *status, bool authenticated);
 void setVoice(const char *voice);
 const char *voiceName();
 const char *voiceNameAt(uint8_t index);

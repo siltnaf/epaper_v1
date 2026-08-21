@@ -5,55 +5,55 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
 #include <SD_MMC.h>
 #include <esp_mac.h>
+#include <qrcode.h>
 
 #include <cstring>
 
 #include "devices/epd_xingtai/epd_xingtai.h"
+#include "devices/audio/opus_player.h"
 #include "devices/ml307/ml307.h"
 #include "devices/sd_card/sd_card.h"
+#include "font/xiaozhi_font.h"
 #include "pages/recording/recording_page.h"
 #include "ui/loading_indicator.h"
 #include "ui/localization.h"
 
 namespace {
-constexpr char CHAT_API_URL[] = "http://100.96.7.15:3001";
+constexpr char CHAT_HTTP_API_URL[] = "http://100.96.7.15:3001";
 constexpr char CHAT_PAIR_URL[] = "https://ultraman.tail34ff26.ts.net:8443";
 constexpr char DEFAULT_CHAT_ROOM[] = "客厅";
 constexpr char DEFAULT_CHAT_DEVICE_NAME[] = "客厅屏";
-constexpr uint32_t CHAT_PRESENCE_INTERVAL_MS = 30000;
 constexpr uint32_t CHAT_POLL_INTERVAL_MS = 5000;
-constexpr uint32_t CHAT_AUTH_RETRY_MS = 30000;
-constexpr uint32_t CHAT_TASK_STACK_BYTES = 6 * 1024;
+constexpr uint32_t CHAT_POLL_TASK_STACK_BYTES = 4 * 1024;
 char contentUrl[128] = {};
-char chatToken[768] = {};
-char chatSecret[64] = {};
 char chatRoom[48] = {};
 char chatDeviceName[48] = {};
 char chatMac[18] = {};
 char chatPairingUrl[192] = {};
-bool chatAuthenticated = false;
 bool chatCredentialsLoaded = false;
-bool chatUiDirty = false;
-uint32_t nextPresenceMs = 0;
-uint32_t nextPollMs = 0;
-TaskHandle_t chatTaskHandle = nullptr;
-StaticTask_t chatTaskBuffer;
-StackType_t chatTaskStack[CHAT_TASK_STACK_BYTES / sizeof(StackType_t)] = {};
+volatile bool chatUiDirty = false;
+bool pairingPopupOpen = false;
+TaskHandle_t chatPollTaskHandle = nullptr;
+volatile bool chatPageOpen = false;
+volatile bool chatPollStopRequested = false;
+portMUX_TYPE chatDataMux = portMUX_INITIALIZER_UNLOCKED;
 Preferences chatPreferences;
 char status[96] = "Tap the microphone to record";
-char authStatusText[64] = "Not connected";
 char pendingPath[96] = {};
 bool uploadPending = false;
 uint32_t messageId = 0;
-constexpr char CHAT_WAV_PATH[] = "/chat/latest.wav";
+constexpr char CHAT_OPUS_PATH[] = "/chat/latest.ogg";
 constexpr uint8_t MAX_VISIBLE_MESSAGES = 4;
 constexpr int MESSAGE_X = 8;
-constexpr int MESSAGE_Y = 40;
+constexpr int MESSAGE_Y = 76;
 constexpr int MESSAGE_W = 224;
-constexpr int MESSAGE_H = 294;
+constexpr int MESSAGE_H = 258;
+constexpr int PAIRING_X = 154;
+constexpr int PAIRING_Y = 40;
+constexpr int PAIRING_W = 76;
+constexpr int PAIRING_H = 28;
 constexpr int RECORD_X = 12;
 constexpr int RECORD_Y = 348;
 constexpr int RECORD_W = 216;
@@ -74,6 +74,15 @@ uint32_t playingMessageId = 0;
 
 void loadMessages();
 bool playMessage(uint32_t id);
+
+uint8_t snapshotMessages(ChatMessage *destination, uint8_t capacity) {
+    if (!destination || capacity == 0) return 0;
+    portENTER_CRITICAL(&chatDataMux);
+    const uint8_t count = min(messageCount, capacity);
+    std::memcpy(destination, messages, static_cast<size_t>(count) * sizeof(ChatMessage));
+    portEXIT_CRITICAL(&chatDataMux);
+    return count;
+}
 
 void copyDisplayText(char *destination, size_t capacity, const char *source,
                      size_t maxBytes) {
@@ -105,7 +114,7 @@ String endpoint(const char *suffix) {
 }
 
 String chatEndpoint(const char *suffix) {
-    return String(CHAT_API_URL) + (suffix ? suffix : "");
+    return String(CHAT_HTTP_API_URL) + (suffix ? suffix : "");
 }
 
 String deviceMac() {
@@ -123,55 +132,13 @@ void loadChatCredentials() {
     chatCredentialsLoaded = true;
     copyText(chatRoom, sizeof(chatRoom), DEFAULT_CHAT_ROOM);
     copyText(chatDeviceName, sizeof(chatDeviceName), DEFAULT_CHAT_DEVICE_NAME);
-    if (chatPreferences.begin("chat-auth", true)) {
-        copyText(chatToken, sizeof(chatToken), chatPreferences.getString("token", "").c_str());
-        copyText(chatSecret, sizeof(chatSecret), chatPreferences.getString("secret", "").c_str());
+    if (chatPreferences.begin("chat-pairing", true)) {
         copyText(chatRoom, sizeof(chatRoom),
                  chatPreferences.getString("room", DEFAULT_CHAT_ROOM).c_str());
         copyText(chatDeviceName, sizeof(chatDeviceName),
                  chatPreferences.getString("name", DEFAULT_CHAT_DEVICE_NAME).c_str());
         chatPreferences.end();
     }
-    if (!chatSecret[0]) {
-        snprintf(chatSecret, sizeof(chatSecret), "%08lX%08lX%08lX%08lX",
-                 static_cast<unsigned long>(esp_random()),
-                 static_cast<unsigned long>(esp_random()),
-                 static_cast<unsigned long>(esp_random()),
-                 static_cast<unsigned long>(esp_random()));
-        if (chatPreferences.begin("chat-auth", false)) {
-            chatPreferences.putString("secret", chatSecret);
-            chatPreferences.putString("room", chatRoom);
-            chatPreferences.putString("name", chatDeviceName);
-            chatPreferences.end();
-        }
-    }
-}
-
-void saveChatToken(const char *token) {
-    copyText(chatToken, sizeof(chatToken), token);
-    if (chatPreferences.begin("chat-auth", false)) {
-        chatPreferences.putString("token", chatToken);
-        chatPreferences.end();
-    }
-}
-
-void addAuthHeader(HTTPClient &http) {
-    if (chatToken[0]) {
-        String header = "Bearer ";
-        header += chatToken;
-        http.addHeader("Authorization", header);
-    }
-}
-
-bool parseAuthResponse(const String &payload) {
-    JsonDocument json;
-    if (deserializeJson(json, payload)) return false;
-    const char *token = json["token"] | json["access_token"] |
-                        json["data"]["token"] | "";
-    if (!token[0]) return false;
-    saveChatToken(token);
-    chatAuthenticated = true;
-    return true;
 }
 
 bool cellularJsonRequest(const char *method, const String &url, const String &body,
@@ -198,11 +165,9 @@ bool cellularJsonRequest(const char *method, const String &url, const String &bo
     request += " HTTP/1.1\r\nHost: ";
     request += authority;
     request += "\r\nContent-Type: application/json\r\nConnection: close\r\n";
-    if (chatToken[0] && url.indexOf("/api/auth/") < 0) {
-        request += "Authorization: Bearer ";
-        request += chatToken;
-        request += "\r\n";
-    }
+    request += "X-Device-Mac: ";
+    request += deviceMac();
+    request += "\r\n";
     request += "Content-Length: ";
     request += String(body.length());
     request += "\r\n\r\n";
@@ -237,53 +202,23 @@ bool cellularJsonRequest(const char *method, const String &url, const String &bo
 bool chatJsonRequest(const char *method, const char *path, const String &body,
                      String &response, int &code) {
     HTTPClient http;
-    WiFiClientSecure secure;
-    secure.setInsecure();
+    WiFiClient plain;
     http.setConnectTimeout(7000);
     http.setTimeout(15000);
     const String url = chatEndpoint(path);
     if (WiFi.status() != WL_CONNECTED)
         return cellularJsonRequest(method, url, body, response, code);
-    if (!http.begin(secure, url)) return false;
+    // Start with plain HTTP. Constructing WiFiClientSecure itself allocates and
+    // throws std::bad_alloc on this no-PSRAM board when heap is fragmented.
+    const bool began = !url.startsWith("https://") && http.begin(plain, url);
+    if (!began) return false;
     http.addHeader("Content-Type", "application/json");
-    if (!String(path).startsWith("/api/auth/")) addAuthHeader(http);
+    http.addHeader("X-Device-Mac", deviceMac());
     code = method && std::strcmp(method, "GET") == 0
         ? http.GET() : http.sendRequest(method, body);
     response = code > 0 ? http.getString() : String();
     http.end();
     return code > 0;
-}
-
-bool authenticateDevice(bool registerDevice) {
-    JsonDocument body;
-    body["mac"] = deviceMac();
-    body["secret"] = chatSecret;
-    body["name"] = chatDeviceName;
-    body["room"] = chatRoom;
-    String request;
-    serializeJson(body, request);
-    String response;
-    int code = 0;
-    const char *path = registerDevice ? "/api/auth/device/register" : "/api/auth/device/login";
-    if (chatJsonRequest("POST", path, request, response, code) &&
-        code >= 200 && code < 300 && parseAuthResponse(response)) {
-        Serial.printf("[CHAT AUTH] device %s ok room=%s\n",
-                      registerDevice ? "registered" : "login", chatRoom);
-        copyText(authStatusText, sizeof(authStatusText), "Connected");
-        return true;
-    }
-    if (registerDevice && code == 409 &&
-        chatJsonRequest("POST", "/api/auth/device/login", request, response, code) &&
-        code >= 200 && code < 300 && parseAuthResponse(response)) {
-        Serial.printf("[CHAT AUTH] device login after register conflict room=%s\n", chatRoom);
-        copyText(authStatusText, sizeof(authStatusText), "Connected");
-        return true;
-    }
-    chatAuthenticated = false;
-    Serial.printf("[CHAT AUTH] device %s failed code=%d\n",
-                  registerDevice ? "register" : "login", code);
-    copyText(authStatusText, sizeof(authStatusText), "Login failed");
-    return false;
 }
 
 void pixel(uint8_t *f, int x, int y) {
@@ -300,14 +235,12 @@ bool inRect(int16_t x, int16_t y, int l, int t, int w, int h) {
 bool uploadWifi(const String &url, File &file, size_t length, String &response) {
     HTTPClient http;
     WiFiClient plain;
-    WiFiClientSecure secure;
-    secure.setInsecure();
     http.setConnectTimeout(7000);
     http.setTimeout(65000);
-    const bool began = url.startsWith("https://") ? http.begin(secure, url) : http.begin(plain, url);
+    const bool began = url.startsWith("http://") && http.begin(plain, url);
     if (!began) return false;
     http.addHeader("Content-Type", "audio/wav");
-    addAuthHeader(http);
+    http.addHeader("X-Device-Mac", deviceMac());
     http.addHeader("Connection", "close");
     const int code = http.sendRequest("POST", &file, length);
     if (code >= 200 && code < 300) response = http.getString();
@@ -338,8 +271,8 @@ bool uploadCellular(const String &url, File &file, size_t length, String &respon
     header += path;
     header += " HTTP/1.1\r\nHost: ";
     header += authority;
-    header += "\r\nContent-Type: audio/wav\r\nAuthorization: Bearer ";
-    header += chatToken;
+    header += "\r\nContent-Type: audio/wav\r\nX-Device-Mac: ";
+    header += deviceMac();
     header += "\r\nConnection: close\r\nContent-Length: ";
     header += String(length);
     header += "\r\n\r\n";
@@ -423,17 +356,14 @@ bool httpGetText(const String &url, String &payload) {
     }
     HTTPClient http;
     WiFiClient plain;
-    WiFiClientSecure secure;
-    secure.setInsecure();
     http.setConnectTimeout(7000);
-    http.setTimeout(20000);
-    addAuthHeader(http);
-    const bool began = url.startsWith("https://") ? http.begin(secure, url) : http.begin(plain, url);
+    http.setTimeout(8000);
+    http.addHeader("X-Device-Mac", deviceMac());
+    const bool began = url.startsWith("http://") && http.begin(plain, url);
     if (!began) return false;
     const int code = http.GET();
     if (code >= 200 && code < 300) payload = http.getString();
     http.end();
-    if (code == 401) chatAuthenticated = false;
     return code >= 200 && code < 300;
 }
 
@@ -443,9 +373,8 @@ void copyMessageText(char *destination, size_t capacity, JsonVariant value) {
 }
 
 void loadMessages() {
-    if (!chatAuthenticated) return;
     String payload;
-    if (!httpGetText(chatEndpoint("/api/chat/messages?for=esp32"), payload)) {
+    if (!httpGetText(chatEndpoint("/api/chat/messages"), payload)) {
         copyText(status, sizeof(status), "Chat refresh failed");
         return;
     }
@@ -455,15 +384,17 @@ void loadMessages() {
         return;
     }
     JsonArray rows = json["rows"].as<JsonArray>();
-    messageCount = 0;
+    if (rows.isNull()) rows = json["messages"].as<JsonArray>();
     if (rows.isNull()) return;
+    ChatMessage updatedMessages[MAX_VISIBLE_MESSAGES] = {};
+    uint8_t updatedCount = 0;
     const size_t total = rows.size();
     const size_t start = total > MAX_VISIBLE_MESSAGES ? total - MAX_VISIBLE_MESSAGES : 0;
     size_t index = 0;
     for (JsonObject row : rows) {
         if (index++ < start) continue;
-        if (messageCount >= MAX_VISIBLE_MESSAGES) break;
-        ChatMessage &message = messages[messageCount++];
+        if (updatedCount >= MAX_VISIBLE_MESSAGES) break;
+        ChatMessage &message = updatedMessages[updatedCount++];
         message.id = row["id"] | 0;
         const char *direction = row["direction"] | "";
         const char *rowSender = row["sender"] | "";
@@ -487,19 +418,29 @@ void loadMessages() {
             message.time[5] = '\0';
         }
     }
+    portENTER_CRITICAL(&chatDataMux);
+    const bool changed = messageCount != updatedCount ||
+        std::memcmp(messages, updatedMessages, sizeof(messages)) != 0;
+    if (changed) {
+        std::memcpy(messages, updatedMessages, sizeof(messages));
+        messageCount = updatedCount;
+        chatUiDirty = true;
+    }
+    portEXIT_CRITICAL(&chatDataMux);
     copyText(status, sizeof(status), "Messages updated");
+    if (changed) {
+        Serial.printf("[CHAT SYNC] room=%s rows=%u visible=%u\n",
+                      json["room"] | chatRoom, static_cast<unsigned>(total),
+                      static_cast<unsigned>(updatedCount));
+    }
 }
 
 bool postChatJson(const char *path, JsonDocument &body, String &response) {
+    body["mac"] = deviceMac();
     String request;
     serializeJson(body, request);
     int code = 0;
     if (!chatJsonRequest("POST", path, request, response, code)) return false;
-    if (code == 401) {
-        chatAuthenticated = false;
-        chatToken[0] = '\0';
-        return false;
-    }
     return code >= 200 && code < 300;
 }
 
@@ -573,12 +514,18 @@ uint32_t latestAudioId(JsonVariant value) {
 bool playMessage(uint32_t id) {
     if (id == 0) return false;
     const String audioUrl = chatEndpoint(("/api/chat/audio/" + String(id)).c_str());
-    if (!SdCard::downloadFile(audioUrl.c_str(), CHAT_WAV_PATH, 44, chatToken)) {
-        copyText(status, sizeof(status), "WAV download failed");
+    if (!SdCard::downloadFile(audioUrl.c_str(), CHAT_OPUS_PATH, 64)) {
+        copyText(status, sizeof(status), "Opus download failed");
         return false;
     }
-    if (!RecordingPage::playWavFile(CHAT_WAV_PATH)) {
-        copyText(status, sizeof(status), "WAV playback failed");
+    if (!SdCard::isValidOggOpus(CHAT_OPUS_PATH, 64)) {
+        copyText(status, sizeof(status), "Unsupported audio format");
+        Serial.printf("[CHAT] Message %lu is not Ogg Opus (WebM is unsupported)\n",
+                      static_cast<unsigned long>(id));
+        return false;
+    }
+    if (!OpusPlayer::play(CHAT_OPUS_PATH)) {
+        copyText(status, sizeof(status), "Opus playback failed");
         return false;
     }
     playingMessageId = id;
@@ -591,68 +538,66 @@ namespace ChatPage {
 void setContentUrl(const char *url) { copyText(contentUrl, sizeof(contentUrl), url); }
 void open() {
     loadChatCredentials();
+    chatPageOpen = true;
+    chatPollStopRequested = false;
+    pairingPopupOpen = false;
     uploadPending = false;
+    portENTER_CRITICAL(&chatDataMux);
     messageCount = 0;
+    std::memset(messages, 0, sizeof(messages));
+    portEXIT_CRITICAL(&chatDataMux);
     copyText(status, sizeof(status), "Tap the microphone to record");
 }
-void serviceNetwork() {
-    loadChatCredentials();
-    const uint32_t now = millis();
-    if (!chatAuthenticated) {
-        if ((WiFi.status() == WL_CONNECTED || cellularModem.isConnected()) &&
-            (nextPresenceMs == 0 || static_cast<int32_t>(now - nextPresenceMs) >= 0)) {
-            if (!authenticateDevice(false)) authenticateDevice(true);
-            nextPresenceMs = now + CHAT_AUTH_RETRY_MS;
-        }
-        return;
+void close() {
+    chatPageOpen = false;
+    chatPollStopRequested = true;
+    OpusPlayer::stop();
+    const uint32_t started = millis();
+    while (chatPollTaskHandle && millis() - started < 10000) {
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
-    if (static_cast<int32_t>(now - nextPresenceMs) >= 0) {
-        sendPresence();
-        nextPresenceMs = now + CHAT_PRESENCE_INTERVAL_MS;
-    }
-    if (static_cast<int32_t>(now - nextPollMs) >= 0) {
-        pollDeviceMessages();
-        nextPollMs = now + CHAT_POLL_INTERVAL_MS;
-        if (chatUiDirty) {
-            chatUiDirty = false;
-        }
-    }
+    OpusPlayer::stop();
 }
-
-void chatTask(void *) {
-    for (;;) {
-        serviceNetwork();
-        vTaskDelay(pdMS_TO_TICKS(250));
+void chatPollTask(void *) {
+    TickType_t lastWake = xTaskGetTickCount();
+    while (!chatPollStopRequested) {
+        if (WiFi.status() == WL_CONNECTED || cellularModem.isConnected()) {
+            pollDeviceMessages();
+            if (chatPollStopRequested) break;
+            loadMessages();
+        }
+        xTaskDelayUntil(&lastWake, pdMS_TO_TICKS(CHAT_POLL_INTERVAL_MS));
     }
+    chatPollTaskHandle = nullptr;
+    vTaskDelete(nullptr);
 }
 void service() {
-    if (chatTaskHandle) return;
-    chatTaskHandle = xTaskCreateStaticPinnedToCore(
-        chatTask, "chat-network",
-        sizeof(chatTaskStack) / sizeof(chatTaskStack[0]), nullptr, 1,
-        chatTaskStack, &chatTaskBuffer, 0);
-    if (!chatTaskHandle) Serial.println("[CHAT] Network worker start failed");
+    if (chatPageOpen && !chatPollTaskHandle) {
+        chatPollStopRequested = false;
+    }
+    if (chatPageOpen && !chatPollTaskHandle &&
+        xTaskCreatePinnedToCore(chatPollTask, "chat-poll",
+                                CHAT_POLL_TASK_STACK_BYTES, nullptr, 1,
+                                &chatPollTaskHandle, 0) != pdPASS) {
+        chatPollTaskHandle = nullptr;
+    }
+    if (chatPageOpen && !chatPollTaskHandle) {
+        static uint32_t lastFailureLogMs = 0;
+        if (millis() - lastFailureLogMs >= CHAT_POLL_INTERVAL_MS) {
+            lastFailureLogMs = millis();
+            Serial.printf("[CHAT] Poll worker start deferred free=%u largest=%u\n",
+                          static_cast<unsigned>(ESP.getFreeHeap()),
+                          static_cast<unsigned>(ESP.getMaxAllocHeap()));
+        }
+    }
 }
 bool sendReply(const char *text) {
-    if (!text || !text[0] || !chatAuthenticated) return false;
+    if (!text || !text[0]) return false;
     JsonDocument body;
     body["text"] = text;
     String response;
     return postChatJson("/api/chat/esp32/reply", body, response);
 }
-bool authenticateFromSettings(bool registerDevice) {
-    loadChatCredentials();
-    if (WiFi.status() != WL_CONNECTED && !cellularModem.isConnected()) {
-        copyText(status, sizeof(status), "Network unavailable");
-        copyText(authStatusText, sizeof(authStatusText), "Network unavailable");
-        return false;
-    }
-    copyText(status, sizeof(status), registerDevice ? "Registering device..." : "Logging in...");
-    const bool authenticated = authenticateDevice(registerDevice);
-    if (!authenticated) copyText(status, sizeof(status), "Device login failed");
-    return authenticated;
-}
-bool isAuthenticated() { return chatAuthenticated; }
 const char *roomName() { loadChatCredentials(); return chatRoom; }
 const char *deviceMacAddress() {
     loadChatCredentials();
@@ -668,12 +613,22 @@ const char *pairingUrl() {
                   chatRoom, chatMac, chatPairingUrl);
     return chatPairingUrl;
 }
-const char *authStatus() { return authStatusText; }
-bool recordControlAt(int16_t x, int16_t y) { return inRect(x, y, RECORD_X, RECORD_Y, RECORD_W, RECORD_H); }
+bool pairingControlAt(int16_t x, int16_t y) {
+    return !pairingPopupOpen && inRect(x, y, PAIRING_X, PAIRING_Y, PAIRING_W, PAIRING_H);
+}
+bool pairingReturnControlAt(int16_t x, int16_t y) {
+    return pairingPopupOpen && inRect(x, y, 18, 350, 204, 42);
+}
+bool recordControlAt(int16_t x, int16_t y) {
+    return !pairingPopupOpen && inRect(x, y, RECORD_X, RECORD_Y, RECORD_W, RECORD_H);
+}
 bool messageControlBoundsAt(int16_t x, int16_t y, int16_t &left,
                             int16_t &top, int16_t &width, int16_t &height) {
-    for (uint8_t index = 0; index < messageCount; ++index) {
-        if (!messages[index].audio) continue;
+    if (pairingPopupOpen) return false;
+    ChatMessage snapshot[MAX_VISIBLE_MESSAGES] = {};
+    const uint8_t count = snapshotMessages(snapshot, MAX_VISIBLE_MESSAGES);
+    for (uint8_t index = 0; index < count; ++index) {
+        if (!snapshot[index].audio) continue;
         top = MESSAGE_Y + 8 + index * 62;
         left = messages[index].deviceMessage ? MESSAGE_X + 55 : MESSAGE_X + 7;
         width = 162;
@@ -683,7 +638,16 @@ bool messageControlBoundsAt(int16_t x, int16_t y, int16_t &left,
     return false;
 }
 bool handleTap(int16_t x, int16_t y) {
-    if (!chatAuthenticated) return false;
+    if (pairingControlAt(x, y)) {
+        pairingPopupOpen = true;
+        pairingUrl();
+        return true;
+    }
+    if (pairingReturnControlAt(x, y)) {
+        pairingPopupOpen = false;
+        return true;
+    }
+    if (pairingPopupOpen) return false;
     if (recordControlAt(x, y)) {
         if (RecordingPage::isRecording()) {
             RecordingPage::stopChatRecording();
@@ -696,12 +660,15 @@ bool handleTap(int16_t x, int16_t y) {
     int16_t left = 0, top = 0, width = 0, height = 0;
     if (messageControlBoundsAt(x, y, left, top, width, height)) {
         const uint8_t index = static_cast<uint8_t>((top - MESSAGE_Y - 8) / 62);
-        const uint32_t selectedId = messages[index].id;
-        if (RecordingPage::isPlayingWav() && playingMessageId == selectedId) {
-            RecordingPage::stop();
+        ChatMessage snapshot[MAX_VISIBLE_MESSAGES] = {};
+        const uint8_t count = snapshotMessages(snapshot, MAX_VISIBLE_MESSAGES);
+        if (index >= count) return false;
+        const uint32_t selectedId = snapshot[index].id;
+        if (OpusPlayer::isPlaying() && playingMessageId == selectedId) {
+            OpusPlayer::stop();
             playingMessageId = 0;
         } else {
-            if (RecordingPage::isPlayingWav()) RecordingPage::stop();
+            if (OpusPlayer::isPlaying()) OpusPlayer::stop();
             playMessage(selectedId);
         }
         return true;
@@ -715,22 +682,63 @@ bool process() {
         uploadPending = false;
         return true;
     }
+    if (chatUiDirty) {
+        portENTER_CRITICAL(&chatDataMux);
+        chatUiDirty = false;
+        portEXIT_CRITICAL(&chatDataMux);
+        return true;
+    }
     return false;
 }
 void render(uint8_t *frame) {
     std::memset(frame, 0x00, XingtaiEpd::FRAME_BYTES);
-    rect(frame, MESSAGE_X, MESSAGE_Y, MESSAGE_W, MESSAGE_H);
-    if (!chatAuthenticated) {
-        UiLocalization::drawCentered(frame, 166, "CHAT NOT CONNECTED", 1);
-        UiLocalization::drawCentered(frame, 194, "OPEN SETTINGS", 1);
+    if (pairingPopupOpen) {
+        rect(frame, 8, 36, 224, 364);
+        rect(frame, 10, 38, 220, 360);
+        UiLocalization::drawCentered(frame, 48,
+            UiLocalization::isChinese() ? "聊天室配对" : "CHAT ROOM PAIRING", 1);
+        constexpr uint8_t QR_VERSION = 5;
+        uint8_t qrBuffer[qrcode_getBufferSize(QR_VERSION)] = {};
+        QRCode qr = {};
+        if (chatPairingUrl[0] &&
+            qrcode_initText(&qr, qrBuffer, QR_VERSION, ECC_LOW, chatPairingUrl) == 0) {
+            constexpr int moduleScale = 4;
+            constexpr int quietModules = 4;
+            const int qrPixels = (qr.size + quietModules * 2) * moduleScale;
+            const int originX = (XingtaiEpd::WIDTH - qrPixels) / 2 + quietModules * moduleScale;
+            const int originY = 70 + quietModules * moduleScale;
+            for (uint8_t y = 0; y < qr.size; ++y)
+                for (uint8_t x = 0; x < qr.size; ++x)
+                    if (qrcode_getModule(&qr, x, y))
+                        for (int sy = 0; sy < moduleScale; ++sy)
+                            for (int sx = 0; sx < moduleScale; ++sx)
+                                pixel(frame, originX + x * moduleScale + sx,
+                                      originY + y * moduleScale + sy);
+        } else {
+            UiLocalization::drawCentered(frame, 150, "QR ERROR", 1);
+        }
+        UiLocalization::drawCentered(frame, 258, deviceMacAddress(), 1);
+        UiLocalization::drawCentered(frame, 280, "MAC PAIRING", 1);
+        rect(frame, 18, 350, 204, 42);
+        UiLocalization::drawCentered(frame, 365,
+            UiLocalization::isChinese() ? "返回" : "RETURN", 1);
+        return;
     }
-    for (uint8_t index = 0; index < messageCount; ++index) {
-        const ChatMessage &message = messages[index];
+    rect(frame, PAIRING_X, PAIRING_Y, PAIRING_W, PAIRING_H);
+    // Linked squares provide a compact pairing symbol beside the command name.
+    rect(frame, PAIRING_X + 5, PAIRING_Y + 8, 8, 8);
+    rect(frame, PAIRING_X + 11, PAIRING_Y + 12, 8, 8);
+    UiLocalization::drawText(frame, PAIRING_X + 24, PAIRING_Y + 10, "PAIRING", 1);
+    rect(frame, MESSAGE_X, MESSAGE_Y, MESSAGE_W, MESSAGE_H);
+    ChatMessage snapshot[MAX_VISIBLE_MESSAGES] = {};
+    const uint8_t visibleCount = snapshotMessages(snapshot, MAX_VISIBLE_MESSAGES);
+    for (uint8_t index = 0; index < visibleCount; ++index) {
+        const ChatMessage &message = snapshot[index];
         const int top = MESSAGE_Y + 8 + index * 62;
         const int left = message.deviceMessage ? MESSAGE_X + 55 : MESSAGE_X + 7;
         constexpr int width = 162;
         rect(frame, left, top, width, 40);
-        if (message.audio && RecordingPage::isPlayingWav() &&
+        if (message.audio && OpusPlayer::isPlaying() &&
             playingMessageId == message.id) {
             rect(frame, left + 2, top + 2, width - 4, 36);
         }

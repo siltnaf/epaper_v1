@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
+#include <freertos/semphr.h>
 
 #include <cstring>
 
@@ -15,11 +16,28 @@
 
 namespace SdCard {
 
+namespace {
+SemaphoreHandle_t sdMutex = nullptr;
+}
+
+Lock::Lock() {
+    if (!sdMutex) sdMutex = xSemaphoreCreateRecursiveMutex();
+    acquired_ = sdMutex && xSemaphoreTakeRecursive(sdMutex, portMAX_DELAY) == pdTRUE;
+}
+
+Lock::~Lock() {
+    if (acquired_ && sdMutex) xSemaphoreGiveRecursive(sdMutex);
+}
+
+bool Lock::acquired() const { return acquired_; }
+
 bool isMounted() {
     return SD_MMC.cardType() != CARD_NONE;
 }
 
 bool isValidOggOpus(const char *path, uint32_t minimumBytes) {
+    Lock lock;
+    if (!lock.acquired()) return false;
     if (!path || !isMounted() || !SD_MMC.exists(path)) return false;
     File file = SD_MMC.open(path, FILE_READ);
     uint8_t header[128] = {};
@@ -42,6 +60,8 @@ bool isValidOggOpus(const char *path, uint32_t minimumBytes) {
 
 bool downloadFile(const char *url, const char *path, uint32_t minimumBytes,
                   const char *bearerToken) {
+    Lock lock;
+    if (!lock.acquired()) return false;
     if (!url || !path || !isMounted() ||
         (WiFi.status() != WL_CONNECTED && !cellularModem.isConnected())) return false;
     UiLoadingIndicator::Scope loadingIndicator;
@@ -102,59 +122,76 @@ bool downloadFile(const char *url, const char *path, uint32_t minimumBytes,
         return true;
     }
 
-    HTTPClient http;
-    http.setConnectTimeout(10000);
-    // HTTPClient stores this as uint16_t; use the valid maximum for individual
-    // socket reads while the transfer loop enforces its own idle/total limits.
-    http.setTimeout(65000);
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    http.setReuse(false);
-    http.setUserAgent("ESP32-ePaper-Asset/1.0");
-    if (bearerToken && bearerToken[0]) {
-        String authorization = "Bearer ";
-        authorization += bearerToken;
-        http.addHeader("Authorization", authorization);
-    }
-    WiFiClient plainClient;
-    WiFiClientSecure secureClient;
-    secureClient.setInsecure();
-    const bool began = String(url).startsWith("https://") ? http.begin(secureClient, url)
-                                                          : http.begin(plainClient, url);
-    if (!began) {
+    constexpr uint8_t MAX_WIFI_ATTEMPTS = 3;
+    uint32_t actualBytes = 0;
+    bool downloadedSuccessfully = false;
+    for (uint8_t attempt = 1; attempt <= MAX_WIFI_ATTEMPTS; ++attempt) {
+        if (attempt > 1) {
+            output.close();
+            SD_MMC.remove(temporary);
+            output = SD_MMC.open(temporary, FILE_WRITE);
+            if (!output) break;
+            delay(350);
+        }
+
+        HTTPClient http;
+        http.setConnectTimeout(10000);
+        // HTTPClient stores this as uint16_t; use the valid maximum for
+        // individual socket reads and recreate the connection on each retry.
+        http.setTimeout(65000);
+        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        http.setReuse(false);
+        http.setUserAgent("ESP32-ePaper-Asset/1.0");
+        WiFiClient plainClient;
+        WiFiClientSecure secureClient;
+        secureClient.setInsecure();
+        const bool began = String(url).startsWith("https://")
+            ? http.begin(secureClient, url) : http.begin(plainClient, url);
+        if (!began) {
+            output.close();
+            SD_MMC.remove(temporary);
+            Serial.printf("[SD] Invalid download URL %s\n", url);
+            return false;
+        }
+        if (bearerToken && bearerToken[0]) {
+            String authorization = "Bearer ";
+            authorization += bearerToken;
+            http.addHeader("Authorization", authorization);
+        }
+
+        Serial.printf("[SD] Downloading attempt=%u/%u %s to %s\n",
+                      attempt, MAX_WIFI_ATTEMPTS, url, destination.c_str());
+        const uint32_t transferStartedMs = millis();
+        const int responseCode = http.GET();
+        int written = -1;
+        int expectedBytes = -1;
+        bool transferComplete = false;
+        if (responseCode >= 200 && responseCode < 300) {
+            expectedBytes = http.getSize();
+            // HTTPClient owns the socket receive loop. Its stream copier handles
+            // partial Wi-Fi packets correctly.
+            written = http.writeToStream(&output);
+            transferComplete = written >= static_cast<int>(minimumBytes) &&
+                               (expectedBytes < 0 || written == expectedBytes);
+        }
+        output.flush();
         output.close();
-        SD_MMC.remove(temporary);
-        Serial.printf("[SD] Invalid download URL %s\n", url);
-        return false;
-    }
+        http.end();
 
-    Serial.printf("[SD] Downloading %s to %s\n", url, destination.c_str());
-    const int responseCode = http.GET();
-    int written = -1;
-    int expectedBytes = -1;
-    bool transferComplete = false;
-    const uint32_t transferStartedMs = millis();
-    if (responseCode >= 200 && responseCode < 300) {
-        expectedBytes = http.getSize();
-        // HTTPClient owns the socket receive loop. Its stream copier handles
-        // partial Wi-Fi packets correctly; polling available() here stalled
-        // after the first 1146-byte packet from the Find Home map endpoint.
-        written = http.writeToStream(&output);
-        transferComplete = written >= static_cast<int>(minimumBytes) &&
-                           (expectedBytes < 0 || written == expectedBytes);
-    }
-    output.flush();
-    output.close();
-    http.end();
+        File downloaded = SD_MMC.open(temporary, FILE_READ);
+        actualBytes = downloaded ? static_cast<uint32_t>(downloaded.size()) : 0;
+        if (downloaded) downloaded.close();
+        downloadedSuccessfully = responseCode >= 200 && responseCode < 300 &&
+                                 transferComplete && actualBytes >= minimumBytes;
+        if (downloadedSuccessfully) break;
 
-    File downloaded = SD_MMC.open(temporary, FILE_READ);
-    const uint32_t actualBytes = downloaded ? static_cast<uint32_t>(downloaded.size()) : 0;
-    if (downloaded) downloaded.close();
-    if (responseCode < 200 || responseCode >= 300 || !transferComplete ||
-        actualBytes < minimumBytes) {
-        Serial.printf("[SD] Download failed http=%d written=%d expected=%d size=%lu elapsed=%lums\n",
-                      responseCode, written, expectedBytes,
+        Serial.printf("[SD] Download attempt=%u/%u failed http=%d written=%d expected=%d "
+                      "size=%lu elapsed=%lums\n",
+                      attempt, MAX_WIFI_ATTEMPTS, responseCode, written, expectedBytes,
                       static_cast<unsigned long>(actualBytes),
                       static_cast<unsigned long>(millis() - transferStartedMs));
+    }
+    if (!downloadedSuccessfully) {
         SD_MMC.remove(temporary);
         return false;
     }

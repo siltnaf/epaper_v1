@@ -149,6 +149,11 @@ bool Ml307::probeConnection() {
         Serial.printf("[ML307] Waiting %lu ms for modem startup\n",
                       static_cast<unsigned long>(remainingMs));
         vTaskDelay(pdMS_TO_TICKS(remainingMs));
+        if (!powered_) {
+            connected_ = false;
+            Serial.println("[ML307] Startup cancelled because logical power was disabled");
+            return false;
+        }
     }
 
     String response;

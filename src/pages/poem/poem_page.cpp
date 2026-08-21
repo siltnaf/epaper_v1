@@ -1047,7 +1047,6 @@ void renderLibrary(uint8_t *frame) {
             if (!marqueeReady) captureMarquee(frame, top);
         } else if (stories[index].saved) drawCheckmark(frame, 215, top + ROW_HEIGHT / 2);
         else drawArrow(frame, 215, top + ROW_HEIGHT / 2, true);
-        if (index == activePoemIndex) invertRect(frame, 12, top, 216, ROW_HEIGHT);
     }
 }
 

@@ -558,33 +558,39 @@ bool httpGet(const String &url, String &payload, uint32_t timeoutMs = 20000,
         return false;
     }
 
-    HTTPClient http;
-    http.setConnectTimeout(7000);
-    http.setTimeout(timeoutMs);
-    http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-    http.setReuse(false);
-    WiFiClient plainClient;
-    WiFiClientSecure secureClient;
-    plainClient.setTimeout(20);
-    secureClient.setTimeout(20);
-    bool began = false;
-    if (url.startsWith("https://")) {
-        secureClient.setInsecure();
-        began = http.begin(secureClient, url);
-    } else {
-        began = http.begin(plainClient, url);
+    int code = -1;
+    String error;
+    constexpr uint8_t MAX_ATTEMPTS = 2;
+    for (uint8_t attempt = 1; attempt <= MAX_ATTEMPTS; ++attempt) {
+        HTTPClient http;
+        http.setConnectTimeout(7000);
+        http.setTimeout(timeoutMs);
+        http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+        http.setReuse(false);
+        WiFiClient plainClient;
+        WiFiClientSecure secureClient;
+        plainClient.setTimeout(20);
+        secureClient.setTimeout(20);
+        const bool began = url.startsWith("https://")
+            ? (secureClient.setInsecure(), http.begin(secureClient, url))
+            : http.begin(plainClient, url);
+        if (!began) {
+            std::strcpy(statusText, "INVALID CONTENT URL");
+            Serial.printf("[STORY] Invalid URL: %s\n", url.c_str());
+            return false;
+        }
+        http.addHeader("Connection", "close");
+        http.addHeader("User-Agent", "ESP32-ePaper-Story/1.0");
+        code = http.GET();
+        if (code >= 200 && code < 300) payload = http.getString();
+        error = code < 0 ? http.errorToString(code) : String();
+        http.end();
+        if (code >= 200 && code < 300) break;
+        Serial.printf("[STORY API] attempt=%u/%u failed code=%d%s%s\n",
+                      attempt, MAX_ATTEMPTS, code,
+                      error.isEmpty() ? "" : " ", error.c_str());
+        if (attempt < MAX_ATTEMPTS && WiFi.status() == WL_CONNECTED) delay(500);
     }
-    if (!began) {
-        std::strcpy(statusText, "INVALID CONTENT URL");
-        Serial.printf("[STORY] Invalid URL: %s\n", url.c_str());
-        return false;
-    }
-    http.addHeader("Connection", "close");
-    http.addHeader("User-Agent", "ESP32-ePaper-Story/1.0");
-    const int code = http.GET();
-    if (code >= 200 && code < 300) payload = http.getString();
-    const String error = code < 0 ? http.errorToString(code) : String();
-    http.end();
     Serial.printf("[STORY API] response code=%d%s%s bytes=%u url=%s\n", code,
                   error.isEmpty() ? "" : " ", error.c_str(), payload.length(), url.c_str());
     if (code < 0) {
@@ -1034,7 +1040,6 @@ void renderLibrary(uint8_t *frame) {
             if (!marqueeReady) captureMarquee(frame, top);
         } else if (stories[index].saved) drawCheckmark(frame, 215, top + ROW_HEIGHT / 2);
         else drawArrow(frame, 215, top + ROW_HEIGHT / 2, true);
-        if (index == activeStoryIndex) invertRect(frame, 12, top, 216, ROW_HEIGHT);
     }
 }
 

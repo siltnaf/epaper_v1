@@ -17,9 +17,12 @@
 #include "pages/poem/poem_bitmap.h"
 #include "pages/word/word_bitmap.h"
 #include "pages/find_home/find_home_bitmap.h"
+#include "pages/chat/chat_bitmap.h"
 #include "pages/game/game_bitmap.h"
 #include "pages/topbar/topbar_assets.h"
 #include "pages/topbar/topbar_bitmap.h"
+#include "pages/ai/ai_page.h"
+#include "ui/localization.h"
 
 namespace {
 
@@ -101,6 +104,7 @@ void statusBar(uint8_t *frame) {
         Topbar::draw4G(frame, 184, 2);
     }
     Topbar::drawBattery(frame, 209, 2);
+    AiPage::drawTopbarStatus(frame);
 }
 
 void icon(uint8_t *frame, int x, int y, const uint8_t *bitmap, bool selected) {
@@ -124,21 +128,28 @@ void icon(uint8_t *frame, int x, int y, const uint8_t *bitmap, bool selected) {
         }
     }
     if (selected) {
-        invertRoundedRect(frame, x - framePadding, y - framePadding,
-                          frameSize, frameSize);
-    }
-}
-
-void chatIcon(uint8_t *frame, int x, int y, bool selected) {
-    roundedFrame(frame, x - 4, y - 4, 56, 56);
-    roundedFrame(frame, x + 4, y + 7, 40, 27);
-    for (int i = 0; i < 8; ++i) pixel(frame, x + 14 + i, y + 34 + i / 2);
-    for (int dot = 0; dot < 3; ++dot) {
-        for (int yy = 0; yy < 4; ++yy) {
-            for (int xx = 0; xx < 4; ++xx) pixel(frame, x + 12 + dot * 10 + xx, y + 18 + yy);
+        constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
+        constexpr int padding = 4;
+        constexpr int width = 56;
+        constexpr int height = 56;
+        // Keep the inverted selection inside the same six-pixel rounded
+        // silhouette as the normal icon frame.
+        constexpr uint8_t cornerInsets[] = {6, 3, 2, 1, 1, 0};
+        for (int row = 0; row < height; ++row) {
+            const int edgeDistance = min(row, height - 1 - row);
+            const int inset = edgeDistance < static_cast<int>(sizeof(cornerInsets))
+                ? cornerInsets[edgeDistance] : 0;
+            for (int column = inset; column < width - inset; ++column) {
+                const int pixelX = x - padding + column;
+                const int pixelY = y - padding + row;
+                if (pixelX >= 0 && pixelX < XingtaiEpd::WIDTH &&
+                    pixelY >= 0 && pixelY < XingtaiEpd::HEIGHT) {
+                    frame[static_cast<size_t>(pixelY) * rowBytes + pixelX / 8] ^=
+                        0x80U >> (pixelX % 8);
+                }
+            }
         }
     }
-    if (selected) invertRoundedRect(frame, x - 4, y - 4, 56, 56);
 }
 
 }
@@ -156,6 +167,10 @@ void render(uint8_t *frame) {
 void render(uint8_t *frame, FunctionIcon selectedIcon) {
     std::memset(frame, 0x00, XingtaiEpd::FRAME_BYTES);
     statusBar(frame);
+    if (AiPage::isOpen()) {
+        AiPage::render(frame);
+        return;
+    }
     constexpr int iconSize = 48;
     constexpr int columnGap = 32;
     constexpr int rowGap = 22;
@@ -185,7 +200,7 @@ void render(uint8_t *frame, FunctionIcon selectedIcon) {
     icon(frame, x3, y3 + iconSize + rowGap, RadioBitmap::DATA,
          selectedIcon == FunctionIcon::Radio);
     icon(frame, 16, 346, FindHomeBitmap::DATA, selectedIcon == FunctionIcon::FindHome);
-    chatIcon(frame, 96, 346, selectedIcon == FunctionIcon::Chat);
+    icon(frame, 96, 346, ChatBitmap::DATA, selectedIcon == FunctionIcon::Chat);
     icon(frame, 176, 346, GameBitmap::DATA, selectedIcon == FunctionIcon::Game);
 }
 

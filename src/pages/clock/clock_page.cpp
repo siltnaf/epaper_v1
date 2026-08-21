@@ -367,6 +367,9 @@ void setWeather(const char *location, const char *condition, const char *tempera
 
 void render(uint8_t *frame) {
     std::memset(frame, 0x00, XingtaiEpd::FRAME_BYTES);
+    // Core clock information must remain readable while the optional SD-backed
+    // Chinese font is unavailable or still provisioning.
+    const bool renderChinese = UiLocalization::isChinese();
 
     char location[sizeof(weatherLocation)] = {};
     char condition[sizeof(weatherCondition)] = {};
@@ -399,13 +402,13 @@ void render(uint8_t *frame) {
     char weekdayText[16] = {};
     if (timeAvailable) {
         std::strftime(timeText, sizeof(timeText), "%H:%M", &timeInfo);
-        if (UiLocalization::isChinese()) {
+        if (renderChinese) {
             snprintf(dateText, sizeof(dateText), "%d年%d月%d日",
                      timeInfo.tm_year + 1900, timeInfo.tm_mon + 1, timeInfo.tm_mday);
         } else {
             std::strftime(dateText, sizeof(dateText), "%Y-%m-%d", &timeInfo);
         }
-        if (UiLocalization::isChinese()) {
+        if (renderChinese) {
             static const char *weekdays[] = {
                 "星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"
             };
@@ -419,20 +422,20 @@ void render(uint8_t *frame) {
         std::strcpy(dateText, "TIME SYNC");
     }
     centeredText(frame, 204, timeText, 3);
-    if (timeAvailable && UiLocalization::isChinese()) {
+    if (timeAvailable && renderChinese) {
         mixedChineseDateAndWeekday(frame, 228, timeInfo, weekdayText);
     } else if (timeAvailable) {
         char dateAndWeekday[32] = {};
         snprintf(dateAndWeekday, sizeof(dateAndWeekday), "%s %s", dateText, weekdayText);
         centeredText(frame, 236, dateAndWeekday, 2);
-    } else if (!UiLocalization::isChinese()) {
+    } else if (!renderChinese) {
         centeredText(frame, 242, dateText, 2);
     } else {
         UiLocalization::drawCentered(frame, 254, "时间同步", 1);
     }
 
     line(frame, 18, 270, 221, 270);
-    if (UiLocalization::isChinese()) {
+    if (renderChinese) {
         char chineseLocation[48] = {};
         char chineseCondition[32] = {};
         chineseWeatherLocation(location, chineseLocation, sizeof(chineseLocation));

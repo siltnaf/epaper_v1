@@ -9,6 +9,7 @@
 
 #include "devices/sd_card/sd_card.h"
 #include "devices/ml307/ml307.h"
+#include "font/chinese_fallback_font.h"
 
 namespace {
 
@@ -55,6 +56,8 @@ CacheEntry glyphCache[GLYPH_CACHE_SIZE] = {};
 uint8_t nextCacheSlot = 0;
 
 bool readAt(uint32_t offset, void *destination, size_t length) {
+    SdCard::Lock lock;
+    if (!lock.acquired()) return false;
     if (!fontFile || !destination || !fontFile.seek(offset)) return false;
     return fontFile.read(static_cast<uint8_t *>(destination), length) == length;
 }
@@ -194,6 +197,7 @@ void provisionTask(void *) {
     if (SD_MMC.exists(FONT_CACHE_PATH) && openFont()) {
         Serial.println("[FONT] Existing SD cache is valid; no download needed");
         provisioning = false;
+        workerStarted = false;
         vTaskDelete(nullptr);
         return;
     }
@@ -222,6 +226,7 @@ void provisionTask(void *) {
         Serial.println("[FONT] Background font provisioning failed; it will retry next boot");
     }
     provisioning = false;
+    workerStarted = false;
     vTaskDelete(nullptr);
 }
 
@@ -288,6 +293,22 @@ bool loadGlyph(uint32_t codepoint, XiaozhiFont::Glyph &glyph) {
     return true;
 }
 
+bool loadFallbackGlyph(uint32_t codepoint, XiaozhiFont::Glyph &glyph) {
+    for (uint16_t index = 0; index < ChineseFallbackFont::GLYPH_COUNT; ++index) {
+        const ChineseFallbackFont::Glyph &fallback = ChineseFallbackFont::GLYPHS[index];
+        if (fallback.codepoint != codepoint) continue;
+        glyph.advance = 16;
+        glyph.width = 16;
+        glyph.height = 16;
+        glyph.offsetX = 0;
+        glyph.offsetY = 0;
+        glyph.bitmapBytes = sizeof(fallback.bitmap);
+        std::memcpy(glyph.bitmap, fallback.bitmap, sizeof(fallback.bitmap));
+        return true;
+    }
+    return false;
+}
+
 }
 
 namespace XiaozhiFont {
@@ -317,12 +338,12 @@ bool isProvisioning() {
 }
 
 const Glyph *glyph(uint32_t codepoint) {
-    if (!available) return nullptr;
     for (CacheEntry &entry : glyphCache) {
         if (entry.valid && entry.codepoint == codepoint) return &entry.glyph;
     }
     CacheEntry &entry = glyphCache[nextCacheSlot++ % GLYPH_CACHE_SIZE];
-    entry.valid = loadGlyph(codepoint, entry.glyph);
+    entry.valid = available && loadGlyph(codepoint, entry.glyph);
+    if (!entry.valid) entry.valid = loadFallbackGlyph(codepoint, entry.glyph);
     entry.codepoint = codepoint;
     return entry.valid ? &entry.glyph : nullptr;
 }

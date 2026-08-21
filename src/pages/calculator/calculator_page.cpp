@@ -300,8 +300,6 @@ void renderPressedKey(uint8_t *frame) {
         pressedButtonIndex >= static_cast<int8_t>(sizeof(BUTTONS) / sizeof(BUTTONS[0]))) {
         return;
     }
-    const Button &button = BUTTONS[static_cast<size_t>(pressedButtonIndex)];
-    invertRect(frame, button.x, button.y, button.width, button.height);
     pressedButtonIndex = -1;
 }
 

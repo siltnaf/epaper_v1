@@ -17,6 +17,7 @@
 #include "font/xiaozhi_font.h"
 #include "memory_budget.h"
 #include "pages/asundar/asundar_page.h"
+#include "pages/ai/ai_page.h"
 #include "pages/book/book_page.h"
 #include "pages/calendar/calendar_page.h"
 #include "pages/calculator/calculator_page.h"
@@ -70,6 +71,8 @@ enum class PageId : uint8_t {
     Game,
 };
 
+const char *pageName(PageId page);
+
 struct TouchAction {
     PageId page = PageId::Main;
     bool pending = false;
@@ -81,12 +84,13 @@ Preferences touchPreferences;
 Preferences settingsPreferences;
 Preferences wifiPreferences;
 bool calibrationActive = false;
+constexpr uint8_t CALIBRATION_POINT_COUNT = 5;
 uint8_t calibrationCount = 0;
-TPoint calibrationRaw[4] = {};
+TPoint calibrationRaw[CALIBRATION_POINT_COUNT] = {};
 // Keep the targets a few pixels inside the physical edges so the crosshair is
 // fully visible and the user can touch its center without hitting the bezel.
-constexpr int16_t calibrationTargetX[4] = {20, 220, 220, 20};
-constexpr int16_t calibrationTargetY[4] = {40, 40, 376, 376};
+constexpr int16_t calibrationTargetX[CALIBRATION_POINT_COUNT] = {20, 220, 120, 220, 20};
+constexpr int16_t calibrationTargetY[CALIBRATION_POINT_COUNT] = {40, 40, 208, 376, 376};
 constexpr float defaultTouchTransform[6] = {
     static_cast<float>(XingtaiEpd::WIDTH - 1) / 299.0f, 0.0f, 0.0f,
     0.0f, static_cast<float>(XingtaiEpd::HEIGHT - 1) / 479.0f, 0.0f,
@@ -138,6 +142,7 @@ int16_t touchGestureLastX = 0;
 int16_t touchGestureLastY = 0;
 volatile bool touchInterruptPending = false;
 volatile uint32_t touchInterruptTick = 0;
+volatile uint32_t touchInterruptSequence = 0;
 volatile bool touchWorkflowPriority = false;
 constexpr uint32_t STARTUP_TOUCH_GUARD_MS = 1500;
 uint32_t touchInputEnabledAtMs = 0;
@@ -150,6 +155,7 @@ bool suppressMainIconReleaseTap = false;
 bool suppressDriverTap = false;
 bool dispatchingSyntheticTap = false;
 bool homeOutlinePressed = false;
+bool aiOutlinePressed = false;
 bool homeTouchActive = false;
 bool priorityControlFeedbackShown = false;
 int16_t priorityControlLeft = 0;
@@ -182,6 +188,8 @@ void queuePage(PageId page);
 void startMainIconFeedback(PageId page);
 void showHomePressedOutline();
 void restoreHomeIcon();
+void showAiPressedOutline();
+void restoreAiIcon();
 void clearFrameRegion(uint8_t *buffer, int left, int top, int width, int height);
 void copyFrameRegion(uint8_t *destination, const uint8_t *source,
                      int left, int top, int width, int height);
@@ -197,25 +205,36 @@ void onRecordingTimerEvent() {
 void IRAM_ATTR onTouchInterruptSignal() {
     touchInterruptPending = true;
     touchInterruptTick = xTaskGetTickCountFromISR();
+    ++touchInterruptSequence;
     touchWorkflowPriority = true;
 }
 
 void serviceTouchInterruptBeforeI2c() {
     bool pending = false;
     uint32_t interruptTick = 0;
+    uint32_t interruptSequence = 0;
     noInterrupts();
     pending = touchInterruptPending;
     interruptTick = touchInterruptTick;
+    interruptSequence = touchInterruptSequence;
     touchInterruptPending = false;
     interrupts();
+    if (pending) {
+        Serial.printf("[TOUCH IRQ] fired seq=%lu tick=%lu int_pin=%d page=%s\n",
+                      static_cast<unsigned long>(interruptSequence),
+                      static_cast<unsigned long>(interruptTick),
+                      digitalRead(BoardPins::TOUCH_INT), pageName(currentPage));
+    }
+
     const bool voiceActive = currentPage == PageId::Voice && VoicePage::isAudioActive();
     const bool musicActive = currentPage == PageId::Music && MusicPage::isAudioActive();
     const bool poemActive = currentPage == PageId::Poem && PoemPage::isAudioActive();
+    const bool chatAudioActive = currentPage == PageId::Chat && OpusPlayer::isPlaying();
     // Stroke animation does not use the shared audio/touch I2C path. Including
     // it here allowed a trailing IRQ from the opening tap to cancel the drawing.
     const bool wordActive = currentPage == PageId::Word && WordPage::isAudioActive();
     const bool recordingActive = currentPage == PageId::Recording && RecordingPage::isRecording();
-    if (!pending || (!voiceActive && !musicActive && !poemActive && !wordActive &&
+    if (!pending || (!voiceActive && !musicActive && !poemActive && !chatAudioActive && !wordActive &&
                      !recordingActive)) return;
     if (recordingActive) {
         if (!RecordingPage::acceptsTouchStop(interruptTick)) {
@@ -226,7 +245,7 @@ void serviceTouchInterruptBeforeI2c() {
         RecordingPage::stopFromTouchInterrupt();
         return;
     }
-    if ((voiceActive || musicActive || poemActive || WordPage::isAudioActive()) &&
+    if ((voiceActive || musicActive || poemActive || chatAudioActive || WordPage::isAudioActive()) &&
         !OpusPlayer::acceptsTouchStop(interruptTick)) {
         suppressNextAudioTap = true;
         Serial.println("[TOUCH IRQ] Ignoring play-tap interrupt after audio start");
@@ -234,10 +253,12 @@ void serviceTouchInterruptBeforeI2c() {
     }
 
     Serial.printf("[TOUCH IRQ] Stopping %s audio before FT6336 I2C read\n",
-                   voiceActive ? "Voice" : musicActive ? "Music" : poemActive ? "Poem" : "Word");
+                   voiceActive ? "Voice" : musicActive ? "Music" : poemActive ? "Poem" :
+                   chatAudioActive ? "Chat" : "Word");
     if (voiceActive) VoicePage::stopAudioFromTouchInterrupt();
     else if (musicActive) MusicPage::stopAudioFromTouchInterrupt();
     else if (poemActive) PoemPage::stopAudioFromTouchInterrupt();
+    else if (chatAudioActive) OpusPlayer::stop();
     else WordPage::stopFromTouchInterrupt();
     // Audio codec setup and FT6336 share Wire. Reclock/recover the bus only
     // after the audio task has stopped, then let touch.loop() read coordinates.
@@ -1366,48 +1387,17 @@ void copyFrameRegion(uint8_t *destination, const uint8_t *source,
 }
 
 void showPressedInversion(int left, int top, int width, int height) {
-    if (width <= 0 || height <= 0) return;
-    std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
-    constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
-    const int right = min<int>(XingtaiEpd::WIDTH, left + width);
-    const int bottom = min<int>(XingtaiEpd::HEIGHT, top + height);
-    for (int y = max(0, top); y < bottom; ++y) {
-        uint8_t *row = transitionFrame + static_cast<size_t>(y) * rowBytes;
-        for (int x = max(0, left); x < right; ++x) {
-            row[x / 8] ^= 0x80U >> (x % 8);
-        }
-    }
-    epaper.displayPartial(frame, transitionFrame, left, top, width, height);
-    copyFrameRegion(frame, transitionFrame, left, top, width, height);
-    epaper.sleep();
-    constexpr uint32_t pressedMs = 300;
-    delay(pressedMs);
+    (void)left;
+    (void)top;
+    (void)width;
+    (void)height;
 }
 
 void showPressedRoundedInversion(int left, int top, int width, int height) {
-    if (width <= 0 || height <= 0) return;
-    std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
-    constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
-    constexpr uint8_t cornerInsets[] = {6, 3, 2, 1, 1, 0};
-    const int right = min<int>(XingtaiEpd::WIDTH, left + width);
-    const int bottom = min<int>(XingtaiEpd::HEIGHT, top + height);
-    for (int y = max(0, top); y < bottom; ++y) {
-        const int localY = y - top;
-        int inset = 0;
-        if (localY < 6) {
-            inset = cornerInsets[localY];
-        } else if (localY >= height - 6) {
-            inset = cornerInsets[height - 1 - localY];
-        }
-        uint8_t *row = transitionFrame + static_cast<size_t>(y) * rowBytes;
-        for (int x = max(0, left + inset); x < min(right, left + width - inset); ++x) {
-            row[x / 8] ^= 0x80U >> (x % 8);
-        }
-    }
-    epaper.displayPartial(frame, transitionFrame, left, top, width, height);
-    copyFrameRegion(frame, transitionFrame, left, top, width, height);
-    epaper.sleep();
-    delay(300);
+    (void)left;
+    (void)top;
+    (void)width;
+    (void)height;
 }
 
 void showPressedBoldFrame(int left, int top, int width, int height) {
@@ -1462,7 +1452,6 @@ bool showPriorityInversion(int left, int top, int width, int height) {
     priorityControlTop = top;
     priorityControlWidth = width;
     priorityControlHeight = height;
-    showPressedInversion(left, top, width, height);
     return true;
 }
 
@@ -1476,25 +1465,6 @@ void restorePriorityControl() {
             return;
         }
     }
-    std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
-    constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
-    const int right = min<int>(XingtaiEpd::WIDTH,
-                               priorityControlLeft + priorityControlWidth);
-    const int bottom = min<int>(XingtaiEpd::HEIGHT,
-                                priorityControlTop + priorityControlHeight);
-    for (int y = max<int>(0, priorityControlTop); y < bottom; ++y) {
-        uint8_t *row = transitionFrame + static_cast<size_t>(y) * rowBytes;
-        for (int x = max<int>(0, priorityControlLeft); x < right; ++x) {
-            row[x / 8] ^= 0x80U >> (x % 8);
-        }
-    }
-    epaper.displayPartial(frame, transitionFrame, priorityControlLeft,
-                          priorityControlTop, priorityControlWidth,
-                          priorityControlHeight);
-    copyFrameRegion(frame, transitionFrame, priorityControlLeft,
-                    priorityControlTop, priorityControlWidth,
-                    priorityControlHeight);
-    epaper.sleep();
 }
 
 bool showPriorityControlPressed(int16_t x, int16_t y) {
@@ -1582,7 +1552,7 @@ void showHomePressedOutline() {
                     homeTile + static_cast<size_t>(row) * tileRowBytes,
                     tileRowBytes);
     }
-    for (int inset = 0; inset < 1; ++inset) {
+    for (int inset = 0; inset < 2; ++inset) {
         const int frameLeft = left + inset;
         const int frameTop = top + inset;
         const int frameRight = left + width - 1 - inset;
@@ -1635,31 +1605,98 @@ void restoreHomeIcon() {
     homeOutlinePressed = false;
 }
 
-void showTopbarLoading(bool visible) {
-    constexpr int loadingLeft = 58;
-    constexpr int loadingWidth = 120;
-    constexpr int loadingTop = 0;
-    constexpr int loadingHeight = 32;
-
-    if (visible) {
-        std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
-        clearFrameRegion(transitionFrame, loadingLeft, loadingTop,
-                         loadingWidth, loadingHeight);
-        UiLocalization::drawCentered(transitionFrame, 12,
-                                     UiLocalization::isChinese() ? "下载中" : "DOWNLOADING", 1);
-        epaper.displayPartial(frame, transitionFrame, loadingLeft, loadingTop,
-                              loadingWidth, loadingHeight);
-    } else {
-        // Reconstruct the physical loading state rather than assuming the
-        // shared transition buffer still contains it after page rendering.
-        std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
-        clearFrameRegion(transitionFrame, loadingLeft, loadingTop,
-                         loadingWidth, loadingHeight);
-        UiLocalization::drawCentered(transitionFrame, 12,
-                                     UiLocalization::isChinese() ? "下载中" : "DOWNLOADING", 1);
-        epaper.displayPartial(transitionFrame, frame, loadingLeft, loadingTop,
-                              loadingWidth, loadingHeight);
+void showAiPressedOutline() {
+    constexpr int left = 52;
+    constexpr int top = 0;
+    constexpr int width = 28;
+    constexpr int height = 32;
+    bool aiTile[height][width] = {};
+    constexpr size_t rowBytes = XingtaiEpd::WIDTH / 8;
+    MainPage::render(transitionFrame);
+    for (int row = 0; row < height; ++row) {
+        for (int column = 0; column < width; ++column) {
+            const int x = left + column;
+            aiTile[row][column] =
+                (transitionFrame[static_cast<size_t>(top + row) * rowBytes + x / 8] &
+                 (0x80U >> (x % 8))) != 0;
+        }
     }
+    std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
+    for (int row = 0; row < height; ++row) {
+        for (int column = 0; column < width; ++column) {
+            const int x = left + column;
+            const size_t offset = static_cast<size_t>(top + row) * rowBytes + x / 8;
+            const uint8_t mask = static_cast<uint8_t>(0x80U >> (x % 8));
+            if (aiTile[row][column]) {
+                transitionFrame[offset] |= mask;
+            } else {
+                transitionFrame[offset] &= static_cast<uint8_t>(~mask);
+            }
+        }
+    }
+    for (int inset = 0; inset < 2; ++inset) {
+        const int frameLeft = left + inset;
+        const int frameTop = top + inset;
+        const int frameRight = left + width - 1 - inset;
+        const int frameBottom = top + height - 1 - inset;
+        for (int x = frameLeft; x <= frameRight; ++x) {
+            transitionFrame[static_cast<size_t>(frameTop) * rowBytes + x / 8] |=
+                0x80U >> (x % 8);
+            transitionFrame[static_cast<size_t>(frameBottom) * rowBytes + x / 8] |=
+                0x80U >> (x % 8);
+        }
+        for (int y = frameTop; y <= frameBottom; ++y) {
+            transitionFrame[static_cast<size_t>(y) * rowBytes + frameLeft / 8] |=
+                0x80U >> (frameLeft % 8);
+            transitionFrame[static_cast<size_t>(y) * rowBytes + frameRight / 8] |=
+                0x80U >> (frameRight % 8);
+        }
+    }
+    epaper.displayPartial(frame, transitionFrame, left, top, width, height);
+    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+    epaper.sleep();
+    aiOutlinePressed = true;
+    Serial.println("[NAVIGATION] AI pressed; bold frame displayed");
+}
+
+void restoreAiIcon() {
+    if (!aiOutlinePressed) return;
+    constexpr int left = 52;
+    constexpr int top = 0;
+    constexpr int width = 28;
+    constexpr int height = 32;
+    std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
+    MainPage::render(transitionFrame);
+    epaper.displayPartial(frame, transitionFrame, left, top, width, height);
+    std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+    epaper.sleep();
+    aiOutlinePressed = false;
+}
+
+void showTopbarLoading(bool visible) {
+    AiPage::setLoading(visible);
+    constexpr int statusLeft = 80;
+    constexpr int statusTop = 0;
+    constexpr int statusWidth = 101;
+    constexpr int statusHeight = 32;
+
+    // Keep the permanent AI label untouched. Only the independent loading
+    // band is wiped and redrawn when SD, Wi-Fi, or 4G work starts/ends.
+    std::memcpy(transitionFrame, frame, XingtaiEpd::FRAME_BYTES);
+    clearFrameRegion(transitionFrame, statusLeft, statusTop,
+                     statusWidth, statusHeight);
+    if (visible) {
+        const char *label = UiLocalization::isChinese() ? "下载中" : "DOWNLOADING";
+        UiLocalization::drawText(transitionFrame, 84, 12, label, 1);
+    }
+    epaper.displayPartialFill(frame, 0x00, statusLeft, statusTop,
+                              statusWidth, statusHeight);
+    clearFrameRegion(frame, statusLeft, statusTop, statusWidth, statusHeight);
+    epaper.sleep();
+    epaper.displayPartial(frame, transitionFrame, statusLeft, statusTop,
+                          statusWidth, statusHeight);
+    copyFrameRegion(frame, transitionFrame, statusLeft, statusTop,
+                    statusWidth, statusHeight);
     epaper.sleep();
 }
 
@@ -1814,7 +1851,17 @@ bool rawToDisplay(TPoint raw, int16_t &x, int16_t &y) {
     const float mappedY = touchTransform[3] * raw.x + touchTransform[4] * raw.y + touchTransform[5];
     x = static_cast<int16_t>(mappedX + 0.5f);
     y = static_cast<int16_t>(mappedY + 0.5f);
-    return x >= 0 && x < XingtaiEpd::WIDTH && y >= 0 && y < XingtaiEpd::HEIGHT;
+    // A finger lifting against the bezel can extrapolate slightly beyond the
+    // four calibration targets. Preserve the gesture by clamping modest edge
+    // overshoot; reject only genuinely corrupt samples.
+    constexpr int16_t EDGE_TOLERANCE = 32;
+    if (x < -EDGE_TOLERANCE || x >= XingtaiEpd::WIDTH + EDGE_TOLERANCE ||
+        y < -EDGE_TOLERANCE || y >= XingtaiEpd::HEIGHT + EDGE_TOLERANCE) {
+        return false;
+    }
+    x = constrain(x, 0, XingtaiEpd::WIDTH - 1);
+    y = constrain(y, 0, XingtaiEpd::HEIGHT - 1);
+    return true;
 }
 
 void calibrationPixel(uint8_t *buffer, int16_t x, int16_t y) {
@@ -1875,12 +1922,11 @@ bool solveCalibrationAxis(const float normal[3][3], const float rhs[3], float re
 }
 
 bool solveCalibration() {
-    // Fit display = a * raw.x + b * raw.y + c using all four corner samples.
-    // The normal equations provide a least-squares affine fit, so one slightly
-    // off-center tap does not distort the entire touch surface.
+    // Fit display = a * raw.x + b * raw.y + c using all five samples. The
+    // center point helps constrain distortion between the four corners.
     float normal[3][3] = {};
     float targets[2][3] = {};
-    for (uint8_t index = 0; index < 4; ++index) {
+    for (uint8_t index = 0; index < CALIBRATION_POINT_COUNT; ++index) {
         const float values[3] = {
             static_cast<float>(calibrationRaw[index].x),
             static_cast<float>(calibrationRaw[index].y), 1.0f,
@@ -2008,7 +2054,9 @@ bool isImmediateTouchControl(int16_t x, int16_t y) {
     }
     if (currentPage == PageId::Chat) {
         int16_t left = 0, top = 0, width = 0, height = 0;
-        return ChatPage::recordControlAt(x, y) ||
+        return ChatPage::pairingControlAt(x, y) ||
+               ChatPage::pairingReturnControlAt(x, y) ||
+               ChatPage::recordControlAt(x, y) ||
                ChatPage::messageControlBoundsAt(x, y, left, top, width, height);
     }
     if (currentPage == PageId::Game) return true;
@@ -2073,7 +2121,7 @@ void handleTouch(TPoint point, TEvent event) {
         // Use the initial contact for calibration. A release sample can move
         // several pixels while the finger lifts, which is significant for the
         // 23-pixel keyboard keys.
-        if (event == TEvent::TouchStart && calibrationCount < 4) {
+        if (event == TEvent::TouchStart && calibrationCount < CALIBRATION_POINT_COUNT) {
             calibrationRaw[calibrationCount++] = point;
             Serial.printf("[CAL] target=%u raw=(%u,%u)\n", calibrationCount, point.x, point.y);
         }
@@ -2109,6 +2157,12 @@ void handleTouch(TPoint point, TEvent event) {
     const int16_t uiX = XingtaiEpd::WIDTH - 1 - x;
     const int16_t uiY = XingtaiEpd::HEIGHT - 1 - y;
 
+    if (isHomeIcon(uiX, uiY)) {
+        Serial.printf("[TOUCH HOME] event=%u raw=(%u,%u) mapped=(%d,%d) ui=(%d,%d)\n",
+                      static_cast<unsigned>(event), point.x, point.y,
+                      x, y, uiX, uiY);
+    }
+
     if (event == TEvent::TouchStart) {
         // A long e-paper feedback refresh can make the FT6336 reject the prior
         // release as a Tap. Once a new physical touch starts, any old release
@@ -2118,6 +2172,25 @@ void handleTouch(TPoint point, TEvent event) {
         if (currentPage == PageId::Calculator) calculatorPressHandled = false;
         immediateControlPressHandled = false;
         priorityControlFeedbackShown = false;
+        // AI is rendered inside MainPage, so Home must be handled as an
+        // immediate exit before generic Home/page routing can consume it.
+        if (AiPage::isOpen() && isHomeIcon(uiX, uiY)) {
+            // Show Home feedback on the visible AI page before changing the
+            // page contents.
+            if (!calculatorRefreshRunning) showHomePressedOutline();
+            AiPage::close();
+            touchGestureActive = false;
+            homeTouchActive = true;
+            suppressMainIconReleaseTap = true;
+            wipeContentAreaWhite(false);
+            MainPage::render(transitionFrame);
+            epaper.displayPartial(frame, transitionFrame, 0, 0,
+                                  XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT);
+            std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+            epaper.sleep();
+            Serial.println("[NAVIGATION] AI Home touch exited immediately");
+            return;
+        }
         if (currentPage != PageId::Main && isHomeIcon(uiX, uiY)) {
             touchGestureActive = false;
             homeTouchActive = true;
@@ -2126,6 +2199,34 @@ void handleTouch(TPoint point, TEvent event) {
             // Keep the current page active for the lifetime of this physical
             // touch. Switching pages here lets later Contact/LiftUp samples be
             // routed against Main and can reopen the page that was just left.
+            return;
+        }
+        // AI is a global top-bar control and must be checked before page-local
+        // handlers on every function page.
+        if (AiPage::openAt(uiX, uiY)) {
+            touchGestureActive = false;
+            immediateControlPressHandled = true;
+            // Clear the opening tap's touch interrupt and arm the exit guard
+            // before rendering the AI page so the tap's trailing edges cannot
+            // be mistaken for a Home touch.
+            noInterrupts();
+            touchInterruptPending = false;
+            interrupts();
+            touchWorkflowPriority = false;
+            // Show AI feedback on the currently visible function page before
+            // wiping and drawing the AI eyes.
+            showAiPressedOutline();
+            // Do not leave the old function page underneath the AI frame. The
+            // entry transition is immediate for Book and every other page.
+            wipeContentAreaWhite(false);
+            MainPage::render(transitionFrame);
+            epaper.displayPartial(frame, transitionFrame, 0, 0,
+                                  XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT);
+            std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+            epaper.sleep();
+            currentPage = PageId::Main;
+            touchAction.pending = false;
+            Serial.println("[NAVIGATION] AI topbar tapped");
             return;
         }
         if (currentPage == PageId::Main) {
@@ -2174,10 +2275,17 @@ void handleTouch(TPoint point, TEvent event) {
     if (event == TEvent::TouchEnd) {
         restorePriorityControl();
         if (homeOutlinePressed) restoreHomeIcon();
+        if (aiOutlinePressed) restoreAiIcon();
         if (homeTouchActive) {
             homeTouchActive = false;
-            Serial.println("[NAVIGATION] Home released; opening cached framebuffer");
-            queuePage(PageId::Main);
+            if (AiPage::isOpen()) {
+                AiPage::close();
+                refreshCurrentPage();
+                Serial.println("[NAVIGATION] Home released; closing AI view");
+            } else {
+                Serial.println("[NAVIGATION] Home released; opening cached framebuffer");
+                queuePage(PageId::Main);
+            }
         }
         if (touchGestureActive) {
             touchGestureLastX = uiX;
@@ -2327,6 +2435,26 @@ void handleTouch(TPoint point, TEvent event) {
         return;
     }
 
+    // Fallback for controllers that report the gesture only as Tap. AI is a
+    // global top-bar control on every function page.
+    if (AiPage::openAt(uiX, uiY)) {
+        immediateControlPressHandled = true;
+        noInterrupts();
+        touchInterruptPending = false;
+        interrupts();
+        touchWorkflowPriority = false;
+        showAiPressedOutline();
+        wipeContentAreaWhite(false);
+        MainPage::render(transitionFrame);
+        epaper.displayPartial(frame, transitionFrame, 0, 0,
+                              XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT);
+        std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+        epaper.sleep();
+        currentPage = PageId::Main;
+        touchAction.pending = false;
+        return;
+    }
+
     // The poem reader is an in-place overlay while the page state remains the
     // library. Give the overlay first refusal so its controls cannot fall
     // through to the playlist underneath.
@@ -2364,16 +2492,6 @@ void handleTouch(TPoint point, TEvent event) {
                       static_cast<unsigned>(action), uiX, uiY, contentUrl,
                       WiFi.status(), cellularModem.isConnected());
         switch (action) {
-        case SettingsPage::Action::OpenChatRoom:
-            SettingsPage::showChatRoom(ChatPage::roomName(),
-                                       ChatPage::deviceMacAddress(), ChatPage::pairingUrl(),
-                                       ChatPage::authStatus(), ChatPage::isAuthenticated());
-            refreshCurrentPage();
-            return;
-        case SettingsPage::Action::ChatBack:
-            SettingsPage::showSettings();
-            refreshCurrentPage();
-            return;
         case SettingsPage::Action::OpenContentUrl:
             SettingsPage::showContentUrl(contentUrl);
             refreshCurrentPage();
@@ -2847,7 +2965,11 @@ void handleTouch(TPoint point, TEvent event) {
 
     if (currentPage == PageId::Chat) {
         int16_t left = 0, top = 0, width = 0, height = 0;
-        if (ChatPage::recordControlAt(uiX, uiY)) {
+        if (ChatPage::pairingControlAt(uiX, uiY)) {
+            showPressedInversion(154, 40, 76, 28);
+        } else if (ChatPage::pairingReturnControlAt(uiX, uiY)) {
+            showPressedInversion(18, 350, 204, 42);
+        } else if (ChatPage::recordControlAt(uiX, uiY)) {
             showPressedInversion(12, 348, 216, 52);
         } else if (ChatPage::messageControlBoundsAt(
                        uiX, uiY, left, top, width, height)) {
@@ -3035,6 +3157,7 @@ void processTouchAction() {
     }
     if (currentPage == PageId::Chat && nextPage != PageId::Chat) {
         RecordingPage::stop();
+        ChatPage::close();
     }
     if ((currentPage == PageId::Calculator) != (nextPage == PageId::Calculator)) {
         if (currentPage == PageId::Calculator) {
@@ -3046,11 +3169,11 @@ void processTouchAction() {
 
     Serial.printf("[UI] Opening %s page\n", pageName(nextPage));
     if (nextPage == PageId::Settings) {
-        SettingsPage::showChatRoom(ChatPage::roomName(),
-                                   ChatPage::deviceMacAddress(), ChatPage::pairingUrl(),
-                                   ChatPage::authStatus(), ChatPage::isAuthenticated());
         SettingsPage::showSettings();
     }
+    // A Main target can mean either Home navigation or the global AI overlay.
+    // Preserve the overlay state when AI was opened from another page.
+    if (nextPage == PageId::Main && !AiPage::isOpen()) AiPage::close();
     if (nextPage == PageId::Clock) prepareClockPage();
     if (nextPage == PageId::Book) {
         BookPage::setContentUrl(contentUrl);
@@ -3211,12 +3334,23 @@ void setup() {
         calibrationActive = true;
         calibrationCount = 0;
         Serial.println("[CAL] WAKE held: touch calibration enabled");
-        Serial.println("[CAL] Tap targets: top-left, top-right, bottom-right, bottom-left");
-        for (uint8_t target = 0; target < 4; ++target) {
-            renderCalibrationTarget(frame, target);
-            epaper.display(frame);
-            // The EPD and touch controller share the board's power-up sequence;
-            // recover the bus after each EPD refresh before polling FT6X36.
+        Serial.println("[CAL] Tap targets: top-left, top-right, center, bottom-right, bottom-left");
+        // Establish a clean panel state once before calibration. Individual
+        // target changes below stay partial and do not repeat this flash.
+        std::memset(transitionFrame, 0xFF, XingtaiEpd::FRAME_BYTES);
+        epaper.display(transitionFrame);
+        std::memset(frame, 0x00, XingtaiEpd::FRAME_BYTES);
+        epaper.display(frame);
+        epaper.sleep();
+        recoverSharedI2c();
+        for (uint8_t target = 0; target < CALIBRATION_POINT_COUNT; ++target) {
+            renderCalibrationTarget(transitionFrame, target);
+            // Use a normal partial update for each target. Avoid the full black
+            // and white calibration refresh, which is slow and visually harsh.
+            epaper.displayPartial(frame, transitionFrame, 0, 0,
+                                  XingtaiEpd::WIDTH, XingtaiEpd::HEIGHT);
+            std::memcpy(frame, transitionFrame, XingtaiEpd::FRAME_BYTES);
+            epaper.sleep();
             recoverSharedI2c();
             while (calibrationCount <= target) {
                 touch.loop();
@@ -3340,13 +3474,24 @@ void loop() {
     if (currentPage == PageId::Recording && RecordingPage::process()) {
         refreshCurrentPage();
     }
-    if (currentPage == PageId::Radio && RadioPage::process()) {
-        refreshCurrentPage();
-    }
     if (currentPage == PageId::Chat && ChatPage::process()) {
         refreshCurrentPage();
     }
     ChatPage::service();
+    if (currentPage == PageId::Main && AiPage::isOpen() && AiPage::animate()) {
+        // Refresh only the eye canvas. Keep the top bar and FT6336 touch area
+        // outside this waveform so Home remains responsive while eyes move.
+        constexpr uint16_t eyeX = 24;
+        constexpr uint16_t eyeY = 96;
+        constexpr uint16_t eyeWidth = 192;
+        constexpr uint16_t eyeHeight = 188;
+        AiPage::render(transitionFrame);
+        epaper.displayPartial(frame, transitionFrame, eyeX, eyeY,
+                              eyeWidth, eyeHeight);
+        copyFrameRegion(frame, transitionFrame, eyeX, eyeY,
+                        eyeWidth, eyeHeight);
+        epaper.sleep();
+    }
     int16_t marqueeTop = 0;
     if (VoicePage::advanceMarquee(marqueeTop) && currentPage == PageId::Voice) {
         VoicePage::renderMarquee(transitionFrame, frame);

@@ -4,6 +4,15 @@
 
 namespace SdCard {
 
+class Lock {
+public:
+    Lock();
+    ~Lock();
+    bool acquired() const;
+private:
+    bool acquired_ = false;
+};
+
 void begin();
 bool isMounted();
 bool downloadFile(const char *url, const char *path, uint32_t minimumBytes,

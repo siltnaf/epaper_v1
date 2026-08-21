@@ -48,6 +48,8 @@ bool isEnabled() { return cacheEnabled; }
 
 bool load(const char *folder, const String &endpoint, const char *slot, String &payload) {
     if (!cacheEnabled) return false;
+    SdCard::Lock sdLock;
+    if (!sdLock.acquired()) return false;
     char path[128] = {};
     if (!cachePath(folder, endpoint, slot, path, sizeof(path))) return false;
     File file = SD_MMC.open(path, FILE_READ);
@@ -67,6 +69,8 @@ bool load(const char *folder, const String &endpoint, const char *slot, String &
 bool save(const char *folder, const String &endpoint, const char *slot,
           const String &payload) {
     if (!cacheEnabled) return false;
+    SdCard::Lock sdLock;
+    if (!sdLock.acquired()) return false;
     if (payload.isEmpty() || payload.length() > MAX_PLAYLIST_BYTES) return false;
     char path[128] = {};
     if (!cachePath(folder, endpoint, slot, path, sizeof(path))) return false;

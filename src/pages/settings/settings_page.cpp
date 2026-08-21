@@ -3,7 +3,6 @@
 #include "devices/epd_xingtai/epd_xingtai.h"
 #include "font/basic_font.h"
 #include "ui/localization.h"
-#include <qrcode.h>
 
 #include <cstring>
 
@@ -13,7 +12,7 @@ SettingsPage::State state = {true, true, false, 60, 0};
 bool sdMounted = false;
 bool audioTestActive = false;
 
-enum class View : uint8_t { Settings, Scanning, Networks, Password, Sd, ContentUrl, Voices, ChatRoom };
+enum class View : uint8_t { Settings, Scanning, Networks, Password, Sd, ContentUrl, Voices };
 enum class Keyboard : uint8_t { Lowercase, Uppercase, Symbols };
 
 View view = View::Settings;
@@ -27,11 +26,6 @@ char sdNames[8][33] = {};
 bool sdDirectories[8] = {};
 uint8_t sdCount = 0;
 bool formatPending = false;
-char chatRoom[48] = {};
-char chatStatus[64] = {};
-bool chatAuthenticated = false;
-char chatMac[24] = {};
-char chatPairingUrl[192] = {};
 constexpr const char *VOICES[] = {"Bella", "Jasper", "Luna", "Bruno", "Rosie", "Hugo", "Kiki", "Leo"};
 constexpr uint8_t VOICE_COUNT = sizeof(VOICES) / sizeof(VOICES[0]);
 uint8_t selectedVoice = 1;
@@ -307,44 +301,8 @@ void renderSettings(uint8_t *frame) {
     button(frame, 164, rowY(7) + 2, 52, 28, cn ? "测试" : "TEST", audioTestActive);
 
     rect(frame, 16, rowY(8), 208, rowHeight);
-    text(frame, 28, rowY(8) + 9, cn ? "聊天室" : "CHAT ROOM", cn ? 1 : 2);
-    text(frame, 220 - textWidth(chatAuthenticated ? "ON" : "OFF", 1), rowY(8) + 10,
-         chatAuthenticated ? "ON" : "OFF", 1);
-
-    rect(frame, 16, rowY(9), 208, rowHeight);
-    text(frame, 28, rowY(9) + 9, cn ? "缓存" : "CACHE", cn ? 1 : 2);
-    toggle(frame, 156, rowY(9) + 3, state.playlistCacheEnabled);
-}
-
-void renderChatRoom(uint8_t *frame) {
-    const bool cn = UiLocalization::isChinese();
-    centeredText(frame, 36, cn ? "手机扫码配对" : "SCAN TO PAIR", cn ? 1 : 2);
-    constexpr uint8_t QR_VERSION = 5;
-    uint8_t qrBuffer[qrcode_getBufferSize(QR_VERSION)] = {};
-    QRCode qr = {};
-    if (chatPairingUrl[0] &&
-        qrcode_initText(&qr, qrBuffer, QR_VERSION, ECC_LOW, chatPairingUrl) == 0) {
-        constexpr int moduleScale = 4;
-        constexpr int quietModules = 4;
-        const int qrPixels = (qr.size + quietModules * 2) * moduleScale;
-        const int originX = (XingtaiEpd::WIDTH - qrPixels) / 2 + quietModules * moduleScale;
-        const int originY = 62 + quietModules * moduleScale;
-        for (uint8_t y = 0; y < qr.size; ++y) {
-            for (uint8_t x = 0; x < qr.size; ++x) {
-                if (qrcode_getModule(&qr, x, y))
-                    fillRect(frame, originX + x * moduleScale, originY + y * moduleScale,
-                             moduleScale, moduleScale);
-            }
-        }
-    } else {
-        centeredText(frame, 142, cn ? "二维码生成失败" : "QR ERROR", 1);
-    }
-    centeredText(frame, 242, chatMac, 1);
-    centeredText(frame, 262, chatAuthenticated
-        ? (cn ? "设备在线" : "DEVICE ONLINE")
-        : (cn ? "正在注册设备" : "REGISTERING DEVICE"), 1);
-    if (chatStatus[0]) centeredText(frame, 282, chatStatus, 1);
-    button(frame, 18, 344, 204, 42, cn ? "返回" : "RETURN");
+    text(frame, 28, rowY(8) + 9, cn ? "缓存" : "CACHE", cn ? 1 : 2);
+    toggle(frame, 156, rowY(8) + 3, state.playlistCacheEnabled);
 }
 
 void renderVoices(uint8_t *frame) {
@@ -490,7 +448,6 @@ void render(uint8_t *frame) {
     else if (view == View::Sd) renderSd(frame);
     else if (view == View::ContentUrl) renderContentUrl(frame);
     else if (view == View::Voices) renderVoices(frame);
-    else if (view == View::ChatRoom) renderChatRoom(frame);
     else renderSettings(frame);
 }
 
@@ -525,10 +482,6 @@ Action actionAt(int16_t x, int16_t y) {
         if (inRect(x, y, 14, 260, 100, 40)) return Action::VoiceBack;
         return voiceIndexAt(x, y) < VOICE_COUNT ? Action::SelectVoice : Action::None;
     }
-    if (view == View::ChatRoom) {
-        if (inRect(x, y, 18, 344, 204, 42)) return Action::ChatBack;
-        return Action::None;
-    }
     if (view != View::Settings) return Action::None;
     constexpr int rowHeight = 32;
     const auto rowY = [](int index) { return 58 + index * 36; };
@@ -542,8 +495,7 @@ Action actionAt(int16_t x, int16_t y) {
     if (inRect(x, y, 116, rowY(6), 56, rowHeight)) return Action::VolumeDown;
     if (inRect(x, y, 172, rowY(6), 52, rowHeight)) return Action::VolumeUp;
     if (inRect(x, y, 16, rowY(7), 208, rowHeight)) return Action::TestAudio;
-    if (inRect(x, y, 16, rowY(8), 208, rowHeight)) return Action::OpenChatRoom;
-    if (inRect(x, y, 16, rowY(9), 208, rowHeight)) return Action::TogglePlaylistCache;
+    if (inRect(x, y, 16, rowY(8), 208, rowHeight)) return Action::TogglePlaylistCache;
     return Action::None;
 }
 
@@ -615,20 +567,6 @@ void showContentUrl(const char *url) {
     std::strncpy(enteredUrl, url ? url : "", sizeof(enteredUrl) - 1);
     enteredUrl[sizeof(enteredUrl) - 1] = '\0';
     view = View::ContentUrl;
-}
-
-void showChatRoom(const char *room, const char *mac, const char *pairingUrl,
-                  const char *status, bool authenticated) {
-    std::strncpy(chatRoom, room ? room : "", sizeof(chatRoom) - 1);
-    chatRoom[sizeof(chatRoom) - 1] = '\0';
-    std::strncpy(chatStatus, status ? status : "", sizeof(chatStatus) - 1);
-    chatStatus[sizeof(chatStatus) - 1] = '\0';
-    chatAuthenticated = authenticated;
-    std::strncpy(chatMac, mac ? mac : "", sizeof(chatMac) - 1);
-    chatMac[sizeof(chatMac) - 1] = '\0';
-    std::strncpy(chatPairingUrl, pairingUrl ? pairingUrl : "", sizeof(chatPairingUrl) - 1);
-    chatPairingUrl[sizeof(chatPairingUrl) - 1] = '\0';
-    view = View::ChatRoom;
 }
 
 void cycleKeyboard() {

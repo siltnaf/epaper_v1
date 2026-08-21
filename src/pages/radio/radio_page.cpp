@@ -1063,7 +1063,6 @@ void render(uint8_t *frame) {
         // inverted. The marquee renderer uses this mask to cut white letters
         // into a solid black strip during each scrolling partial refresh.
         if (activeOrPending && !marqueeReady) captureMarquee(frame, top);
-        if (index == activeIndex || index == selectedIndex) invertRect(frame, 12, top, 216, ROW_HEIGHT);
     }
 }
 
