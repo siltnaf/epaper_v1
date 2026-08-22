@@ -570,7 +570,7 @@ bool loadCartoons(int32_t requestedOffset, bool forceRemote = false,
     bool loaded = !forceRemote && PlaylistCache::load(
         CARTOON_SD_FOLDER, endpoint, cacheSlot, payload);
     bool fetchedRemote = false;
-    const String url = endpoint + "?limit=5";
+    const String url = endpoint;
     if (!cacheOnly && WiFi.status() == WL_CONNECTED) {
         // The streaming parse keeps only one JSON object in memory, so it works
         // even when the heap is too fragmented to buffer the full catalog. The
