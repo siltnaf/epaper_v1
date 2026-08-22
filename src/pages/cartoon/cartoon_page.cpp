@@ -69,6 +69,8 @@ char selectedSlug[64] = {};
 char selectedComicTitle[80] = {};
 char selectedChapterId[32] = {};
 char selectedChapterTitle[80] = {};
+char selectedCartoonRowId[64] = {};
+char selectedChapterRowId[64] = {};
 char statusText[64] = {};
 String chapterPayload;
 size_t jpegSize = 0;
@@ -118,6 +120,20 @@ void rect(uint8_t *frame, int x, int y, int width, int height) {
     line(frame, x, y + height - 1, x + width - 1, y + height - 1);
     line(frame, x, y, x, y + height - 1);
     line(frame, x + width - 1, y, x + width - 1, y + height - 1);
+}
+
+void invertRect(uint8_t *frame, int x, int y, int width, int height) {
+    if (!frame || width <= 0 || height <= 0) return;
+    const int left = max(0, x);
+    const int top = max(0, y);
+    const int right = min<int>(XingtaiEpd::WIDTH, x + width);
+    const int bottom = min<int>(XingtaiEpd::HEIGHT, y + height);
+    for (int row = top; row < bottom; ++row) {
+        for (int column = left; column < right; ++column) {
+            frame[static_cast<size_t>(row) * (XingtaiEpd::WIDTH / 8) + column / 8] ^=
+                static_cast<uint8_t>(0x80U >> (column % 8));
+        }
+    }
 }
 
 void drawArrow(uint8_t *frame, int centerX, int centerY, bool right) {
@@ -898,6 +914,7 @@ bool loadChapterPageFromApi(const char *slug, int32_t requestedOffset) {
 bool loadChapters(const ListItem &comic) {
     copyText(selectedSlug, sizeof(selectedSlug), comic.id);
     copyText(selectedComicTitle, sizeof(selectedComicTitle), comic.title);
+    selectedChapterRowId[0] = '\0';
     chapterPage = 1;
     chapterRowCount = 0;
     chapterTotal = 0;
@@ -1699,7 +1716,8 @@ void renderPager(uint8_t *frame, uint16_t page, uint16_t pages) {
 }
 
 void renderList(uint8_t *frame, const ListItem *items, uint8_t count,
-                uint16_t offset, uint16_t page, uint16_t pages) {
+                uint16_t offset, uint16_t page, uint16_t pages,
+                const char *selectedId) {
     renderPager(frame, page, pages);
     for (uint8_t index = 0; index < count; ++index) {
         const int top = LIST_TOP + index * (ROW_HEIGHT + ROW_GAP);
@@ -1710,6 +1728,8 @@ void renderList(uint8_t *frame, const ListItem *items, uint8_t count,
         drawTitle(frame, 34, top + 1, 171, ROW_HEIGHT - 2, items[index].title);
         if (items[index].saved) drawCheckmark(frame, 215, top + ROW_HEIGHT / 2);
         else drawArrow(frame, 215, top + ROW_HEIGHT / 2, true);
+        if (selectedId && selectedId[0] && std::strcmp(items[index].id, selectedId) == 0)
+            invertRect(frame, 12, top, 216, ROW_HEIGHT);
     }
 }
 
@@ -1780,6 +1800,8 @@ void open() {
     imageReady = false;
     jpegSize = 0;
     readerJpegPath[0] = '\0';
+    selectedCartoonRowId[0] = '\0';
+    selectedChapterRowId[0] = '\0';
     ensureCartoonDirectory();
     cartoonCount = 0;
     cartoonTotal = 0;
@@ -1978,9 +2000,23 @@ bool handleTap(int16_t x, int16_t y) {
         const int top = LIST_TOP + index * (ROW_HEIGHT + ROW_GAP);
         if (!inRect(x, y, 12, top, 216, ROW_HEIGHT)) continue;
         if (view == View::Cartoons) {
-            return index < cartoonCount && loadChapters(cartoons[index]);
+            if (index >= cartoonCount) return false;
+            if (std::strcmp(selectedCartoonRowId, cartoons[index].id) != 0) {
+                copyText(selectedCartoonRowId, sizeof(selectedCartoonRowId),
+                         cartoons[index].id);
+                refreshMode = RefreshMode::ListContent;
+                return true;
+            }
+            return loadChapters(cartoons[index]);
         }
-        return index < chapterRowCount && openChapter(chapterRows[index]);
+        if (index >= chapterRowCount) return false;
+        if (std::strcmp(selectedChapterRowId, chapterRows[index].id) != 0) {
+            copyText(selectedChapterRowId, sizeof(selectedChapterRowId),
+                     chapterRows[index].id);
+            refreshMode = RefreshMode::ListContent;
+            return true;
+        }
+        return openChapter(chapterRows[index]);
     }
     return false;
 }
@@ -2033,14 +2069,14 @@ void render(uint8_t *frame) {
         else UiLocalization::drawText(frame, 14, 39, "RETURN");
         drawCenteredTitle(frame, 0, 34, XingtaiEpd::WIDTH, 18, selectedComicTitle);
         renderList(frame, chapterRows, chapterRowCount, chapterOffset,
-                   chapterPage, pageCount(chapterTotal));
+                   chapterPage, pageCount(chapterTotal), selectedChapterRowId);
         if (!chapterRowCount) UiLocalization::drawCentered(frame, 200, statusText);
         return;
     }
     if (UiLocalization::isChinese()) drawTitle(frame, 91, 34, 58, 18, "漫画");
     else UiLocalization::drawCentered(frame, 36, "CARTOON", 2);
     renderList(frame, cartoons, cartoonCount, cartoonOffset,
-               cartoonPage, pageCount(cartoonTotal));
+               cartoonPage, pageCount(cartoonTotal), selectedCartoonRowId);
     if (!cartoonCount) UiLocalization::drawCentered(frame, 200, statusText);
 }
 
