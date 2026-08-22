@@ -669,9 +669,6 @@ void open() {
     messageCount = 0;
     std::memset(messages, 0, sizeof(messages));
     portEXIT_CRITICAL(&chatDataMux);
-    authenticate();
-    sendPresence(true);
-    checkBinding();
     copyText(status, sizeof(status), "Tap the microphone to record");
 }
 void close() {
@@ -688,10 +685,12 @@ void chatPollTask(void *) {
     TickType_t lastWake = xTaskGetTickCount();
     while (!chatPollStopRequested) {
         if (WiFi.status() == WL_CONNECTED || cellularModem.isConnected()) {
-            if (!ensureAuthenticated()) {
+            if (!chatAuthenticated && !authenticate()) {
                 xTaskDelayUntil(&lastWake, pdMS_TO_TICKS(CHAT_POLL_INTERVAL_MS));
                 continue;
             }
+            if (!chatBound) checkBinding();
+            if (lastPresenceMs == 0) sendPresence(true);
             if (millis() - lastPresenceMs >= CHAT_PRESENCE_INTERVAL_MS)
                 sendPresence(true);
             pollDeviceMessages();
@@ -704,14 +703,6 @@ void chatPollTask(void *) {
     vTaskDelete(nullptr);
 }
 void service() {
-    if ((WiFi.status() == WL_CONNECTED || cellularModem.isConnected()) &&
-        !chatAuthenticated) {
-        if (authenticate()) sendPresence(true);
-    }
-    if ((WiFi.status() == WL_CONNECTED || cellularModem.isConnected()) &&
-        chatAuthenticated && millis() - lastPresenceMs >= CHAT_PRESENCE_INTERVAL_MS) {
-        sendPresence(true);
-    }
     if (chatPageOpen && !chatPollTaskHandle) {
         chatPollStopRequested = false;
     }
