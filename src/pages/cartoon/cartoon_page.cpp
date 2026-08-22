@@ -571,9 +571,18 @@ bool loadCartoons(int32_t requestedOffset, bool forceRemote = false,
         CARTOON_SD_FOLDER, endpoint, cacheSlot, payload);
     bool fetchedRemote = false;
     const String url = endpoint;
-    if (!cacheOnly && WiFi.status() == WL_CONNECTED &&
-        loadCartoonPageStream(url, requestedOffset)) {
-        return true;
+    if (!cacheOnly && WiFi.status() == WL_CONNECTED) {
+        // The streaming parse keeps only one JSON object in memory, so it works
+        // even when the heap is too fragmented to buffer the full catalog. The
+        // server occasionally drops the first connection (-7); retry once before
+        // falling back to the memory-heavy whole-buffer path.
+        for (uint8_t attempt = 1; attempt <= 2; ++attempt) {
+            if (loadCartoonPageStream(url, requestedOffset)) return true;
+            if (attempt < 2) {
+                Serial.printf("[CARTOON API] stream retry attempt=%u\n", attempt + 1);
+                delay(350);
+            }
+        }
     }
     if (!cacheOnly && (forceRemote || !loaded)) {
         loaded = httpGetText(url, payload);
