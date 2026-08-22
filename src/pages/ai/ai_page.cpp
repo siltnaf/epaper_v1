@@ -18,6 +18,9 @@ uint32_t nextGazeMs = 0;
 uint8_t gazeIndex = 0;
 constexpr int8_t GAZE_X[] = {-10, 0, 10, 6, -6, 0};
 constexpr int8_t GAZE_Y[] = {0, -5, 0, 5, 4, 0};
+// The AI page runs a single 5 Hz tick: it advances the eye gaze animation and
+// lets the main loop service the FT6336 touch panel on the same 200 ms cadence.
+constexpr uint32_t GAZE_INTERVAL_MS = 200;
 
 void pixel(uint8_t *frame, int x, int y) {
     if (!frame || x < 0 || x >= XingtaiEpd::WIDTH || y < 0 || y >= XingtaiEpd::HEIGHT) return;
@@ -121,6 +124,14 @@ bool controlAt(int16_t x, int16_t y) {
 bool openAt(int16_t x, int16_t y) {
     if (!controlAt(x, y)) return false;
     aiOpen = true;
+    // The eyes were never moving because the animation flag stayed false. Start
+    // the gaze loop when the overlay opens and schedule the first move one tick
+    // out so the initial render has time to settle.
+    eyesAnimating = true;
+    gazeIndex = 0;
+    gazeX = 0;
+    gazeY = 0;
+    nextGazeMs = millis() + GAZE_INTERVAL_MS;
     return true;
 }
 
@@ -137,7 +148,7 @@ bool animate() {
     gazeIndex = static_cast<uint8_t>((gazeIndex + 1) % (sizeof(GAZE_X) / sizeof(GAZE_X[0])));
     gazeX = GAZE_X[gazeIndex];
     gazeY = GAZE_Y[gazeIndex];
-    nextGazeMs = millis() + 1400;
+    nextGazeMs = millis() + GAZE_INTERVAL_MS;
     return true;
 }
 
