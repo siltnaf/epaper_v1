@@ -33,10 +33,7 @@ char chatRoom[48] = {};
 char chatDeviceName[48] = {};
 char chatMac[18] = {};
 char chatPairingUrl[192] = {};
-char chatSecret[33] = {};
-char chatToken[384] = {};
 bool chatCredentialsLoaded = false;
-bool chatAuthenticated = false;
 bool chatBound = false;
 uint32_t lastPresenceMs = 0;
 volatile bool chatUiDirty = false;
@@ -152,21 +149,7 @@ void loadChatCredentials() {
                  chatPreferences.getString("room", DEFAULT_CHAT_ROOM).c_str());
         copyText(chatDeviceName, sizeof(chatDeviceName),
                  chatPreferences.getString("name", DEFAULT_CHAT_DEVICE_NAME).c_str());
-        copyText(chatSecret, sizeof(chatSecret),
-                 chatPreferences.getString("secret", "").c_str());
-        copyText(chatToken, sizeof(chatToken),
-                 chatPreferences.getString("token", "").c_str());
         chatPreferences.end();
-    }
-    if (!chatSecret[0]) {
-        const uint32_t a = esp_random();
-        const uint32_t b = esp_random();
-        snprintf(chatSecret, sizeof(chatSecret), "%08lX%08lX",
-                 static_cast<unsigned long>(a), static_cast<unsigned long>(b));
-        if (chatPreferences.begin("chat-pairing", false)) {
-            chatPreferences.putString("secret", chatSecret);
-            chatPreferences.end();
-        }
     }
 }
 
@@ -194,11 +177,6 @@ bool cellularJsonRequest(const char *method, const String &url, const String &bo
     request += " HTTP/1.1\r\nHost: ";
     request += authority;
     request += "\r\nContent-Type: application/json\r\nConnection: close\r\n";
-    if (chatToken[0]) {
-        request += "Authorization: Bearer ";
-        request += chatToken;
-        request += "\r\n";
-    }
     request += "X-Device-Mac: ";
     request += deviceMac();
     request += "\r\n";
@@ -247,56 +225,12 @@ bool chatJsonRequest(const char *method, const char *path, const String &body,
     const bool began = !url.startsWith("https://") && http.begin(plain, url);
     if (!began) return false;
     http.addHeader("Content-Type", "application/json");
-    if (chatToken[0]) {
-        http.addHeader("Authorization", String("Bearer ") + chatToken);
-    }
+    http.addHeader("X-Device-Mac", deviceMac());
     code = method && std::strcmp(method, "GET") == 0
         ? http.GET() : http.sendRequest(method, body);
     response = code > 0 ? http.getString() : String();
     http.end();
     return code > 0;
-}
-
-bool authenticate() {
-    loadChatCredentials();
-    JsonDocument body;
-    body["mac"] = deviceMac();
-    body["secret"] = chatSecret;
-    body["name"] = chatDeviceName;
-    body["room"] = chatRoom;
-    String request;
-    serializeJson(body, request);
-    const bool hasStoredToken = chatToken[0] != '\0';
-    chatToken[0] = '\0';
-    const char *firstPath = hasStoredToken
-        ? "/api/auth/device/login" : "/api/auth/device/register";
-    const char *secondPath = hasStoredToken
-        ? "/api/auth/device/register" : "/api/auth/device/login";
-    for (const char *path : {firstPath, secondPath}) {
-        String response;
-        int code = 0;
-        if (!chatJsonRequest("POST", path, request, response, code) || code < 200 || code >= 300)
-            continue;
-        JsonDocument json;
-        if (deserializeJson(json, response)) continue;
-        const char *token = json["token"] | "";
-        if (!token[0] || !(json["ok"] | false)) continue;
-        copyText(chatToken, sizeof(chatToken), token);
-        chatAuthenticated = true;
-        if (chatPreferences.begin("chat-pairing", false)) {
-            chatPreferences.putString("token", chatToken);
-            chatPreferences.end();
-        }
-        Serial.printf("[CHAT AUTH] authenticated via %s\n", path);
-        return true;
-    }
-    chatAuthenticated = false;
-    return false;
-}
-
-bool ensureAuthenticated() {
-    if (chatAuthenticated && chatToken[0]) return true;
-    return authenticate();
 }
 
 bool checkBinding() {
@@ -345,7 +279,7 @@ bool uploadWifi(const String &url, File &file, size_t length, String &response) 
     const bool began = url.startsWith("http://") && http.begin(plain, url);
     if (!began) return false;
     http.addHeader("Content-Type", "audio/wav");
-    if (chatToken[0]) http.addHeader("Authorization", String("Bearer ") + chatToken);
+    http.addHeader("X-Device-Mac", deviceMac());
     http.addHeader("Connection", "close");
     const int code = http.sendRequest("POST", &file, length);
     if (code >= 200 && code < 300) response = http.getString();
@@ -377,11 +311,9 @@ bool uploadCellular(const String &url, File &file, size_t length, String &respon
     header += " HTTP/1.1\r\nHost: ";
     header += authority;
     header += "\r\nContent-Type: audio/wav\r\n";
-    if (chatToken[0]) {
-        header += "Authorization: Bearer ";
-        header += chatToken;
-        header += "\r\n";
-    }
+    header += "X-Device-Mac: ";
+    header += deviceMac();
+    header += "\r\n";
     header += "\r\nConnection: close\r\nContent-Length: ";
     header += String(length);
     header += "\r\n\r\n";
@@ -435,11 +367,6 @@ bool uploadFile() {
     String response;
     const String url = chatEndpoint("/api/chat/messages");
     bool ok = false;
-    if (!ensureAuthenticated()) {
-        file.close();
-        copyText(status, sizeof(status), "Chat login failed");
-        return false;
-    }
     if (WiFi.status() == WL_CONNECTED) ok = uploadWifi(url, file, length, response);
     else ok = uploadCellular(url, file, length, response);
     file.close();
@@ -474,7 +401,7 @@ bool httpGetText(const String &url, String &payload) {
     http.setTimeout(8000);
     const bool began = url.startsWith("http://") && http.begin(plain, url);
     if (!began) return false;
-    if (chatToken[0]) http.addHeader("Authorization", String("Bearer ") + chatToken);
+    http.addHeader("X-Device-Mac", deviceMac());
     const int code = http.GET();
     if (code >= 200 && code < 300) payload = http.getString();
     http.end();
@@ -488,8 +415,7 @@ void copyMessageText(char *destination, size_t capacity, JsonVariant value) {
 
 void loadMessages() {
     String payload;
-    if (!ensureAuthenticated() ||
-        !httpGetText(chatEndpoint("/api/chat/messages?for=esp32"), payload)) {
+    if (!httpGetText(chatEndpoint("/api/chat/messages?for=esp32"), payload)) {
         copyText(status, sizeof(status), "Chat refresh failed");
         return;
     }
@@ -551,7 +477,6 @@ void loadMessages() {
 }
 
 bool postChatJson(const char *path, JsonDocument &body, String &response) {
-    if (!ensureAuthenticated()) return false;
     String request;
     serializeJson(body, request);
     int code = 0;
@@ -560,7 +485,6 @@ bool postChatJson(const char *path, JsonDocument &body, String &response) {
 }
 
 void sendPresence(bool online) {
-    if (!ensureAuthenticated()) return;
     JsonDocument body;
     body["online"] = online;
     String response;
@@ -582,8 +506,7 @@ void acknowledgeMessage(uint32_t id) {
 
 void pollDeviceMessages() {
     String payload;
-    if (!ensureAuthenticated() ||
-        !httpGetText(chatEndpoint("/api/chat/messages?for=esp32"), payload)) return;
+    if (!httpGetText(chatEndpoint("/api/chat/messages?for=esp32"), payload)) return;
     JsonDocument json;
     if (deserializeJson(json, payload)) return;
     JsonArray rows = json["rows"].as<JsonArray>();
@@ -633,8 +556,8 @@ uint32_t latestAudioId(JsonVariant value) {
 bool playMessage(uint32_t id) {
     if (id == 0) return false;
     const String audioUrl = chatEndpoint(("/api/chat/audio/" + String(id)).c_str());
-    if (!ensureAuthenticated() ||
-        !SdCard::downloadFile(audioUrl.c_str(), CHAT_OPUS_PATH, 64, chatToken)) {
+    if (!SdCard::downloadFile((audioUrl + "?mac=" + deviceMac()).c_str(),
+                              CHAT_OPUS_PATH, 64)) {
         copyText(status, sizeof(status), "Opus download failed");
         return false;
     }
@@ -662,7 +585,6 @@ void open() {
     chatPollStopRequested = false;
     pairingPopupOpen = false;
     uploadPending = false;
-    chatAuthenticated = false;
     chatBound = false;
     lastPresenceMs = 0;
     portENTER_CRITICAL(&chatDataMux);
@@ -685,10 +607,6 @@ void chatPollTask(void *) {
     TickType_t lastWake = xTaskGetTickCount();
     while (!chatPollStopRequested) {
         if (WiFi.status() == WL_CONNECTED || cellularModem.isConnected()) {
-            if (!chatAuthenticated && !authenticate()) {
-                xTaskDelayUntil(&lastWake, pdMS_TO_TICKS(CHAT_POLL_INTERVAL_MS));
-                continue;
-            }
             if (!chatBound) checkBinding();
             if (lastPresenceMs == 0) sendPresence(true);
             if (millis() - lastPresenceMs >= CHAT_PRESENCE_INTERVAL_MS)
