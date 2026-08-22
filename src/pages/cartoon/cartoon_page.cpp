@@ -686,6 +686,15 @@ String jsonStringAt(const String &json, int objectStart, const char *key, int ob
     return result;
 }
 
+// The chapter directory normalizes every entry to carry both `id` and `cid`
+// with the same value. Prefer `id` and fall back to `cid` so older cached
+// payloads that only carried `cid` still resolve instead of being dropped.
+String chapterIdAt(const String &json, int objectStart, int objectEnd) {
+    String id = jsonStringAt(json, objectStart, "id", objectEnd);
+    if (id.isEmpty()) id = jsonStringAt(json, objectStart, "cid", objectEnd);
+    return id;
+}
+
 void loadChapterRows() {
     chapterRowCount = 0;
     chapterTotal = 0;
@@ -699,7 +708,7 @@ void loadChapterRows() {
         const int objectEnd = chapterPayload.indexOf('}', objectStart);
         if (objectEnd < 0) break;
         if (chapterTotal >= firstVisible && chapterRowCount < ROWS_PER_PAGE) {
-            const String id = jsonStringAt(chapterPayload, objectStart, "id", objectEnd);
+            const String id = chapterIdAt(chapterPayload, objectStart, objectEnd);
             const String title = jsonStringAt(chapterPayload, objectStart, "title", objectEnd);
             copyText(chapterRows[chapterRowCount].id, sizeof(chapterRows[chapterRowCount].id), id.c_str());
             copyText(chapterRows[chapterRowCount].title, sizeof(chapterRows[chapterRowCount].title),
@@ -734,7 +743,7 @@ bool parseChapterPage(const String &payload, uint16_t firstVisible) {
                 chapterHasMore = true;
                 break;
             }
-            const String id = jsonStringAt(payload, objectStart, "id", objectEnd);
+            const String id = chapterIdAt(payload, objectStart, objectEnd);
             const String title = jsonStringAt(payload, objectStart, "title", objectEnd);
             if (!id.isEmpty()) {
                 ListItem &row = chapterRows[chapterRowCount++];
@@ -763,7 +772,7 @@ void chapterListPath(const char *slug, char *path, size_t pathSize) {
 
 bool parseChapterObject(const String &object, uint16_t firstVisible) {
     if (object.indexOf("\"chapters\"") >= 0) return false;
-    const String id = jsonStringAt(object, 0, "id", object.length());
+    const String id = chapterIdAt(object, 0, object.length());
     const String title = jsonStringAt(object, 0, "title", object.length());
     if (id.isEmpty()) return false;
     if (chapterTotal >= firstVisible && chapterRowCount < ROWS_PER_PAGE) {
